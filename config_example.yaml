@@ -1,7 +1,7 @@
 # ==============================================================================
 # Deimos — DIA Expression Integrated Multi-Omics Suite
 # Reusable YAML configuration file
-# https://github.com/BenoitBe/deimos-proteomics
+# https://github.com/BenoitBe/deimos-proteomics-pipeline
 # ==============================================================================
 # Usage:
 #   python deimos.py --config config_example.yaml
