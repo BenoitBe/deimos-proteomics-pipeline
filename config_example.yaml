@@ -1,0 +1,78 @@
+# ==============================================================================
+# Deimos — DIA Expression Integrated Multi-Omics Suite
+# Reusable YAML configuration file
+# https://github.com/BenoitBe/deimos-proteomics
+# ==============================================================================
+# Usage:
+#   python deimos.py --config config_example.yaml
+#   python deimos.py --config config_example.yaml --out-dir /data/project2
+#
+# CLI arguments (--tsv, --design, --out-dir) always override the YAML.
+# ==============================================================================
+
+
+# ── Statistical thresholds — Volcanos & Robustness ───────────────────────────
+# volcano_use_padj : false = raw p-value | true = FDR-BH (p.adj)
+volcano_use_padj:    false
+volcano_p_thresh:    0.05
+
+# Minimum fold-change in LINEAR scale (converted to log2FC internally)
+# e.g. 1.5 → log2FC ≥ 0.585 | 2.0 → log2FC ≥ 1.0
+volcano_ratio_min:   1.5
+
+
+# ── Statistical thresholds — ANOVA & Heatmap ─────────────────────────────────
+anova_use_padj:      false
+anova_p_thresh:      0.05
+
+
+# ── Clustering heatmap ────────────────────────────────────────────────────────
+n_heatmap_clusters:  3            # Number of k-means clusters (≥ 2)
+
+
+# ── Robustness score ──────────────────────────────────────────────────────────
+# 0 = disabled (significant time saving on large datasets)
+# Recommended: 100 for production analysis, 20 for a quick test
+n_iter_robustness:   100
+
+
+# ── FDR correction ────────────────────────────────────────────────────────────
+# false (default) : independent BH correction per contrast
+# true            : global BH correction across all p-values in the study
+#                   (more conservative — recommended if ≥ 20 contrasts)
+fdr_global:          false
+
+
+# ── Missing-value imputation method ──────────────────────────────────────────
+# 'qrilc'  : pure MNAR — left-censored truncated normal (Lazar 2016)
+#            Recommended for DIA (MNAR expected to dominate)
+# 'mixed'  : QRILC if fully absent in a condition (MNAR), kNN if partial (MAR)
+#            ⚠️ kNN can artificially inflate statistical power if MAR > 50%
+impute_method:       qrilc
+
+
+# ── Optional modules ──────────────────────────────────────────────────────────
+
+# gProfiler organism for GO/KEGG enrichment
+# Examples: hsapiens, mmusculus, bnapus, athaliana, efa (E. faecalis), rnorvegicus
+# null (or absent) = GO enrichment disabled
+go_organism:         null
+
+# WGCNA — Co-expression module analysis (longest step)
+# Set to false for exploratory analyses
+make_wgcna:          false
+
+# Interactive HTML dashboard (requires build_dashboardv7.py)
+make_dashboard:      true
+
+# DEqMS — Peptide-count weighting (requires report.pr_matrix.tsv)
+use_deqms:           false
+
+
+# ── Input file paths ──────────────────────────────────────────────────────────
+# Edit these paths if your files are not in the current directory.
+# These values can also be overridden via: --tsv, --design, --out-dir
+tsv_path:            report.pg_matrix.tsv
+design_path:         ExperimentalDesign.csv
+pr_path:             report.pr_matrix.tsv
+out_dir:             proteomics_output

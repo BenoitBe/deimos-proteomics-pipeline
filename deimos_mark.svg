@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <radialGradient id="dmSurf" cx="38%" cy="34%" r="68%">
+      <stop offset="0%" stop-color="#c4b49a"/><stop offset="45%" stop-color="#8a7560"/><stop offset="100%" stop-color="#3d3028"/>
+    </radialGradient>
+    <radialGradient id="dmTerm" cx="72%" cy="62%" r="55%">
+      <stop offset="0%" stop-color="#1a1008" stop-opacity="0.8"/><stop offset="100%" stop-color="#1a1008" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="dmSpec" cx="32%" cy="27%" r="32%">
+      <stop offset="0%" stop-color="#e8dcc8" stop-opacity="0.6"/><stop offset="100%" stop-color="#e8dcc8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="dmHalo" cx="50%" cy="50%" r="50%">
+      <stop offset="72%" stop-color="#c0622a" stop-opacity="0"/><stop offset="100%" stop-color="#c0622a" stop-opacity="0.30"/>
+    </radialGradient>
+    <clipPath id="dmClip">
+      <path d="M52 14 C76 11,98 20,108 38 C120 60,116 86,108 104 C99 124,80 138,56 142 C34 146,14 136,8 114 C3 94,6 66,18 46 C28 28,38 17,52 14 Z" transform="scale(0.82) translate(8 6)"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(2 2)">
+    <path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmSurf)"/>
+    <path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmTerm)"/>
+    <path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmSpec)"/>
+    <g clip-path="url(#dmClip)">
+      <ellipse cx="42" cy="52" rx="15" ry="12" fill="#5c4a35" opacity="0.30"/>
+      <ellipse cx="42" cy="52" rx="15" ry="12" fill="none" stroke="#2e2318" stroke-width="2" opacity="0.5"/>
+      <ellipse cx="78" cy="90" rx="10" ry="8" fill="#5c4a35" opacity="0.25"/>
+      <ellipse cx="78" cy="90" rx="10" ry="8" fill="none" stroke="#2e2318" stroke-width="1.6" opacity="0.45"/>
+      <circle cx="66" cy="30" r="5" fill="#4a3a28" opacity="0.3"/>
+      <circle cx="24" cy="92" r="4" fill="#4a3a28" opacity="0.25"/>
+    </g>
+    <path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmHalo)"/>
+  </g>
+</svg>

@@ -1,0 +1,17 @@
+label;condition;replicate
+Sple-WT-01;WT;1
+Sple-WT-02;WT;2
+Sple-WT-03;WT;3
+Sple-WT-04;WT;4
+Sple-KO-01;KO;1
+Sple-KO-02;KO;2
+Sple-KO-03;KO;3
+Sple-KO-04;KO;4
+Sple-WT-stress-01;WT_stress;1
+Sple-WT-stress-02;WT_stress;2
+Sple-WT-stress-03;WT_stress;3
+Sple-WT-stress-04;WT_stress;4
+Sple-KO-stress-01;KO_stress;1
+Sple-KO-stress-02;KO_stress;2
+Sple-KO-stress-03;KO_stress;3
+Sple-KO-stress-04;KO_stress;4

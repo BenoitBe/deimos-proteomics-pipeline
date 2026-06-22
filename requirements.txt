@@ -1,0 +1,34 @@
+# Deimos — DIA Expression Integrated Multi-Omics Suite
+# pip install -r requirements.txt
+
+# Core data stack
+pandas
+numpy
+scipy
+scikit-learn
+
+# Visualisation
+matplotlib
+seaborn
+adjustText          # label anti-overlap on volcanos (ggrepel equivalent)
+
+# Dimensionality reduction
+umap-learn
+
+# Excel I/O
+openpyxl
+pillow              # image resizing before Excel insertion
+
+# Heatmaps
+PyComplexHeatmap    # clustered heatmap with dendrograms (optional, auto-fallback)
+
+# Config
+pyyaml
+
+# GO/KEGG enrichment (optional — pipeline runs without it)
+gprofiler-official
+
+# Dashboard JS dependencies (not pip-installable — manual placement required)
+# chart.umd.min.js   : https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js
+# xlsx.full.min.js   : https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+# -> Place both files alongside build_dashboardv7.py for offline dashboard generation

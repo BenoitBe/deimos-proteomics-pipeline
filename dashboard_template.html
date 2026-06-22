@@ -1,0 +1,1602 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Proteogen — Proteomics Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root{
+  --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bg4:#2d333b;
+  --bd:rgba(240,246,252,.1);--bd2:rgba(240,246,252,.2);
+  --tx:#e6edf3;--tx2:#8b949e;--tx3:#6e7681;
+  --up:#3fb950;--dn:#f85149;--bl:#388bfd;--am:#d29922;--pu:#bc8cff;--ac:#1f6feb;
+  --cl1:#f0e68c;--cl2:#87ceeb;--cl3:#dda0dd;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.5;}
+nav{background:var(--bg2);border-bottom:1px solid var(--bd);padding:0 20px;display:flex;align-items:center;gap:2px;height:50px;position:sticky;top:0;z-index:200;}
+.logo{font-size:14px;font-weight:700;letter-spacing:.5px;margin-right:14px;display:inline-flex;align-items:center;gap:8px;}
+.logo svg{width:26px;height:26px;flex:0 0 auto;border-radius:5px;box-shadow:0 1px 3px rgba(0,0,0,.4);}
+.logo .logo-txt{display:inline-flex;flex-direction:column;line-height:1.1;}
+.logo .logo-sub{font-size:9px;font-weight:400;letter-spacing:.3px;color:var(--tx2);}
+nav a{color:var(--tx2);text-decoration:none;font-size:12px;padding:6px 10px;border-radius:6px;cursor:pointer;transition:all .15s;white-space:nowrap;}
+nav a:hover,nav a.active{color:var(--tx);background:var(--bg3);}
+.page{display:none;padding:18px 20px;max-width:1440px;margin:0 auto;}
+.page.active{display:block;}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px;}
+.kpi{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px 16px;}
+.kpi .lbl{font-size:10px;color:var(--tx2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px;}
+.kpi .val{font-size:22px;font-weight:700;}
+.kpi .sub{font-size:10px;color:var(--tx3);margin-top:2px;}
+.panel{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px 16px;margin-bottom:14px;}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+.ph h2{font-size:14px;font-weight:600;}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px;}
+select,input[type=range],input[type=text]{background:var(--bg3);border:1px solid var(--bd2);color:var(--tx);border-radius:6px;padding:5px 9px;font-size:12px;}
+select:focus,input:focus{outline:1px solid var(--ac);}
+input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
+.badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;}
+.bu{background:rgba(63,185,80,.15);color:var(--up);}
+.bd2c{background:rgba(248,81,73,.15);color:var(--dn);}
+.bn{background:var(--bg3);color:var(--tx2);}
+.tip{position:fixed;background:var(--bg4);border:1px solid var(--bd2);border-radius:6px;padding:9px 12px;font-size:12px;pointer-events:none;z-index:9999;max-width:300px;line-height:1.6;display:none;}
+.tip .tg{font-weight:700;font-size:13px;margin-bottom:2px;}
+.tip .tl{color:var(--tx2);}
+.dep-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px;}
+.dep-card{background:var(--bg3);border:1px solid var(--bd);border-radius:6px;padding:9px 10px;cursor:pointer;transition:border-color .15s;}
+.dep-card:hover,.dep-card.active{border-color:var(--ac);}
+.dep-card .dcn{font-size:9px;color:var(--tx2);margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.dep-card .dcu{color:var(--up);font-size:13px;font-weight:700;}
+.dep-card .dcd{color:var(--dn);font-size:13px;font-weight:700;}
+.dep-card .dcs{color:var(--tx3);font-size:11px;margin:0 2px;}
+.ctrl{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;}
+.clbl{font-size:11px;color:var(--tx2);}
+.sv{font-size:12px;font-weight:700;min-width:28px;color:var(--ac);}
+.go-wrap{overflow-y:auto;max-height:240px;}
+.go-bar{display:flex;align-items:center;gap:7px;padding:4px 0;border-bottom:1px solid var(--bd);}
+.go-bar .gn{flex:1;font-size:10px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+.go-bar .gt{width:90px;height:5px;background:var(--bg3);border-radius:3px;flex-shrink:0;}
+.go-bar .gf{height:5px;border-radius:3px;}
+.go-bar .gp{width:66px;font-size:10px;color:var(--tx2);text-align:right;flex-shrink:0;}
+.cbtn{padding:4px 11px;border-radius:14px;border:1px solid var(--bd2);background:var(--bg3);color:var(--tx2);cursor:pointer;font-size:11px;transition:all .15s;white-space:nowrap;}
+.cbtn:hover{border-color:var(--ac);color:var(--tx);}
+.cbtn.active{background:var(--ac);border-color:var(--ac);color:#fff;}
+.hm-legend{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--tx2);margin-bottom:8px;flex-wrap:wrap;}
+.hm-grad{width:90px;height:7px;border-radius:3px;background:linear-gradient(to right,#388bfd,#21262d,#f85149);}
+.hm-cl{display:inline-flex;align-items:center;gap:4px;margin-left:6px;}
+.hm-dot{width:8px;height:8px;border-radius:2px;}
+.pt{width:100%;border-collapse:collapse;font-size:12px;}
+.pt th{background:var(--bg3);color:var(--tx2);padding:7px 10px;text-align:left;font-weight:500;border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:10;}
+.pt td{padding:6px 10px;border-bottom:1px solid var(--bd);}
+.pt tr:hover td{background:var(--bg3);}
+.mono{font-family:monospace;font-size:11px;color:var(--tx2);}
+.itbl{width:100%;border-collapse:collapse;font-size:11px;}
+.itbl th{background:var(--bg3);color:var(--tx2);padding:6px 8px;text-align:left;font-weight:500;border-bottom:1px solid var(--bd);position:sticky;top:0;white-space:nowrap;}
+.itbl td{padding:5px 8px;border-bottom:1px solid var(--bd);}
+.itbl tr:hover td{background:var(--bg3);}
+.ix{color:var(--up);font-weight:700;}
+.exp-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;}
+.exp-btn{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:6px;border:1px solid var(--bd2);background:var(--bg3);color:var(--tx);cursor:pointer;font-size:11px;font-weight:500;transition:all .15s;white-space:nowrap;}
+.exp-btn:hover{background:var(--bg4);border-color:var(--ac);}
+.exp-btn.grn{border-color:rgba(63,185,80,.4);color:var(--up);}
+.exp-btn.grn:hover{background:rgba(63,185,80,.1);}
+.exp-sep{width:1px;height:20px;background:var(--bd2);}
+.exp-lbl{font-size:10px;color:var(--tx3);}
+.wg-ph{border:2px dashed var(--bd2);border-radius:8px;padding:36px;text-align:center;color:var(--tx2);}
+.radio-grp{display:flex;gap:4px;background:var(--bg3);border-radius:6px;padding:3px;}
+.radio-grp label{padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;color:var(--tx2);transition:all .15s;}
+.radio-grp input{display:none;}
+.radio-grp input:checked+label{background:var(--ac);color:#fff;}
+</style>
+</head>
+<body>
+<nav>
+  <span class="logo"><svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><defs><radialGradient id="dmSurf" cx="38%" cy="34%" r="68%"><stop offset="0%" stop-color="#c4b49a"/><stop offset="45%" stop-color="#8a7560"/><stop offset="100%" stop-color="#3d3028"/></radialGradient><radialGradient id="dmTerm" cx="72%" cy="62%" r="55%"><stop offset="0%" stop-color="#1a1008" stop-opacity="0.8"/><stop offset="100%" stop-color="#1a1008" stop-opacity="0"/></radialGradient><radialGradient id="dmSpec" cx="32%" cy="27%" r="32%"><stop offset="0%" stop-color="#e8dcc8" stop-opacity="0.6"/><stop offset="100%" stop-color="#e8dcc8" stop-opacity="0"/></radialGradient><radialGradient id="dmHalo" cx="50%" cy="50%" r="50%"><stop offset="72%" stop-color="#c0622a" stop-opacity="0"/><stop offset="100%" stop-color="#c0622a" stop-opacity="0.30"/></radialGradient><clipPath id="dmClip"><path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z"/></clipPath></defs><path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmSurf)"/><path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmTerm)"/><path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmSpec)"/><g clip-path="url(#dmClip)"><ellipse cx="42" cy="52" rx="15" ry="12" fill="#5c4a35" opacity="0.30"/><ellipse cx="42" cy="52" rx="15" ry="12" fill="none" stroke="#2e2318" stroke-width="2" opacity="0.5"/><ellipse cx="78" cy="90" rx="10" ry="8" fill="#5c4a35" opacity="0.25"/><ellipse cx="78" cy="90" rx="10" ry="8" fill="none" stroke="#2e2318" stroke-width="1.6" opacity="0.45"/><circle cx="66" cy="30" r="5" fill="#4a3a28" opacity="0.3"/><circle cx="24" cy="92" r="4" fill="#4a3a28" opacity="0.25"/></g><path d="M50 8 C72 6,92 14,101 32 C112 52,109 76,101 92 C93 110,76 122,54 126 C33 130,15 121,9 100 C4 82,7 56,18 38 C27 22,37 11,50 8 Z" fill="url(#dmHalo)"/></svg><span class="logo-txt"><span>Proteogen</span><span class="logo-sub">Université de Caen</span></span></span>
+  <a class="active" onclick="showPage('overview')">Overview</a>
+  <a onclick="showPage('volcano')">Volcano</a>
+  <a onclick="showPage('gopage')">GO</a>
+  <a onclick="showPage('heatmap')">Heatmap</a>
+  <a onclick="showPage('intersect')">Intersections</a>
+  <a onclick="showPage('proteins')">DEP Table</a>
+  <a onclick="showPage('qcpage')">QC / PCA</a>
+  <a onclick="showPage('wgcna')">WGCNA</a>
+</nav>
+
+<!-- OVERVIEW -->
+<div id="overview" class="page active">
+  <div class="exp-bar">
+    <span class="exp-lbl">Export:</span>
+    <button class="exp-btn grn" onclick="exportAllDEP()">📊 All DEP</button>
+    <div class="exp-sep"></div>
+    <button class="exp-btn" onclick="exportTop20Pi()">⭐ Top 20 Pi</button>
+    <button class="exp-btn" onclick="exportGOAll()">🧬 Full GO</button>
+  </div>
+  <div class="kpi-grid" id="kpiGrid"></div>
+  <div class="row2">
+    <div class="panel">
+      <div class="ph"><h2>DEP per contrast</h2><span style="font-size:10px;color:var(--tx2)">p&lt;0.05 · |LFC|&gt;0.26</span></div>
+      <div style="position:relative;height:240px;"><canvas id="barContrasts"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="ph"><h2>ANOVA clusters</h2></div>
+      <div style="position:relative;height:240px;"><canvas id="pieCluster"></canvas></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph">
+      <h2>Top 20 — Pi Score (|LFC|×−log₁₀p)</h2>
+      <span style="font-size:10px;color:var(--tx2)">max score across all comparisons</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start;">
+      <div style="position:relative;height:280px;"><canvas id="piChart"></canvas></div>
+      <div id="piDescList" style="overflow-y:auto;max-height:280px;"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><h2>Most recurrent GO:BP (all contrasts)</h2></div>
+    <div style="position:relative;height:200px;"><canvas id="goGlobal"></canvas></div>
+  </div>
+</div>
+
+<!-- VOLCANO -->
+<div id="volcano" class="page">
+  <div class="dep-grid" id="depGrid"></div>
+  <div class="exp-bar">
+    <span class="exp-lbl">Export:</span>
+    <button class="exp-btn grn" onclick="exportVolcSig()">📊 Significant DEP</button>
+    <button class="exp-btn" onclick="exportVolcAll()">📋 All proteins</button>
+  </div>
+  <div class="panel">
+    <div class="ctrl">
+      <span class="clbl">|LFC| ≥</span>
+      <input type="range" id="fcSlider" min="0" max="2" step="0.05" value="0.26" style="width:80px;">
+      <span class="sv" id="fcVal">0.26</span>
+      <div class="radio-grp" title="Significance threshold">
+        <input type="radio" name="ptype" id="use_pval" value="p" checked>
+        <label for="use_pval">p.val</label>
+        <input type="radio" name="ptype" id="use_padj" value="padj">
+        <label for="use_padj">p.adj</label>
+      </div>
+      <span class="clbl">threshold ≤</span>
+      <input type="range" id="pThresh" min="0.001" max="0.1" step="0.001" value="0.05" style="width:80px;">
+      <span class="sv" id="pThreshVal">0.05</span>
+      <span class="clbl">Robustness ≥</span>
+      <input type="range" id="robSlider" min="0" max="100" step="5" value="0" style="width:70px;">
+      <span class="sv" id="robVal">0</span>
+      <input type="text" id="volcSearch" placeholder="Search gene…" style="width:180px;">
+      <button id="btnInvert" onclick="toggleInvert()" style="margin-left:auto;padding:5px 12px;
+        border-radius:6px;border:1px solid var(--bd2);background:var(--bg3);color:var(--tx2);
+        cursor:pointer;font-size:11px;font-weight:500;transition:all .15s;"
+        title="Inverser le signe du LFC (A vs B → B vs A)">
+        ⇄ Inverser
+      </button>
+    </div>
+    <div style="position:relative;width:100%;height:460px;"><canvas id="volcCanvas"></canvas></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:5px;">
+      <span style="font-size:10px;color:var(--tx3);">Hover a point for details · NS subsampled (600/contrast)</span>
+      <button class="exp-btn" onclick="exportCanvas('volcCanvas','proteogen_volcano_'+activeContrast)" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+    </div>
+  </div>
+  <div class="tip" id="tooltip"></div>
+</div>
+
+<!-- GO -->
+<div id="gopage" class="page">
+  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+  <div style="display:flex;gap:6px;flex-wrap:wrap;flex:1;" id="goBtns"></div>
+  <button id="btnGoInvert" onclick="toggleGoInvert()" style="padding:5px 12px;
+    border-radius:6px;border:1px solid var(--bd2);background:var(--bg3);color:var(--tx2);
+    cursor:pointer;font-size:11px;font-weight:500;white-space:nowrap;transition:all .15s;"
+    title="Inverser le signe du z-score (A vs B → B vs A)">
+    ⇄ Inverser
+  </button>
+</div>
+  <div id="goSourcePanels" class="row3" style="margin-bottom:14px;"></div>
+  <div class="panel">
+    <div class="ph">
+      <h2>Z-score per term — red=up · blue=down</h2>
+      <button class="exp-btn" onclick="exportChartToCanvas('goZChart','proteogen_GO_zscore')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+    </div>
+    <div style="position:relative;height:300px;"><canvas id="goZChart"></canvas></div>
+  </div>
+  <div class="panel">
+    <div class="ph">
+      <h2>Distribution by source</h2>
+      <button class="exp-btn" onclick="exportChartToCanvas('goSrcChart','proteogen_GO_sources')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+    </div>
+    <div style="position:relative;height:180px;"><canvas id="goSrcChart"></canvas></div>
+  </div>
+  <div class="panel" id="goFigsPanel">
+    <div class="ph">
+      <h2>GO figures — from the analysis report</h2>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <div class="radio-grp" id="goFigTabs">
+          <input type="radio" name="goFig" id="gf_man" value="manhattan" checked>
+          <label for="gf_man">Manhattan</label>
+          <input type="radio" name="goFig" id="gf_lol" value="lollipop">
+          <label for="gf_lol">Lollipop</label>
+          <input type="radio" name="goFig" id="gf_dot" value="dotplot">
+          <label for="gf_dot">Dotplot</label>
+          <input type="radio" name="goFig" id="gf_cho" value="chord">
+          <label for="gf_cho">Chord</label>
+        </div>
+        <button class="exp-btn" onclick="downloadGOFig()" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+      </div>
+    </div>
+    <div id="goFigNoData" style="display:none;padding:16px;font-size:12px;color:var(--tx3);">Figure non disponible pour ce contraste.</div>
+    <div style="overflow:auto;text-align:center;">
+      <img id="goFigImg" src="" alt="GO figure" style="max-width:100%;border-radius:6px;display:none;">
+    </div>
+  </div>
+</div>
+
+<!-- HEATMAP -->
+<div id="heatmap" class="page">
+  <div class="exp-bar">
+    <span class="exp-lbl">Export:</span>
+    <button class="exp-btn grn" onclick="exportHmFiltered()">📊 Z-scores (filtered view)</button>
+    <button class="exp-btn" onclick="exportHmAll()">📋 Z-scores complets (847)</button>
+  </div>
+  <div class="ctrl">
+    <span class="clbl">Cluster :</span>
+    <select id="hmCluster"><option value="all">Tous</option></select>
+    <span class="clbl">Top N :</span>
+    <input type="range" id="hmN" min="20" max="847" step="10" value="100" style="width:100px;">
+    <span class="sv" id="hmNVal">100</span>
+    <span class="clbl">Tri :</span>
+    <select id="hmSort"><option value="q">q-value</option><option value="cl">Cluster</option></select>
+    <input type="text" id="hmSearch" placeholder="Gene…" style="margin-left:auto;width:140px;">
+  </div>
+  <div class="hm-legend">
+    <span>Z-score :</span><span style="color:#388bfd;">−2</span>
+    <div class="hm-grad"></div><span style="color:#f85149;">+2</span>
+    <span id="hmClusterLegend"></span>
+    <span style="margin-left:8px;font-size:10px;color:var(--tx3);" id="hmInfo"></span>
+    <button class="exp-btn" onclick="exportCanvas('hmCanvas','proteogen_heatmap')" style="padding:3px 9px;font-size:10px;margin-left:8px;">⬇ PNG</button>
+    <span style="margin-left:12px;font-size:10px;color:var(--tx2);">Conditions :</span>
+    <div id="condLegend" style="display:flex;gap:8px;"></div>
+  </div>
+  <div style="overflow:auto;max-height:75vh;"><canvas id="hmCanvas" style="display:block;"></canvas></div>
+</div>
+
+<!-- INTERSECTIONS -->
+<div id="intersect" class="page">
+  <div class="exp-bar">
+    <span class="exp-lbl">Export:</span>
+    <button class="exp-btn grn" onclick="exportInterFiltered()">📊 Filtered view</button>
+    <button class="exp-btn" onclick="exportInterAll()">📋 Toutes</button>
+  </div>
+  <div class="panel">
+    <div class="ph">
+      <h2>UpSet Plot — Intersections</h2>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:10px;color:var(--tx2)">Barres sup = taille intersection · Matrice = combinaison · Barres gauche = taille set</span>
+        <button class="exp-btn" onclick="exportCanvas('upsetCanvas','proteogen_upset')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+      </div>
+    </div>
+    <div style="overflow-x:auto;"><canvas id="upsetCanvas" style="display:block;"></canvas></div>
+  </div>
+  <div class="ctrl">
+    <span class="clbl">Nb conditions min :</span>
+    <input type="range" id="nbMin" min="1" max="6" step="1" value="1" style="width:80px;">
+    <span class="sv" id="nbMinVal">1</span>
+    <input type="text" id="interSearch" placeholder="Gene / protein / description…" style="margin-left:auto;width:220px;">
+  </div>
+  <div class="panel" style="overflow:auto;max-height:460px;">
+    <table class="itbl"><thead><tr id="interHead">
+      <th>Protein</th><th>Gene</th><th>Description</th><th>N</th>
+    </tr></thead><tbody id="interBody"></tbody></table>
+  </div>
+  <div style="font-size:11px;color:var(--tx2);margin-top:6px;" id="interCount"></div>
+</div>
+
+<!-- TABLE DEP -->
+<div id="proteins" class="page">
+  <div class="exp-bar">
+    <span class="exp-lbl">Export:</span>
+    <button class="exp-btn grn" onclick="exportProtFiltered()">📊 Filtered view</button>
+  </div>
+  <div class="ctrl">
+    <select id="protContrast" style="min-width:210px;"></select>
+    <select id="protDir"><option value="all">Tous DEP</option><option value="U">↑ Up</option><option value="D">↓ Down</option></select>
+    <span class="clbl">Robustness ≥</span>
+    <input type="range" id="protRob" min="0" max="100" step="5" value="0" style="width:80px;">
+    <span class="sv" id="protRobVal">0</span>
+    <div class="radio-grp">
+      <input type="radio" name="ptypeProt" id="pp_pval" value="p" checked>
+      <label for="pp_pval">p.val</label>
+      <input type="radio" name="ptypeProt" id="pp_padj" value="padj">
+      <label for="pp_padj">p.adj</label>
+    </div>
+    <span class="clbl">threshold ≤</span>
+    <input type="range" id="protPThresh" min="0.001" max="0.1" step="0.001" value="0.05" style="width:80px;">
+    <span class="sv" id="protPThreshVal">0.05</span>
+    <input type="text" id="protSearch" placeholder="Gene / protein…" style="margin-left:auto;width:180px;">
+  </div>
+  <div class="panel" style="overflow:auto;max-height:65vh;">
+    <table class="pt"><thead><tr>
+      <th>Protein</th><th>Gene</th><th>Description</th><th>Status</th>
+      <th>LFC</th><th>p.val</th><th>p.adj</th><th>Pi score</th><th>Robustness</th>
+    </tr></thead><tbody id="protBody"></tbody></table>
+  </div>
+  <div style="font-size:11px;color:var(--tx2);margin-top:6px;" id="protCount"></div>
+</div>
+
+<!-- QC / PCA -->
+<div id="qcpage" class="page">
+  <div class="row2">
+    <div class="panel">
+      <div class="ph">
+        <h2>PCA — ANOVA significant proteins (n=847)</h2>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:10px;color:var(--tx2);" id="pcaVarExp"></span>
+          <button class="exp-btn" onclick="exportCanvas('pcaCanvas','proteogen_PCA')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+        </div>
+      </div>
+      <div class="ctrl">
+        <div class="radio-grp">
+          <input type="radio" name="pcaAxes" id="pca12" value="12" checked>
+          <label for="pca12">PC1 vs PC2</label>
+          <input type="radio" name="pcaAxes" id="pca13" value="13">
+          <label for="pca13">PC1 vs PC3</label>
+          <input type="radio" name="pcaAxes" id="pca23" value="23">
+          <label for="pca23">PC2 vs PC3</label>
+        </div>
+      </div>
+      <div style="position:relative;width:100%;height:380px;"><canvas id="pcaCanvas"></canvas></div>
+      <div class="tip" id="pcaTip"></div>
+    </div>
+    <div class="panel">
+      <div class="ph">
+        <h2>Scatter plots — Mean log₂ intensity per condition</h2>
+        <button class="exp-btn" onclick="exportCanvas('scatterCanvas','proteogen_scatter_'+document.getElementById('scatterContrast').value)" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+      </div>
+      <div class="ctrl">
+        <span class="clbl">Comparaison :</span>
+        <select id="scatterContrast" style="min-width:200px;"></select>
+      </div>
+      <div style="position:relative;width:100%;height:380px;"><canvas id="scatterCanvas"></canvas></div>
+      <div class="tip" id="scatterTip"></div>
+    </div>
+  </div>
+</div>
+
+<!-- WGCNA -->
+<div id="wgcna" class="page">
+  <div class="kpi-grid" id="wgcnaKpi"></div>
+  <div class="row2">
+    <div class="panel">
+      <div class="ph"><h2>Hub proteins per module — Top 5 (kME)</h2></div>
+      <div style="position:relative;height:320px;"><canvas id="wgcnaHubChart"></canvas></div>
+    </div>
+    <div class="panel">
+      <div class="ph"><h2>Distribution des modules</h2></div>
+      <div style="position:relative;height:320px;"><canvas id="wgcnaModPie"></canvas></div>
+    </div>
+  </div>
+  <div class="exp-bar">
+    <span class="exp-lbl">Export:</span>
+    <button class="exp-btn grn" onclick="exportWGCNA()">📊 Full WGCNA table</button>
+  </div>
+  <div class="ctrl">
+    <span class="clbl">Module :</span>
+    <select id="wgcnaMod"><option value="all">Tous</option></select>
+    <input type="text" id="wgcnaSearch" placeholder="Gene…" style="margin-left:auto;width:160px;">
+  </div>
+  <div class="panel" style="overflow:auto;max-height:460px;">
+    <table class="pt"><thead><tr>
+      <th>Gene</th><th>Module</th><th>HubScore (kME)</th><th>Description</th>
+    </tr></thead><tbody id="wgcnaBody"></tbody></table>
+  </div>
+  <div style="font-size:11px;color:var(--tx2);margin-top:6px;" id="wgcnaCount"></div>
+</div>
+
+<script>
+__DATA_INJECTION__
+</script>
+<script>
+/* ── POLYFILL ── */
+if(!CanvasRenderingContext2D.prototype.roundRect){
+  CanvasRenderingContext2D.prototype.roundRect=function(x,y,w,h,r){
+    r=Math.min(r,w/2,h/2);
+    this.moveTo(x+r,y);this.lineTo(x+w-r,y);this.arcTo(x+w,y,x+w,y+r,r);
+    this.lineTo(x+w,y+h-r);this.arcTo(x+w,y+h,x+w-r,y+h,r);
+    this.lineTo(x+r,y+h);this.arcTo(x,y+h,x,y+h-r,r);
+    this.lineTo(x,y+r);this.arcTo(x,y,x+r,y,r);this.closePath();return this;
+  };
+}
+Chart.defaults.color='#8b949e';
+Chart.defaults.borderColor='rgba(240,246,252,.06)';
+Chart.defaults.font.size=11;
+
+/* ── Robust numeric helpers (avoid Math.min(...bigArray) which freezes) ── */
+function _minOf(arr){var m=Infinity;for(var i=0;i<arr.length;i++){if(arr[i]<m)m=arr[i];}return m;}
+function _maxOf(arr){var m=-Infinity;for(var i=0;i<arr.length;i++){if(arr[i]>m)m=arr[i];}return m;}
+
+let activeContrast=CONTRASTS[0];
+let invertActive=false;
+let currentGOContrast=CONTRASTS[0];
+let goZChart=null,goSrcChart=null;
+let goInvertActive=false;
+
+const COND_COLORS={};
+CONDITIONS.forEach((c,i)=>{
+  const palette=['#388bfd','#3fb950','#d29922','#bc8cff','#f85149','#39d353'];
+  COND_COLORS[c]=palette[i%palette.length];
+});
+
+/* ── ROUTING ── */
+function showPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('nav a').forEach(a=>a.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  ['overview','volcano','gopage','heatmap','intersect','proteins','qcpage','wgcna'].forEach((n,i)=>{
+    if(n===id)document.querySelectorAll('nav a')[i].classList.add('active');
+  });
+  if(id==='volcano')drawVolcano();
+  if(id==='heatmap'){buildCondLegend();drawHeatmap();}
+  if(id==='proteins')renderProtTable();
+  if(id==='intersect'){renderIntersect();initUpset();}
+  if(id==='qcpage')initQC();
+  if(id==='wgcna')initWGCNA();
+}
+
+/* ── OVERVIEW ── */
+function initOverview(){
+  // Destroy Chart.js charts already present on these canvases (otherwise
+  // Chart.js throws "Canvas is already in use" and the page ends up freezing).
+  ['barContrasts','pieCluster','piChart','goGlobal'].forEach(function(id){
+    try{
+      var c=document.getElementById(id);
+      if(c && window.Chart && Chart.getChart){
+        var ex=Chart.getChart(c);
+        if(ex) ex.destroy();
+      }
+    }catch(e){}
+  });
+  const grid=document.getElementById('kpiGrid');
+  const kpis=[
+    {lbl:'Quantified proteins',val:STATS.total_proteins.toLocaleString('fr'),sub:'filtered & imputed',col:'var(--bl)'},
+    {lbl:'DEP ANOVA',val:STATS.sig_anova,sub:'',col:'var(--pu)'},
+    {lbl:'Total DEP',val:(STATS.total_dep!==undefined?STATS.total_dep:'—'),sub:'toutes comparaisons',col:'var(--up)'},
+    {lbl:'Comparaisons',val:CONTRASTS.length,sub:CONDITIONS.length+' conditions',col:'var(--tx)'},
+  ];
+  grid.innerHTML=kpis.map(k=>`<div class="kpi"><div class="lbl">${k.lbl}</div><div class="val" style="color:${k.col}">${k.val}</div><div class="sub">${k.sub||''}</div></div>`).join('');
+
+  const short=c=>c.replace(/_vs_/g,' vs ').replace(/_/g,' ').replace('Polyculture','Poly');
+  new Chart(document.getElementById('barContrasts'),{
+    type:'bar',
+    data:{labels:CONTRASTS.map(short),datasets:[
+      {label:'Up',data:CONTRASTS.map(c=>STATS.contrasts_summary[c].up),backgroundColor:'rgba(63,185,80,.65)',borderRadius:3},
+      {label:'Down',data:CONTRASTS.map(c=>-STATS.contrasts_summary[c].down),backgroundColor:'rgba(248,81,73,.65)',borderRadius:3}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b949e'}}},
+      scales:{x:{ticks:{color:'#8b949e',maxRotation:30}},y:{ticks:{color:'#8b949e'}}}}
+  });
+
+  const clKeys=Object.keys(STATS.clusters);
+  new Chart(document.getElementById('pieCluster'),{
+    type:'doughnut',
+    data:{labels:clKeys.map(k=>k+' ('+STATS.clusters[k]+')'),
+      datasets:[{data:clKeys.map(k=>STATS.clusters[k]),
+        backgroundColor:['rgba(240,232,140,.45)','rgba(135,206,235,.45)','rgba(221,160,221,.45)'],
+        borderColor:['#f0e68c','#87ceeb','#dda0dd'],borderWidth:1.5}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b949e'}}}}
+  });
+
+  new Chart(document.getElementById('piChart'),{
+    type:'bar',
+    data:{labels:TOP20_PI.map(p=>p.gene||p.name),
+      datasets:[{label:'Pi score',data:TOP20_PI.map(p=>+p.pi.toFixed(2)),
+        backgroundColor:'rgba(56,139,253,.6)',borderRadius:2}]},
+    options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
+      plugins:{legend:{display:false},
+        tooltip:{callbacks:{label:ctx=>' Pi = '+ctx.raw.toFixed(2),afterLabel:ctx=>{const d=TOP20_PI[ctx.dataIndex].desc;return d?'  '+d:'';} }}},
+      scales:{x:{ticks:{color:'#8b949e'}},y:{ticks:{color:'#8b949e',font:{size:10}}}}}
+  });
+
+  document.getElementById('piDescList').innerHTML=TOP20_PI.map((p,i)=>`
+    <div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;border-bottom:1px solid var(--bd);">
+      <span style="font-size:10px;color:var(--tx3);min-width:16px;text-align:right;">${i+1}</span>
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:12px;font-weight:600;color:#c9d1d9;">${p.gene||p.name}</div>
+        <div style="font-size:10px;color:var(--tx2);line-height:1.4;" title="${p.desc}">${p.desc||'—'}</div>
+      </div>
+      <span style="font-size:11px;font-weight:700;color:var(--bl);flex-shrink:0;">${p.pi.toFixed(1)}</span>
+    </div>`).join('');
+
+  const termCnt={};
+  CONTRASTS.forEach(c=>{(GO_DATA[c]||[]).filter(t=>t.source==='GO:BP').slice(0,5).forEach(t=>{termCnt[t.term_name]=(termCnt[t.term_name]||0)+1;});});
+  // "Recurrent" = present in at least 2 contrasts; otherwise we fill
+  // with the most frequent ones to avoid an empty chart.
+  let entries=Object.entries(termCnt).sort((a,b)=>b[1]-a[1]);
+  let recurrent=entries.filter(e=>e[1]>=2);
+  const topGO=(recurrent.length>=3?recurrent:entries).slice(0,14);
+  new Chart(document.getElementById('goGlobal'),{
+    type:'bar',
+    data:{labels:topGO.map(e=>e[0].length>40?e[0].slice(0,40)+'…':e[0]),
+      datasets:[{label:'Nb contrastes',data:topGO.map(e=>e[1]),backgroundColor:'rgba(188,140,255,.6)',borderRadius:2}]},
+    options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#8b949e',stepSize:1,precision:0},beginAtZero:true},y:{ticks:{color:'#8b949e',font:{size:10}}}}}
+  });
+}
+
+/* ── DEP GRID ── */
+function initDepGrid(){
+  const wrap=document.getElementById('depGrid');
+  CONTRASTS.forEach((c,i)=>{
+    const s=STATS.contrasts_summary[c];
+    const lbl=c.replace(/_vs_/g,' vs ').replace(/_/g,' ');
+    const div=document.createElement('div');
+    div.className='dep-card'+(i===0?' active':'');
+    div.innerHTML='<div class="dcn" title="'+lbl+'">'+lbl+'</div><span class="dcu">↑'+s.up+'</span><span class="dcs">/</span><span class="dcd">↓'+s.down+'</span>';
+    div.onclick=()=>{
+      document.querySelectorAll('.dep-card').forEach(d=>d.classList.remove('active'));
+      div.classList.add('active');
+      activeContrast=c;
+      // Reset inversion on contrast switch
+      if(invertActive){ invertActive=false; const btn=document.getElementById('btnInvert');
+        if(btn){btn.style.background='var(--bg3)';btn.style.borderColor='var(--bd2)';btn.style.color='var(--tx2)';btn.textContent='⇄ Inverser';} }
+      drawVolcano();
+    };
+    wrap.appendChild(div);
+  });
+}
+
+/* ── VOLCANO ── */
+function getVolcFilter(){
+  const fc=parseFloat(document.getElementById('fcSlider').value);
+  const ptype=document.querySelector('input[name="ptype"]:checked').value;
+  const thresh=parseFloat(document.getElementById('pThresh').value);
+  const rob=parseInt(document.getElementById('robSlider').value);
+  const search=(document.getElementById('volcSearch').value||'').toLowerCase().trim();
+  return {fc,ptype,thresh,rob,search};
+}
+function isSig(p, fc, ptype, thresh){
+  const pv = ptype==='padj' ? parseFloat(p.padj) : parseFloat(p.p);
+  return !isNaN(pv) && pv <= thresh && Math.abs(p.d) > fc;
+}
+
+function toggleInvert(){
+  invertActive = !invertActive;
+  const btn = document.getElementById('btnInvert');
+  if(btn){
+    btn.style.background    = invertActive ? 'rgba(248,81,73,.15)' : 'var(--bg3)';
+    btn.style.borderColor   = invertActive ? 'rgba(248,81,73,.5)'  : 'var(--bd2)';
+    btn.style.color         = invertActive ? 'var(--dn)'           : 'var(--tx2)';
+    btn.textContent         = invertActive ? '⇄ Inverted'           : '⇄ Inverser';
+  }
+  drawVolcano();
+}
+
+function drawVolcano(){
+  const {fc,ptype,thresh,rob,search}=getVolcFilter();
+  const rawPts=(VOLCANO[activeContrast]||[]).filter(p=>p.r>=rob);
+  const pts = invertActive
+    ? rawPts.map(p=>({...p, d:-p.d, s: p.s==='U'?'D': p.s==='D'?'U': p.s}))
+    : rawPts;
+  const canvas=document.getElementById('volcCanvas');
+  const ctx=canvas.getContext('2d');
+  const W=canvas.offsetWidth||900;const H=460;
+  const dpr=devicePixelRatio||1;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  ctx.scale(dpr,dpr);
+  const pad={l:54,r:22,t:24,b:46};
+  const pw=W-pad.l-pad.r;const ph=H-pad.t-pad.b;
+  // y-axis: always -log10(p.val) for visual
+  const xv=pts.map(p=>p.d),yv=pts.map(p=>p.lp);
+  if(!xv.length)return;
+  const xmin=Math.min(_minOf(xv),0)-0.4,xmax=Math.max(_maxOf(xv),0)+0.4;
+  const ythresh=-Math.log10(Math.max(thresh,1e-10));
+  const ymax=Math.max(_maxOf(yv),ythresh+1)+0.5;
+  const sx=v=>(v-xmin)/(xmax-xmin)*pw+pad.l;
+  const sy=v=>ph-(v/ymax)*ph+pad.t;
+  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='rgba(240,246,252,.05)';ctx.lineWidth=.5;
+  for(let i=0;i<=5;i++){const y=pad.t+i*ph/5;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();}
+  ctx.strokeStyle='rgba(240,246,252,.22)';ctx.lineWidth=.8;ctx.setLineDash([4,4]);
+  [fc,-fc].forEach(v=>{ctx.beginPath();ctx.moveTo(sx(v),pad.t);ctx.lineTo(sx(v),pad.t+ph);ctx.stroke();});
+  ctx.beginPath();ctx.moveTo(pad.l,sy(ythresh));ctx.lineTo(pad.l+pw,sy(ythresh));ctx.stroke();
+  ctx.setLineDash([]);
+  let su=0,sd=0;
+  pts.forEach(p=>{
+    const x=sx(p.d),y=sy(p.lp);
+    const sig=isSig(p,fc,ptype,thresh);
+    const isU=sig&&p.d>fc,isD=sig&&p.d<-fc;
+    const hit=search&&((p.Genes||'').toLowerCase().includes(search)||(p.name||'').toLowerCase().includes(search));
+    let col='#2d333b',r=2.2;
+    if(isU){col='rgba(63,185,80,.75)';su++;}
+    if(isD){col='rgba(248,81,73,.75)';sd++;}
+    if(hit){col='#ffd700';r=6;ctx.strokeStyle='rgba(255,255,255,.6)';ctx.lineWidth=.8;}
+    ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();
+    if(hit)ctx.stroke();
+  });
+  ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillText(invertActive?'log₂ Fold Change (inverted)':'log₂ Fold Change',pad.l+pw/2,H-8);
+  ctx.save();ctx.translate(14,pad.t+ph/2);ctx.rotate(-Math.PI/2);ctx.fillText('−log₁₀(p-value)',0,0);ctx.restore();
+  ctx.font='10px sans-serif';
+  [-3,-2,-1,0,1,2,3].filter(v=>v>=xmin&&v<=xmax).forEach(v=>{ctx.textAlign='center';ctx.fillText(v,sx(v),H-28);});
+  ctx.textAlign='right';
+  [0,1,2,3,4,5].filter(v=>v<=ymax).forEach(v=>ctx.fillText(v,pad.l-5,sy(v)+4));
+  ctx.font='bold 12px sans-serif';ctx.textAlign='left';
+  ctx.fillStyle='rgba(63,185,80,.9)';ctx.fillText('↑ '+su,pad.l+pw-52,pad.t+16);
+  ctx.fillStyle='rgba(248,81,73,.9)';ctx.fillText('↓ '+sd,pad.l+pw-52,pad.t+32);
+  // label ptype
+  ctx.fillStyle='#6e7681';ctx.font='10px sans-serif';ctx.textAlign='right';
+  ctx.fillText('seuil '+ptype+' ≤ '+thresh,pad.l+pw-2,sy(ythresh)-4);
+  ctx.fillStyle='#6e7681';ctx.font='11px sans-serif';ctx.textAlign='center';
+  const parts=activeContrast.split('_vs_');
+  const contrastLabel=invertActive
+    ? (parts[1]||'').replace(/_/g,' ')+' vs '+(parts[0]||'').replace(/_/g,' ')
+    : activeContrast.replace(/_vs_/g,' vs ').replace(/_/g,' ');
+  ctx.fillText(contrastLabel,pad.l+pw/2,pad.t+14);
+  canvas._pts=pts;canvas._sx=sx;canvas._sy=sy;canvas._fc=fc;canvas._pt=ythresh;canvas._ptype=ptype;canvas._thresh=thresh;
+}
+
+function initVolcTooltip(){
+  const canvas=document.getElementById('volcCanvas');
+  const tt=document.getElementById('tooltip');
+  canvas.addEventListener('mousemove',e=>{
+    const rect=canvas.getBoundingClientRect();
+    const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    if(!canvas._pts)return;
+    let best=null,bd=1e9;
+    canvas._pts.forEach(p=>{
+      const dx=canvas._sx(p.d)-mx,dy=canvas._sy(p.lp)-my;
+      const dist=Math.sqrt(dx*dx+dy*dy);
+      if(dist<bd){bd=dist;best=p;}
+    });
+    if(bd<14&&best){
+      const sig=isSig(best,canvas._fc,canvas._ptype,canvas._thresh);
+      const isU=sig&&best.d>canvas._fc,isD=sig&&best.d<-canvas._fc;
+      const badge=isU?'<span class="badge bu">↑ Up</span>':isD?'<span class="badge bd2c">↓ Down</span>':'<span class="badge bn">NS</span>';
+      const descTxt=best.desc&&best.desc.trim()?'<div class="tl" style="font-style:italic;color:#8b949e;margin-top:1px;">'+best.desc+'</div>':'';
+      tt.innerHTML='<div class="tg">'+(best.Genes||best.name||'—')+'</div>'+
+        '<div class="tl"><code style="font-size:10px;color:#6e7681;">'+best.name+'</code></div>'+
+        descTxt+
+        '<div class="tl" style="margin-top:3px;">LFC:<b>'+best.d.toFixed(3)+'</b> p.val:<b>'+parseFloat(best.p).toExponential(2)+'</b> p.adj:<b>'+parseFloat(best.padj).toExponential(2)+'</b></div>'+
+        '<div class="tl">Pi:<b>'+parseFloat(best.pi).toFixed(3)+'</b> · Robustesse:<b>'+best.r+'/100</b></div>'+badge;
+      tt.style.display='block';tt.style.left=(e.clientX+16)+'px';tt.style.top=(e.clientY-12)+'px';
+    }else tt.style.display='none';
+  });
+  canvas.addEventListener('mouseleave',()=>{tt.style.display='none';});
+}
+
+/* ── GO ── */
+function toggleGoInvert(){
+  goInvertActive = !goInvertActive;
+  const btn = document.getElementById('btnGoInvert');
+  if(btn){
+    btn.style.background  = goInvertActive ? 'rgba(248,81,73,.15)' : 'var(--bg3)';
+    btn.style.borderColor = goInvertActive ? 'rgba(248,81,73,.5)'  : 'var(--bd2)';
+    btn.style.color       = goInvertActive ? 'var(--dn)'           : 'var(--tx2)';
+    btn.textContent       = goInvertActive ? '⇄ Inverted'           : '⇄ Inverser';
+  }
+  // Update contrast button labels
+  document.querySelectorAll('#goBtns .cbtn').forEach((btn,i) => {
+    const c = CONTRASTS[i];
+    const parts = c.split('_vs_');
+    btn.textContent = goInvertActive
+      ? parts[1].replace(/_/g,' ') + ' vs ' + parts[0].replace(/_/g,' ')
+      : c.replace(/_vs_/g,' vs ').replace(/_/g,' ');
+  });
+  renderGO(currentGOContrast);
+}
+
+function initGO(){
+  const wrap=document.getElementById('goBtns');
+  CONTRASTS.forEach((c,i)=>{
+    const btn=document.createElement('button');
+    btn.className='cbtn'+(i===0?' active':'');
+    const parts=c.split('_vs_');
+    btn.textContent=goInvertActive
+      ? parts[1].replace(/_/g,' ')+' vs '+parts[0].replace(/_/g,' ')
+      : c.replace(/_vs_/g,' vs ').replace(/_/g,' ');
+    btn.onclick=()=>{document.querySelectorAll('#goBtns .cbtn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');renderGO(c);};
+    wrap.appendChild(btn);
+  });
+  renderGO(CONTRASTS[0]);
+}
+function renderGO(c){
+  currentGOContrast=c;
+  const data=GO_DATA[c]||[];
+
+  // --- Dynamic source panels (canvas-based for PNG export) ---
+  const sources=[...new Set(data.map(t=>t.source))].sort();
+  const container=document.getElementById('goSourcePanels');
+  container.style.gridTemplateColumns='repeat('+Math.min(sources.length,3)+',1fr)';
+
+  // Build one panel per source with a canvas
+  container.innerHTML=sources.map(src=>{
+    const canvasId='goCanvas_'+src.replace(/[^a-zA-Z0-9]/g,'_');
+    return `<div class="panel">
+      <div class="ph">
+        <h2>${src}</h2>
+        <button class="exp-btn" onclick="exportCanvas('${canvasId}','proteogen_GO_${src.replace(/[^a-zA-Z0-9]/g,'_')}')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+      </div>
+      <canvas id="${canvasId}" style="display:block;width:100%;"></canvas>
+    </div>`;
+  }).join('');
+
+  // Draw each source canvas
+  sources.forEach(src=>{
+    const canvasId='goCanvas_'+src.replace(/[^a-zA-Z0-9]/g,'_');
+    const canvas=document.getElementById(canvasId);
+    if(!canvas)return;
+    const terms=data.filter(t=>t.source===src).sort((a,b)=>a.p_value-b.p_value).slice(0,12);
+    if(!terms.length){
+      canvas.style.display='none';
+      canvas.insertAdjacentHTML('afterend','<div style="color:#6e7681;font-size:11px;padding:8px;">Aucun terme</div>');
+      return;
+    }
+    // Apply GO inversion: flip z_score sign
+    const termsMod = goInvertActive ? terms.map(t=>({...t,z_score:-(t.z_score||0)})) : terms;
+    const maxZ=Math.max(...termsMod.map(t=>Math.abs(t.z_score||0)),0.01);
+    const maxP=Math.max(...termsMod.map(t=>-Math.log10(Math.max(t.p_value,1e-10))));
+    const dpr=devicePixelRatio||1;
+    const ROW=26, PAD={l:8,r:70,t:8,b:8}, BAR_ZONE=110, LABEL_W=160;
+    const W=canvas.offsetWidth||340;
+    const H=PAD.t+terms.length*ROW+PAD.b;
+    canvas.width=W*dpr; canvas.height=H*dpr;
+    canvas.style.height=H+'px';
+    const ctx=canvas.getContext('2d');
+    ctx.scale(dpr,dpr);
+    ctx.fillStyle='#161b22'; ctx.fillRect(0,0,W,H);
+
+    const srcAccentColors={'GO:BP':'#388bfd','GO:CC':'#3fb950','GO:MF':'#d29922','REAC':'#bc8cff','KEGG':'#f85149'};
+    const accentCol=srcAccentColors[src]||'#8b949e';
+
+    termsMod.forEach((t,i)=>{
+      const y=PAD.t+i*ROW;
+      const z=t.z_score||0;
+      const barCol=z>=0?'rgba(248,81,73,.8)':'rgba(56,139,253,.8)';
+      const bw=Math.round(Math.abs(z)/maxZ*BAR_ZONE);
+      // row bg
+      ctx.fillStyle=i%2===0?'#161b22':'#1a1f27';
+      ctx.fillRect(0,y,W,ROW);
+      // term label
+      const label=t.term_name.length>26?t.term_name.slice(0,25)+'…':t.term_name;
+      ctx.fillStyle='#c9d1d9'; ctx.font='10px sans-serif'; ctx.textAlign='left';
+      ctx.fillText(label,PAD.l,y+ROW/2+4);
+      // z-score bar background
+      const barX=LABEL_W;
+      ctx.fillStyle='#21262d';
+      ctx.fillRect(barX,y+6,BAR_ZONE,ROW-12);
+      // z-score bar fill
+      if(bw>0){
+        ctx.fillStyle=barCol;
+        ctx.fillRect(barX,y+6,bw,ROW-12);
+      }
+      // p-value label
+      ctx.fillStyle='#6e7681'; ctx.font='9px sans-serif'; ctx.textAlign='right';
+      ctx.fillText(t.p_value.toExponential(1),W-PAD.r+62,y+ROW/2+3);
+      // z-score value
+      ctx.fillStyle=z>=0?'rgba(248,81,73,.9)':'rgba(56,139,253,.9)';
+      ctx.font='bold 9px sans-serif'; ctx.textAlign='right';
+      ctx.fillText('z='+z.toFixed(2),W-4,y+ROW/2+3);
+    });
+    // Header line
+    ctx.fillStyle=accentCol; ctx.fillRect(0,0,3,H);
+    // Column headers
+    ctx.fillStyle='#6e7681'; ctx.font='8px sans-serif'; ctx.textAlign='left';
+    ctx.fillText('Terme',PAD.l,PAD.t-1);
+    ctx.textAlign='right';
+    ctx.fillText('p-value',W-PAD.r+62,PAD.t-1);
+    ctx.fillText('z-score',W-4,PAD.t-1);
+  });
+
+  // --- Z-score chart ---
+  if(goZChart)goZChart.destroy();
+  const topAll=[...data].sort((a,b)=>a.p_value-b.p_value).slice(0,16);
+  // Apply inversion to z-scores
+  const topAllMod = goInvertActive ? topAll.map(t=>({...t,z_score:-(t.z_score||0)})) : topAll;
+  goZChart=new Chart(document.getElementById('goZChart'),{
+    type:'bar',
+    data:{labels:topAllMod.map(t=>t.term_name.length>42?t.term_name.slice(0,42)+'...':t.term_name),
+      datasets:[{label:'Z-score',data:topAllMod.map(t=>+(t.z_score||0).toFixed(3)),
+        backgroundColor:topAllMod.map(t=>(t.z_score||0)>=0?'rgba(248,81,73,.7)':'rgba(56,139,253,.7)'),borderRadius:3}]},
+    options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' z='+ctx.raw.toFixed(3)+' | p='+topAllMod[ctx.dataIndex].p_value.toExponential(2)}}},
+      scales:{x:{title:{display:true,text:'Z-score (+ = up-regulated)',color:'#8b949e',font:{size:10}}},y:{ticks:{font:{size:10}}}}}
+  });
+
+  // --- Source breakdown chart ---
+  if(goSrcChart)goSrcChart.destroy();
+  const srcCnt={};data.forEach(t=>{srcCnt[t.source]=(srcCnt[t.source]||0)+1;});
+  const srcK=Object.keys(srcCnt);
+  const srcColors={'GO:BP':'rgba(56,139,253,.6)','GO:CC':'rgba(63,185,80,.6)',
+    'GO:MF':'rgba(210,153,34,.6)','REAC':'rgba(188,140,255,.6)','KEGG':'rgba(248,81,73,.6)'};
+  goSrcChart=new Chart(document.getElementById('goSrcChart'),{
+    type:'bar',
+    data:{labels:srcK,datasets:[{label:'Termes',data:srcK.map(s=>srcCnt[s]),
+      backgroundColor:srcK.map(s=>srcColors[s]||'rgba(100,100,100,.6)'),borderRadius:3}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#8b949e'}},y:{ticks:{color:'#8b949e',stepSize:1}}}}
+  });
+
+  // --- GO figures from Excel ---
+  showGOFig(c);
+}
+
+function showGOFig(c){
+  currentGOContrast=c;
+  const ftype=document.querySelector('input[name="goFig"]:checked')?.value||'manhattan';
+  const imgs=GO_IMAGES[c]||{};
+  const img=document.getElementById('goFigImg');
+  const noData=document.getElementById('goFigNoData');
+  const chordTab=document.getElementById('gf_cho');
+  // Show/hide chord tab based on availability
+  if(chordTab){
+    chordTab.parentElement.style.opacity=imgs.chord?'1':'0.4';
+    chordTab.disabled=!imgs.chord;
+  }
+  // Resolve which figure to show (fallback if selected not available)
+  let key=ftype;
+  if(!imgs[key]){
+    // fallback order
+    for(const k of ['manhattan','lollipop','dotplot','chord']){
+      if(imgs[k]){key=k;break;}
+    }
+  }
+  if(imgs[key]){
+    img.src=imgs[key];
+    img.style.display='block';
+    noData.style.display='none';
+  } else {
+    img.style.display='none';
+    noData.style.display='block';
+  }
+}
+function downloadGOFig(){
+  const ftype=document.querySelector('input[name="goFig"]:checked')?.value||'manhattan';
+  const imgs=GO_IMAGES[currentGOContrast]||{};
+  const src=imgs[ftype];
+  if(!src){alert('Figure non disponible.');return;}
+  const a=document.createElement('a');
+  a.download='proteogen_GO_'+ftype+'_'+currentGOContrast+'.jpg';
+  a.href=src; a.click();
+}
+
+function drawHeatmap(){
+  const clF=document.getElementById('hmCluster').value;
+  const nMax=parseInt(document.getElementById('hmN').value);
+  const srt=document.getElementById('hmSort').value;
+  const search=(document.getElementById('hmSearch').value||'').toLowerCase().trim();
+  let data=[...HEATMAP];
+  if(clF!=='all')data=data.filter(r=>r.cl===clF);
+  if(search)data=data.filter(r=>r.g.toLowerCase().includes(search));
+  data=srt==='q'?data.sort((a,b)=>a.q-b.q):data.sort((a,b)=>a.cl.localeCompare(b.cl)||a.q-b.q);
+  data=data.slice(0,nMax);
+  document.getElementById('hmInfo').textContent=data.length+' proteins';
+
+  const nR=data.length,nC=SAMPLE_COLS.length;
+  const cW=22,cH=14,lW=100,lH=100;
+  const W=lW+nC*cW+20,H=lH+nR*cH;
+  const canvas=document.getElementById('hmCanvas');
+  const dpr=devicePixelRatio||1;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  const ctx=canvas.getContext('2d');
+  ctx.scale(dpr,dpr);
+  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+
+  // Condition separator lines + colored headers
+  let xCursor=lW;
+  CONDITIONS.forEach(cond=>{
+    const cols=COND_MAP[cond]||[];
+    const condW=cols.length*cW;
+    const col=COND_COLORS[cond]||'#888';
+    // Color bar under header
+    ctx.fillStyle=col;
+    ctx.fillRect(xCursor,lH-6,condW,4);
+    // Condition label centered
+    ctx.fillStyle=col;ctx.font='bold 9px sans-serif';ctx.textAlign='center';
+    ctx.fillText(cond.replace('Polyculture.','Poly '),xCursor+condW/2,lH-10);
+    // Vertical separator
+    if(xCursor>lW){
+      ctx.strokeStyle='rgba(240,246,252,.15)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(xCursor,0);ctx.lineTo(xCursor,H);ctx.stroke();
+    }
+    xCursor+=condW;
+  });
+
+  // Column labels (rotated sample names)
+  SAMPLE_COLS.forEach((col,i)=>{
+    ctx.save();ctx.translate(lW+i*cW+cW/2,lH-12);ctx.rotate(-Math.PI/3);
+    ctx.fillStyle='#8b949e';ctx.font='8px sans-serif';ctx.textAlign='right';
+    ctx.fillText(col.replace(/^.*_(\d+)$/,'$1'),0,0); // just the replicate number
+    ctx.restore();
+  });
+
+  const CLC={'Cluster_1':'#f0e68c','Cluster_2':'#87ceeb','Cluster_3':'#dda0dd','NA':'#555'};
+  data.forEach((row,ri)=>{
+    const y=lH+ri*cH;
+    ctx.fillStyle=CLC[row.cl]||'#555';ctx.fillRect(0,y+1,4,cH-2);
+    ctx.fillStyle='#c9d1d9';ctx.font='10px sans-serif';ctx.textAlign='right';
+    ctx.fillText(row.g.slice(0,14),lW-7,y+cH-3);
+    row.v.forEach((val,ci)=>{
+      const v=Math.max(-2,Math.min(2,typeof val==='number'?val:0));
+      let r,g,b;
+      if(v>=0){const f=v/2;r=Math.round(33+f*(248-33));g=Math.round(139+f*(81-139));b=Math.round(253+f*(73-253));}
+      else{const f=-v/2;r=Math.round(33+f*(56-33));g=139;b=253;}
+      ctx.fillStyle='rgb('+r+','+g+','+b+')';
+      ctx.fillRect(lW+ci*cW,y,cW-1,cH-1);
+    });
+  });
+}
+
+/* ── UPSET ── */
+let upsetDrawn=false;
+function initUpset(){
+  if(upsetDrawn)return;upsetDrawn=true;
+  const U=UPSET_DATA;
+  const SETS=U.sets,INTERS=U.intersections,SET_SIZES=U.set_sizes,FULL=U.full_labels;
+  const nS=SETS.length,nI=INTERS.length;
+  const BAR_H=180,DOT_H=22,COL_W=46,LBL_W=52,SET_W=80,PAD_T=24,PAD_B=10;
+  const MATRIX_H=nS*DOT_H+PAD_B;
+  const TOTAL_H=PAD_T+BAR_H+MATRIX_H+42,TOTAL_W=SET_W+LBL_W+nI*COL_W+20;
+  const canvas=document.getElementById('upsetCanvas');
+  const dpr=devicePixelRatio||1;
+  canvas.width=TOTAL_W*dpr;canvas.height=TOTAL_H*dpr;
+  canvas.style.width=TOTAL_W+'px';canvas.style.height=TOTAL_H+'px';
+  const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);
+  ctx.fillStyle='#161b22';ctx.fillRect(0,0,TOTAL_W,TOTAL_H);
+  const maxCnt=Math.max(...INTERS.map(x=>x.count),1);
+  const maxSz=Math.max(...Object.values(SET_SIZES),1);
+  const colX=i=>SET_W+LBL_W+i*COL_W+COL_W/2;
+  const rowY=s=>PAD_T+BAR_H+s*DOT_H+DOT_H/2;
+  const barBot=PAD_T+BAR_H;
+  INTERS.forEach((inter,i)=>{
+    const x=colX(i);const bh=Math.round(inter.count/maxCnt*(BAR_H-8));const by=barBot-bh;
+    ctx.fillStyle='rgba(56,139,253,.75)';
+    ctx.beginPath();ctx.roundRect(x-COL_W/2+6,by,COL_W-12,bh,3);ctx.fill();
+    ctx.fillStyle='#c9d1d9';ctx.font='bold 9px sans-serif';ctx.textAlign='center';
+    ctx.fillText(inter.count,x,by-3);
+  });
+  ctx.fillStyle='#6e7681';ctx.font='9px sans-serif';ctx.textAlign='right';
+  [0,.25,.5,.75,1].forEach(f=>{
+    const val=Math.round(f*maxCnt);const y=barBot-Math.round(f*(BAR_H-8));
+    ctx.fillText(val,SET_W+LBL_W-4,y+3);
+    ctx.strokeStyle='rgba(240,246,252,.04)';ctx.lineWidth=.5;
+    ctx.beginPath();ctx.moveTo(SET_W+LBL_W,y);ctx.lineTo(TOTAL_W-10,y);ctx.stroke();
+  });
+  SETS.forEach((_,si)=>{
+    ctx.fillStyle=si%2===0?'rgba(255,255,255,.02)':'transparent';
+    ctx.fillRect(SET_W+LBL_W,rowY(si)-DOT_H/2,nI*COL_W,DOT_H);
+  });
+  SETS.forEach((s,si)=>{
+    ctx.fillStyle='#c9d1d9';ctx.font='11px sans-serif';ctx.textAlign='right';
+    ctx.fillText(s,SET_W+LBL_W-8,rowY(si)+4);
+  });
+  SETS.forEach((s,si)=>{
+    const y=rowY(si);const bw=Math.round((SET_SIZES[s]||0)/maxSz*(SET_W-8));
+    ctx.fillStyle='rgba(188,140,255,.6)';
+    ctx.beginPath();ctx.roundRect(SET_W-4-bw,y-DOT_H/2+3,bw,DOT_H-6,2);ctx.fill();
+    ctx.fillStyle='#8b949e';ctx.font='9px sans-serif';ctx.textAlign='right';
+    ctx.fillText(SET_SIZES[s]||0,SET_W-8-bw,y+4);
+  });
+  INTERS.forEach((inter,i)=>{
+    const x=colX(i);
+    const actIdx=inter.sets.map(s=>SETS.indexOf(s)).filter(idx=>idx>=0).sort((a,b)=>a-b);
+    if(actIdx.length>1){
+      ctx.strokeStyle='rgba(56,139,253,.85)';ctx.lineWidth=2;
+      ctx.beginPath();ctx.moveTo(x,rowY(actIdx[0]));ctx.lineTo(x,rowY(actIdx[actIdx.length-1]));ctx.stroke();
+    }
+    SETS.forEach((s,si)=>{
+      const isA=inter.sets.includes(s);
+      ctx.beginPath();ctx.arc(x,rowY(si),isA?6:4,0,Math.PI*2);
+      ctx.fillStyle=isA?'#388bfd':'#2d333b';ctx.fill();
+      if(isA){ctx.strokeStyle='rgba(56,139,253,.35)';ctx.lineWidth=1.5;ctx.stroke();}
+    });
+  });
+  const tt=document.getElementById('tooltip');
+  canvas.addEventListener('mousemove',e=>{
+    const rect=canvas.getBoundingClientRect();
+    const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    let found=null;
+    INTERS.forEach((inter,i)=>{if(Math.abs(mx-colX(i))<COL_W/2&&my<barBot)found=inter;});
+    if(found){
+      tt.innerHTML='<div class="tg">'+found.count+' proteins</div>'+
+        '<div class="tl" style="margin-top:3px;">'+found.sets.map(s=>FULL[s]||s).join('<br>')+'</div>';
+      tt.style.display='block';tt.style.left=(e.clientX+14)+'px';tt.style.top=(e.clientY-10)+'px';
+    }else tt.style.display='none';
+  });
+  canvas.addEventListener('mouseleave',()=>{tt.style.display='none';});
+}
+
+/* ── INTERSECTIONS TABLE ── */
+function renderIntersect(){
+  const nbMin=parseInt(document.getElementById('nbMin').value);
+  const search=(document.getElementById('interSearch').value||'').toLowerCase().trim();
+  let data=INTERSECTIONS.filter(r=>r.nb>=nbMin);
+  if(search)data=data.filter(r=>
+    r.g.toLowerCase().includes(search)||
+    r.pg.toLowerCase().includes(search)||
+    (r.desc||'').toLowerCase().includes(search));
+
+  // Colonnes de contrastes dynamiques : c1..cN dans l'ordre de CONTRASTS.
+  // Short labels come from UPSET_DATA.sets (same order); title = full name.
+  const nC = (typeof CONTRASTS!=='undefined') ? CONTRASTS.length : 0;
+  const labels = (typeof UPSET_DATA!=='undefined' && UPSET_DATA.sets && UPSET_DATA.sets.length)
+                 ? UPSET_DATA.sets : null;
+  const fullL  = (typeof CONTRASTS!=='undefined') ? CONTRASTS : [];
+
+  // Header: rebuild from the 4 fixed columns + one per contrast
+  const head=document.getElementById('interHead');
+  if(head && head.dataset.built!=='1'){
+    let h='<th>Protein</th><th>Gene</th><th>Description</th><th>N</th>';
+    for(let i=0;i<nC;i++){
+      const lab=labels?labels[i]:('c'+(i+1));
+      const full=fullL[i]?String(fullL[i]).replace(/_vs_/g,' vs ').replace(/_/g,' '):lab;
+      h+='<th title="'+full+'" style="white-space:nowrap;">'+lab+'</th>';
+    }
+    head.innerHTML=h;
+    head.dataset.built='1';
+  }
+
+  const tbody=document.getElementById('interBody');tbody.innerHTML='';
+  const X='<span class="ix">✓</span>';const E='<span style="color:var(--bg4)">—</span>';
+  data.slice(0,400).forEach(r=>{
+    const nbCol=r.nb>=4?'var(--up)':r.nb>=2?'var(--am)':'var(--tx2)';
+    const tr=document.createElement('tr');
+    let cells='<td class="mono">'+r.pg+'</td>'+
+      '<td style="color:#c9d1d9;font-weight:600;">'+r.g+'</td>'+
+      '<td style="font-size:10px;color:var(--tx2);" title="'+(r.desc||'')+'">'+((r.desc||'').slice(0,40)||'—')+'</td>'+
+      '<td><span style="font-weight:700;color:'+nbCol+'">'+r.nb+'</span></td>';
+    for(let i=0;i<nC;i++){
+      cells+='<td>'+(r['c'+(i+1)]==='X'?X:E)+'</td>';
+    }
+    tr.innerHTML=cells;
+    tbody.appendChild(tr);
+  });
+  document.getElementById('interCount').textContent=data.length+' proteins (max 400)';
+}
+
+/* ── PROTEIN TABLE ── */
+function initProtTable(){
+  const sel=document.getElementById('protContrast');
+  CONTRASTS.forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c.replace(/_vs_/g,' vs ').replace(/_/g,' ');sel.appendChild(o);});
+  sel.onchange=renderProtTable;
+  document.getElementById('protDir').onchange=renderProtTable;
+  document.getElementById('protRob').oninput=function(){document.getElementById('protRobVal').textContent=this.value;renderProtTable();};
+  document.querySelectorAll('input[name="ptypeProt"]').forEach(r=>r.onchange=renderProtTable);
+  document.getElementById('protPThresh').oninput=function(){document.getElementById('protPThreshVal').textContent=parseFloat(this.value).toFixed(3);renderProtTable();};
+  document.getElementById('protSearch').oninput=renderProtTable;
+  renderProtTable();
+}
+function renderProtTable(){
+  const c=document.getElementById('protContrast').value;
+  const dir=document.getElementById('protDir').value;
+  const rob=parseInt(document.getElementById('protRob').value);
+  const ptype=document.querySelector('input[name="ptypeProt"]:checked').value;
+  const thresh=parseFloat(document.getElementById('protPThresh').value);
+  const search=(document.getElementById('protSearch').value||'').toLowerCase().trim();
+  const fc=0.26;
+  let pts=(VOLCANO[c]||[]).filter(p=>{
+    const pv=ptype==='padj'?parseFloat(p.padj):parseFloat(p.p);
+    const isU=pv<=thresh&&p.d>fc,isD=pv<=thresh&&p.d<-fc;
+    if(!isU&&!isD)return false;
+    if(dir==='U'&&!isU)return false;
+    if(dir==='D'&&!isD)return false;
+    if(p.r<rob)return false;
+    if(search&&!(p.Genes||'').toLowerCase().includes(search)&&!(p.name||'').toLowerCase().includes(search))return false;
+    return true;
+  }).sort((a,b)=>parseFloat(a.p)-parseFloat(b.p));
+  const tbody=document.getElementById('protBody');tbody.innerHTML='';
+  pts.slice(0,300).forEach(p=>{
+    const isU=p.d>fc;
+    const badge=isU?'<span class="badge bu">↑ Up</span>':'<span class="badge bd2c">↓ Down</span>';
+    const descShort=(p.desc||'').slice(0,40)+((p.desc||'').length>40?'…':'');
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td class="mono">'+p.name+'</td>'+
+      '<td style="color:#c9d1d9;font-weight:600;">'+(p.Genes||'—')+'</td>'+
+      '<td style="font-size:11px;color:var(--tx2);" title="'+(p.desc||'')+'">'+descShort+'</td>'+
+      '<td>'+badge+'</td>'+
+      '<td style="color:'+(isU?'#3fb950':'#f85149')+';font-weight:600;">'+p.d.toFixed(3)+'</td>'+
+      '<td style="color:var(--tx2);">'+parseFloat(p.p).toExponential(2)+'</td>'+
+      '<td style="color:var(--tx2);">'+parseFloat(p.padj).toExponential(2)+'</td>'+
+      '<td style="color:var(--bl);">'+parseFloat(p.pi).toFixed(3)+'</td>'+
+      '<td><span style="color:'+(p.r>=75?'#3fb950':p.r>=40?'#d29922':'#8b949e')+'">'+p.r+'</span></td>';
+    tbody.appendChild(tr);
+  });
+  document.getElementById('protCount').textContent=pts.length+' DEP proteins (max 300)';
+}
+
+/* ── WGCNA ── */
+let wgcnaInited=false;
+function initWGCNA(){
+  if(wgcnaInited)return;wgcnaInited=true;
+
+  // KPIs
+  const kpi=document.getElementById('wgcnaKpi');
+  const modCounts={};
+  WGCNA_ROWS.forEach(r=>{modCounts[r.mod]=(modCounts[r.mod]||0)+1;});
+  kpi.innerHTML=`
+    <div class="kpi"><div class="lbl">Assigned proteins</div><div class="val" style="color:var(--bl)">${WGCNA_ROWS.length}</div><div class="sub">module grey exclu</div></div>
+    <div class="kpi"><div class="lbl">Modules</div><div class="val" style="color:var(--pu)">${WGCNA_MODS.length}</div></div>
+    ${WGCNA_MODS.map(m=>`<div class="kpi"><div class="lbl">${m}</div><div class="val" style="color:#${m==='blue'?'388bfd':m==='turquoise'?'00bcd4':m==='green'?'3fb950':m==='yellow'?'d29922':m==='red'?'f85149':m==='brown'?'a0522d':m==='black'?'8b949e':'888'}">${modCounts[m]||0}</div><div class="sub">proteins</div></div>`).join('')}
+  `;
+
+  // Hub chart (top 5 per module stacked)
+  const labels=[];const datasets=[];
+  const modColors={blue:'#388bfd',turquoise:'#00bcd4',green:'#3fb950',yellow:'#d29922',
+                   red:'#f85149',brown:'#cd853f',black:'#8b949e'};
+  WGCNA_MODS.forEach(mod=>{
+    const top=(WGCNA_TOP5[mod]||[]).slice(0,5);
+    top.forEach(p=>{if(!labels.includes(p.g))labels.push(p.g);});
+  });
+  WGCNA_MODS.forEach(mod=>{
+    const top=(WGCNA_TOP5[mod]||[]).slice(0,5);
+    const data=labels.map(l=>{
+      const found=top.find(p=>p.g===l);
+      return found?found.hub:0;
+    });
+    datasets.push({label:mod,data,backgroundColor:(modColors[mod]||'#888')+'99',borderColor:modColors[mod]||'#888',borderWidth:1,borderRadius:2});
+  });
+  new Chart(document.getElementById('wgcnaHubChart'),{
+    type:'bar',
+    data:{labels,datasets},
+    options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
+      plugins:{legend:{labels:{color:'#8b949e',font:{size:10}}}},
+      scales:{x:{stacked:false,ticks:{color:'#8b949e'},title:{display:true,text:'kME (Hub Score)',color:'#8b949e',font:{size:10}}},
+              y:{ticks:{color:'#8b949e',font:{size:10}}}}}
+  });
+
+  // Pie modules
+  new Chart(document.getElementById('wgcnaModPie'),{
+    type:'doughnut',
+    data:{labels:WGCNA_MODS,datasets:[{
+      data:WGCNA_MODS.map(m=>modCounts[m]||0),
+      backgroundColor:WGCNA_MODS.map(m=>(modColors[m]||'#888')+'88'),
+      borderColor:WGCNA_MODS.map(m=>modColors[m]||'#888'),borderWidth:1.5
+    }]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}}
+  });
+
+  // Module select
+  const sel=document.getElementById('wgcnaMod');
+  WGCNA_MODS.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m+' ('+modCounts[m]+')';sel.appendChild(o);});
+  sel.onchange=renderWGCNATable;
+  document.getElementById('wgcnaSearch').oninput=renderWGCNATable;
+  renderWGCNATable();
+}
+function renderWGCNATable(){
+  const mod=document.getElementById('wgcnaMod').value;
+  const search=(document.getElementById('wgcnaSearch').value||'').toLowerCase().trim();
+  let rows=[...WGCNA_ROWS];
+  if(mod!=='all')rows=rows.filter(r=>r.mod===mod);
+  if(search)rows=rows.filter(r=>r.g.toLowerCase().includes(search)||(r.desc||'').toLowerCase().includes(search));
+  rows.sort((a,b)=>b.hub-a.hub);
+  const modColors={blue:'#388bfd',turquoise:'#00bcd4',green:'#3fb950',yellow:'#d29922',
+                   red:'#f85149',brown:'#cd853f',black:'#8b949e'};
+  const tbody=document.getElementById('wgcnaBody');tbody.innerHTML='';
+  rows.slice(0,300).forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td style="color:#c9d1d9;font-weight:600;">'+r.g+'</td>'+
+      '<td><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;background:'+(modColors[r.mod]||'#888')+'22;color:'+(modColors[r.mod]||'#888')+';font-weight:600;">'+r.mod+'</span></td>'+
+      '<td style="color:var(--bl);font-weight:600;">'+r.hub.toFixed(4)+'</td>'+
+      '<td style="font-size:11px;color:var(--tx2);" title="'+(r.desc||'')+'">'+((r.desc||'').slice(0,55)||'—')+'</td>';
+    tbody.appendChild(tr);
+  });
+  document.getElementById('wgcnaCount').textContent=rows.length+' proteins (max 300)';
+}
+
+/* ── EXPORTS ── */
+function makeWb(sheets){
+  const wb=XLSX.utils.book_new();
+  sheets.forEach(s=>{
+    const ws=XLSX.utils.json_to_sheet(s.data);
+    if(s.data.length){ws['!cols']=Object.keys(s.data[0]).map(k=>({wch:Math.min(45,Math.max(k.length,...s.data.slice(0,50).map(r=>String(r[k]||'').length)))}))}
+    XLSX.utils.book_append_sheet(wb,ws,s.name.slice(0,31));
+  });
+  return wb;
+}
+function xls(wb,fn){XLSX.writeFile(wb,fn);}
+function depRow(p){
+  const isU=p.d>0;
+  return{'Protein':p.name,'Gene':p.Genes||'','Description':p.desc||'','Status':isU?'Up':'Down',
+    'LFC':p.d,'p.val':parseFloat(p.p),'p.adj':parseFloat(p.padj),'Pi score':parseFloat(p.pi),'Robustness':p.r};
+}
+function exportAllDEP(){
+  const fc=0.26,thresh=0.05,ptype='p';
+  const sum=CONTRASTS.map(c=>({'Contrast':c,'Up':STATS.contrasts_summary[c].up,'Down':STATS.contrasts_summary[c].down,'Total':STATS.contrasts_summary[c].up+STATS.contrasts_summary[c].down}));
+  const sheets=[{name:'Summary',data:sum}];
+  CONTRASTS.forEach(c=>{
+    const data=(VOLCANO[c]||[]).filter(p=>{const pv=parseFloat(p.p);return pv<=thresh&&Math.abs(p.d)>fc;}).sort((a,b)=>parseFloat(a.p)-parseFloat(b.p)).map(depRow);
+    sheets.push({name:c.replace('Polyculture','Poly').slice(0,31),data});
+  });
+  xls(makeWb(sheets),'proteogen_DEP_tous_contrastes.xlsx');
+}
+function exportTop20Pi(){
+  const data=TOP20_PI.map((p,i)=>({'Rank':i+1,'Protein':p.name,'Gene':p.gene,'Description':p.desc,'Pi score':+p.pi.toFixed(3)}));
+  xls(makeWb([{name:'Top20_Pi',data}]),'proteogen_top20_pi.xlsx');
+}
+function exportGOAll(){
+  const sheets=CONTRASTS.map(c=>({name:('GO_'+c).replace('Polyculture','Poly').slice(0,31),
+    data:(GO_DATA[c]||[]).map(t=>({'Source':t.source,'Terme':t.term_name,'ID':t.term_id,'p-value':t.p_value,'Intersection':t.intersection_size,'Query':t.query_size,'Gene ratio':t.gene_ratio||'','Z-score':t.z_score||''}))}));
+  xls(makeWb(sheets),'proteogen_GO.xlsx');
+}
+function exportVolcSig(){
+  const {fc,ptype,thresh,rob}=getVolcFilter();
+  const data=(VOLCANO[activeContrast]||[]).filter(p=>{const pv=ptype==='padj'?parseFloat(p.padj):parseFloat(p.p);return pv<=thresh&&Math.abs(p.d)>fc&&p.r>=rob;}).sort((a,b)=>parseFloat(a.p)-parseFloat(b.p)).map(depRow);
+  xls(makeWb([{name:'DEP',data}]),'proteogen_DEP_'+activeContrast.slice(0,25)+'.xlsx');
+}
+function exportVolcAll(){
+  const data=(VOLCANO[activeContrast]||[]).sort((a,b)=>parseFloat(a.p)-parseFloat(b.p)).map(p=>({'Protein':p.name,'Gene':p.Genes||'','Description':p.desc||'','Status':p.s==='U'?'Up':p.s==='D'?'Down':'NS','LFC':p.d,'p.val':parseFloat(p.p),'p.adj':parseFloat(p.padj),'Pi score':parseFloat(p.pi),'Robustness':p.r}));
+  xls(makeWb([{name:'All',data}]),'proteogen_all_'+activeContrast.slice(0,25)+'.xlsx');
+}
+function exportHmFiltered(){
+  const clF=document.getElementById('hmCluster').value;
+  const nMax=parseInt(document.getElementById('hmN').value);
+  const search=(document.getElementById('hmSearch').value||'').toLowerCase().trim();
+  let rows=[...HEATMAP];if(clF!=='all')rows=rows.filter(r=>r.cl===clF);if(search)rows=rows.filter(r=>r.g.toLowerCase().includes(search));
+  rows=rows.sort((a,b)=>a.q-b.q).slice(0,nMax);
+  const data=rows.map(r=>{const o={'Protein':r.pg,'Gene':r.g,'Cluster':r.cl,'q-value':r.q};SAMPLE_COLS.forEach((s,i)=>{o[s]=r.v[i];});return o;});
+  xls(makeWb([{name:'Heatmap_Zscore',data}]),'proteogen_heatmap_filtered.xlsx');
+}
+function exportHmAll(){
+  const data=[...HEATMAP].sort((a,b)=>a.cl.localeCompare(b.cl)||a.q-b.q).map(r=>{const o={'Protein':r.pg,'Gene':r.g,'Cluster':r.cl,'q-value':r.q};SAMPLE_COLS.forEach((s,i)=>{o[s]=r.v[i];});return o;});
+  xls(makeWb([{name:'Heatmap_full',data}]),'proteogen_heatmap_complet.xlsx');
+}
+function exportInterFiltered(){
+  const nbMin=parseInt(document.getElementById('nbMin').value);
+  const search=(document.getElementById('interSearch').value||'').toLowerCase().trim();
+  let rows=INTERSECTIONS.filter(r=>r.nb>=nbMin);
+  if(search)rows=rows.filter(r=>r.g.toLowerCase().includes(search)||r.pg.toLowerCase().includes(search)||(r.desc||'').toLowerCase().includes(search));
+  const data=rows.map(r=>({'Protein':r.pg,'Gene':r.g,'Description':r.desc||'','N conditions':r.nb,'M/P1':r.c1==='X'?'X':'','M/P2':r.c2==='X'?'X':'','M/P3':r.c3==='X'?'X':'','P1/P2':r.c4==='X'?'X':'','P1/P3':r.c5==='X'?'X':'','P2/P3':r.c6==='X'?'X':''}));
+  xls(makeWb([{name:'Intersections',data}]),'proteogen_intersections_filtered.xlsx');
+}
+function exportInterAll(){
+  const data=[...INTERSECTIONS].sort((a,b)=>b.nb-a.nb).map(r=>({'Protein':r.pg,'Gene':r.g,'Description':r.desc||'','N conditions':r.nb,'M/P1':r.c1==='X'?'X':'','M/P2':r.c2==='X'?'X':'','M/P3':r.c3==='X'?'X':'','P1/P3':r.c5==='X'?'X':'','P2/P3':r.c6==='X'?'X':''}));
+  xls(makeWb([{name:'Intersections_full',data}]),'proteogen_intersections_all.xlsx');
+}
+function exportProtFiltered(){
+  const c=document.getElementById('protContrast').value;
+  const dir=document.getElementById('protDir').value;
+  const rob=parseInt(document.getElementById('protRob').value);
+  const ptype=document.querySelector('input[name="ptypeProt"]:checked').value;
+  const thresh=parseFloat(document.getElementById('protPThresh').value);
+  const search=(document.getElementById('protSearch').value||'').toLowerCase().trim();
+  const fc=0.26;
+  const data=(VOLCANO[c]||[]).filter(p=>{
+    const pv=ptype==='padj'?parseFloat(p.padj):parseFloat(p.p);
+    const isU=pv<=thresh&&p.d>fc,isD=pv<=thresh&&p.d<-fc;
+    if(!isU&&!isD)return false;
+    if(dir==='U'&&!isU)return false;if(dir==='D'&&!isD)return false;
+    if(p.r<rob)return false;
+    if(search&&!(p.Genes||'').toLowerCase().includes(search)&&!(p.name||'').toLowerCase().includes(search))return false;
+    return true;
+  }).sort((a,b)=>parseFloat(a.p)-parseFloat(b.p)).map(depRow);
+  xls(makeWb([{name:'DEP_filtered',data}]),'proteogen_table_DEP_'+c.slice(0,25)+'.xlsx');
+}
+function exportWGCNA(){
+  const data=WGCNA_ROWS.map(r=>({'Gene':r.g,'Module':r.mod,'HubScore':r.hub,'Description':r.desc||''}));
+  xls(makeWb([{name:'WGCNA',data}]),'proteogen_WGCNA.xlsx');
+}
+
+/* ── SLIDER WIRING ── */
+document.getElementById('fcSlider').oninput=function(){document.getElementById('fcVal').textContent=parseFloat(this.value).toFixed(2);drawVolcano();};
+document.getElementById('pThresh').oninput=function(){document.getElementById('pThreshVal').textContent=parseFloat(this.value).toFixed(3);drawVolcano();};
+document.getElementById('robSlider').oninput=function(){document.getElementById('robVal').textContent=this.value;drawVolcano();};
+document.getElementById('volcSearch').oninput=function(){drawVolcano();};
+document.querySelectorAll('input[name="ptype"]').forEach(r=>r.onchange=drawVolcano);
+document.querySelectorAll('input[name="goFig"]').forEach(r=>r.onchange=()=>showGOFig(currentGOContrast));
+document.getElementById('hmCluster').onchange=drawHeatmap;
+/* Dynamically fills the dropdown menu and the cluster legend according to
+   the clusters actually present (variable number depending on the pipeline). */
+function initClusterControls(){
+  try{
+    var data=(typeof HEATMAP_DATA!=='undefined')?HEATMAP_DATA:
+             (typeof HEATMAP!=='undefined'?HEATMAP:[]);
+    if(!data||!data.length)return;
+    var palette=['#5B8FF9','#F6BD16','#5AD8A6','#E8684A','#9270CA',
+                 '#FF9D4D','#269A99','#FF99C3','#6DC8EC','#FF6B6B'];
+    var counts={};
+    data.forEach(function(r){var c=r.cl; if(c&&c!=='NA')counts[c]=(counts[c]||0)+1;});
+    var keys=Object.keys(counts).sort();
+    var total=data.length;
+    // Dropdown menu
+    var sel=document.getElementById('hmCluster');
+    if(sel){
+      sel.innerHTML='<option value="all">Tous ('+total+')</option>';
+      keys.forEach(function(k){
+        var num=(String(k).match(/(\d+)$/)||[])[1]||k;
+        sel.innerHTML+='<option value="'+k+'">Cluster '+num+' ('+counts[k]+')</option>';
+      });
+    }
+    // Slider Top N max = total
+    var nSlider=document.getElementById('hmN');
+    if(nSlider){nSlider.max=total; if(+nSlider.value>total)nSlider.value=total;}
+    // Legend
+    var leg=document.getElementById('hmClusterLegend');
+    if(leg){
+      leg.innerHTML=keys.map(function(k,i){
+        var num=(String(k).match(/(\d+)$/)||[])[1]||(i+1);
+        return '<span class="hm-cl"><span class="hm-dot" style="background:'+
+               palette[i%palette.length]+'"></span>Cl.'+num+'</span>';
+      }).join('');
+    }
+  }catch(e){console.warn('initClusterControls',e);}
+}
+initClusterControls();
+document.getElementById('hmSort').onchange=drawHeatmap;
+document.getElementById('hmN').oninput=function(){document.getElementById('hmNVal').textContent=this.value;drawHeatmap();};
+document.getElementById('hmSearch').oninput=function(){drawHeatmap();};
+document.getElementById('nbMin').oninput=function(){document.getElementById('nbMinVal').textContent=this.value;renderIntersect();};
+document.getElementById('interSearch').oninput=function(){renderIntersect();};
+/* The "Min N conditions" slider must go up to the real number of contrasts
+   in which a protein can appear (variable depending on the project). */
+(function initNbMinSlider(){
+  try{
+    var s=document.getElementById('nbMin');
+    if(!s||typeof INTERSECTIONS==='undefined'||!INTERSECTIONS.length)return;
+    var maxNb=1;
+    INTERSECTIONS.forEach(function(r){ if(r.nb>maxNb)maxNb=r.nb; });
+    // upper bound = max observed (at least the number of contrasts if available)
+    if(typeof CONTRASTS!=='undefined'&&CONTRASTS.length>maxNb)maxNb=CONTRASTS.length;
+    s.max=maxNb;
+  }catch(e){console.warn('initNbMinSlider',e);}
+})();
+window.addEventListener('resize',()=>{
+  if(document.getElementById('volcano').classList.contains('active'))drawVolcano();
+  if(document.getElementById('heatmap').classList.contains('active'))drawHeatmap();
+});
+
+/* ── INIT ── */
+/* Initialise les sliders/radios depuis les seuils choisis dans le pipeline
+   (ABOUT_DATA.params) so that volcanos / heatmap reflect these thresholds. */
+function initParamsFromAbout(){
+  try{
+    var p=(typeof ABOUT_DATA!=='undefined'&&ABOUT_DATA.params)?ABOUT_DATA.params:null;
+    if(!p)return;
+    // Volcano : fold-change (log2), seuil p, type p.val/p.adj
+    if(p.lfc_thresh!==undefined){
+      var fcS=document.getElementById('fcSlider');
+      if(fcS){fcS.value=p.lfc_thresh; var fcL=document.getElementById('fcVal'); if(fcL)fcL.textContent=(+p.lfc_thresh).toFixed(2);}
+    }
+    if(p.volcano_p!==undefined){
+      var pT=document.getElementById('pThresh');
+      if(pT){pT.value=p.volcano_p; var pL=document.getElementById('pVal'); if(pL)pL.textContent=p.volcano_p;}
+    }
+    if(p.volcano_p_type==='p.adj'){
+      var r=document.querySelector('input[name="ptype"][value="padj"]');
+      if(r)r.checked=true;
+    }
+    // ANOVA / heatmap: protein threshold
+    if(p.anova_p!==undefined){
+      var ppT=document.getElementById('protPThresh');
+      if(ppT){ppT.value=p.anova_p; var ppL=document.getElementById('protPVal'); if(ppL)ppL.textContent=p.anova_p;}
+    }
+  }catch(e){console.warn('initParamsFromAbout',e);}
+}
+initParamsFromAbout();
+initOverview();
+initDepGrid();
+initGO();
+initProtTable();
+setTimeout(initVolcTooltip,300);
+/* ── PCA + SCATTER ── */
+let qcInited=false;
+function initQC(){
+  if(qcInited)return;qcInited=true;
+  // Var explained label
+  const ve=PCA_DATA.var_exp;
+  document.getElementById('pcaVarExp').textContent=
+    'PC1='+ve[0]+'%  PC2='+ve[1]+'%  PC3='+ve[2]+'%';
+  // Scatter contrast select
+  const sel=document.getElementById('scatterContrast');
+  CONTRASTS.forEach(c=>{
+    const o=document.createElement('option');
+    o.value=c;o.textContent=c.replace(/_vs_/g,' vs ').replace(/_/g,' ');
+    sel.appendChild(o);
+  });
+  sel.onchange=drawScatter;
+  document.querySelectorAll('input[name="pcaAxes"]').forEach(r=>r.onchange=drawPCA);
+  drawPCA();
+  drawScatter();
+}
+
+function drawPCA(){
+  const axes=document.querySelector('input[name="pcaAxes"]:checked').value;
+  const xi=parseInt(axes[0])-1, yi=parseInt(axes[1])-1;
+  const pcKeys=['pc1','pc2','pc3'];
+  const pts=PCA_DATA.points;
+  const canvas=document.getElementById('pcaCanvas');
+  const ctx=canvas.getContext('2d');
+  const W=canvas.offsetWidth||600;const H=380;
+  const dpr=devicePixelRatio||1;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  ctx.scale(dpr,dpr);
+  const pad={l:50,r:20,t:20,b:40};
+  const pw=W-pad.l-pad.r,ph=H-pad.t-pad.b;
+  const xs=pts.map(p=>p[pcKeys[xi]]),ys=pts.map(p=>p[pcKeys[yi]]);
+  const xmn=Math.min(...xs)-0.3,xmx=Math.max(...xs)+0.3;
+  const ymn=Math.min(...ys)-0.3,ymx=Math.max(...ys)+0.3;
+  const sx=v=>(v-xmn)/(xmx-xmn)*pw+pad.l;
+  const sy=v=>ph-(v-ymn)/(ymx-ymn)*ph+pad.t;
+  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+  // Axes
+  ctx.strokeStyle='rgba(240,246,252,.08)';ctx.lineWidth=.5;
+  for(let i=0;i<=4;i++){
+    const x=pad.l+i*pw/4;ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,pad.t+ph);ctx.stroke();
+    const y=pad.t+i*ph/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();
+  }
+  // Zero lines
+  if(xmn<0&&xmx>0){ctx.strokeStyle='rgba(240,246,252,.2)';ctx.lineWidth=.8;ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(sx(0),pad.t);ctx.lineTo(sx(0),pad.t+ph);ctx.stroke();}
+  if(ymn<0&&ymx>0){ctx.beginPath();ctx.moveTo(pad.l,sy(0));ctx.lineTo(pad.l+pw,sy(0));ctx.stroke();}
+  ctx.setLineDash([]);
+  // Points + ellipses per condition
+  const condPts={};
+  pts.forEach(p=>{(condPts[p.cond]=condPts[p.cond]||[]).push(p);});
+  CONDITIONS.forEach(cond=>{
+    const col=COND_COLORS[cond]||'#888';
+    const cpts=(condPts[cond]||[]);
+    // Ellipse (rough bounding)
+    if(cpts.length>1){
+      const cx=cpts.reduce((s,p)=>s+p[pcKeys[xi]],0)/cpts.length;
+      const cy=cpts.reduce((s,p)=>s+p[pcKeys[yi]],0)/cpts.length;
+      const rx=Math.max(...cpts.map(p=>Math.abs(p[pcKeys[xi]]-cx)))+0.1;
+      const ry=Math.max(...cpts.map(p=>Math.abs(p[pcKeys[yi]]-cy)))+0.1;
+      ctx.beginPath();ctx.ellipse(sx(cx),sy(cy),rx/(xmx-xmn)*pw,ry/(ymx-ymn)*ph,0,0,Math.PI*2);
+      ctx.fillStyle=col+'22';ctx.fill();
+      ctx.strokeStyle=col+'66';ctx.lineWidth=1;ctx.stroke();
+    }
+    // Points
+    cpts.forEach(p=>{
+      ctx.beginPath();ctx.arc(sx(p[pcKeys[xi]]),sy(p[pcKeys[yi]]),6,0,Math.PI*2);
+      ctx.fillStyle=col;ctx.fill();
+      ctx.strokeStyle='#161b22';ctx.lineWidth=1.5;ctx.stroke();
+    });
+    // Labels
+    if(cpts.length){
+      const cx=cpts.reduce((s,p)=>s+p[pcKeys[xi]],0)/cpts.length;
+      const cy=cpts.reduce((s,p)=>s+p[pcKeys[yi]],0)/cpts.length;
+      ctx.fillStyle=col;ctx.font='bold 10px sans-serif';ctx.textAlign='center';
+      ctx.fillText(cond.replace('Polyculture.','Poly '),sx(cx),sy(cy)-12);
+    }
+  });
+  // Axis labels
+  const ve=PCA_DATA.var_exp;
+  ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillText('PC'+(xi+1)+' ('+ve[xi]+'%)',pad.l+pw/2,H-6);
+  ctx.save();ctx.translate(12,pad.t+ph/2);ctx.rotate(-Math.PI/2);
+  ctx.fillText('PC'+(yi+1)+' ('+ve[yi]+'%)',0,0);ctx.restore();
+  // Axis ticks
+  ctx.font='9px sans-serif';ctx.fillStyle='#6e7681';
+  [-2,-1,0,1,2].filter(v=>v>=xmn&&v<=xmx).forEach(v=>{ctx.textAlign='center';ctx.fillText(v.toFixed(0),sx(v),H-22);});
+  ctx.textAlign='right';
+  [-2,-1,0,1,2].filter(v=>v>=ymn&&v<=ymx).forEach(v=>{ctx.fillText(v.toFixed(0),pad.l-4,sy(v)+3);});
+  // Tooltip
+  const tt=document.getElementById('pcaTip');
+  canvas._pts=pts;canvas._sx=sx;canvas._sy=sy;canvas._xi=xi;canvas._yi=yi;canvas._pk=pcKeys;
+  canvas.onmousemove=function(e){
+    const rect=canvas.getBoundingClientRect();
+    const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    let best=null,bd=1e9;
+    canvas._pts.forEach(p=>{
+      const dx=canvas._sx(p[canvas._pk[canvas._xi]])-mx;
+      const dy=canvas._sy(p[canvas._pk[canvas._yi]])-my;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if(d<bd){bd=d;best=p;}
+    });
+    if(bd<14&&best){
+      tt.innerHTML='<div class="tg">'+best.sample+'</div>'+
+        '<div class="tl">'+best.cond+'</div>'+
+        '<div class="tl">PC1='+best.pc1+' PC2='+best.pc2+'</div>';
+      tt.style.display='block';tt.style.left=(e.clientX+14)+'px';tt.style.top=(e.clientY-10)+'px';
+    }else tt.style.display='none';
+  };
+  canvas.onmouseleave=()=>{tt.style.display='none';};
+}
+
+function drawScatter(){
+  const c=document.getElementById('scatterContrast').value;
+  const obj=(SCATTER_DATA[c]||{});
+  const pts=obj.pts||[];
+  const canvas=document.getElementById('scatterCanvas');
+  const ctx=canvas.getContext('2d');
+  const W=canvas.offsetWidth||600;const H=380;
+  const dpr=devicePixelRatio||1;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  ctx.scale(dpr,dpr);
+  const pad={l:58,r:20,t:28,b:52};
+  const pw=W-pad.l-pad.r,ph=H-pad.t-pad.b;
+  const xs=pts.map(p=>p.x),ys=pts.map(p=>p.y);
+  if(!xs.length)return;
+  const allv=[];
+  for(let i=0;i<xs.length;i++){ if(xs[i]>0)allv.push(xs[i]); if(ys[i]>0)allv.push(ys[i]); }
+  if(!allv.length)return;
+  const mn=_minOf(allv)-0.5,mx=_maxOf(allv)+0.5;
+  const sx=v=>(v-mn)/(mx-mn)*pw+pad.l;
+  const sy=v=>(1-(v-mn)/(mx-mn))*ph+pad.t;
+  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+  // Grid
+  ctx.strokeStyle='rgba(240,246,252,.05)';ctx.lineWidth=.5;
+  for(let i=0;i<=4;i++){
+    const x=pad.l+i*pw/4;ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,pad.t+ph);ctx.stroke();
+    const y=pad.t+i*ph/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();
+  }
+  // Diagonal y=x
+  ctx.strokeStyle='rgba(240,246,252,.25)';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(sx(mn),sy(mn));ctx.lineTo(sx(mx),sy(mx));ctx.stroke();
+  ctx.setLineDash([]);
+  // Points
+  pts.forEach(p=>{
+    if(p.x<=0||p.y<=0)return;
+    const col=p.s==='U'?'rgba(63,185,80,.8)':p.s==='D'?'rgba(248,81,73,.8)':'rgba(100,110,120,.35)';
+    const r=p.s!=='N'?3.5:1.8;
+    ctx.beginPath();ctx.arc(sx(p.x),sy(p.y),r,0,Math.PI*2);
+    ctx.fillStyle=col;ctx.fill();
+  });
+  // Axis labels
+  ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillText((obj.label_a||'')+' — mean log₂ intensity',pad.l+pw/2,H-8);
+  ctx.save();ctx.translate(12,pad.t+ph/2);ctx.rotate(-Math.PI/2);
+  ctx.fillText((obj.label_b||'')+' — mean log₂ intensity',0,0);ctx.restore();
+  // Ticks
+  ctx.font='9px sans-serif';ctx.fillStyle='#6e7681';
+  const step=Math.ceil((mx-mn)/5);
+  for(let v=Math.ceil(mn);v<=mx;v+=step){
+    ctx.textAlign='center';ctx.fillText(v.toFixed(0),sx(v),H-32);
+    ctx.textAlign='right';ctx.fillText(v.toFixed(0),pad.l-4,sy(v)+3);
+  }
+  // Counts + r
+  const su=pts.filter(p=>p.s==='U').length;
+  const sd=pts.filter(p=>p.s==='D').length;
+  ctx.font='bold 11px sans-serif';ctx.textAlign='left';
+  ctx.fillStyle='rgba(63,185,80,.9)';ctx.fillText('↑ '+su,pad.l+6,pad.t+16);
+  ctx.fillStyle='rgba(248,81,73,.9)';ctx.fillText('↓ '+sd,pad.l+6,pad.t+30);
+  ctx.fillStyle='#8b949e';ctx.font='10px sans-serif';ctx.textAlign='right';
+  ctx.fillText('r = '+(obj.r||'').toFixed(4),pad.l+pw-4,pad.t+14);
+  // Tooltip
+  const tt=document.getElementById('scatterTip');
+  canvas._pts=pts;canvas._sx=sx;canvas._sy=sy;
+  canvas.onmousemove=function(e){
+    const rect=canvas.getBoundingClientRect();
+    const mx2=e.clientX-rect.left,my2=e.clientY-rect.top;
+    let best=null,bd=1e9;
+    canvas._pts.forEach(p=>{
+      if(p.x<=0||p.y<=0)return;
+      const dx=canvas._sx(p.x)-mx2,dy=canvas._sy(p.y)-my2;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if(d<bd){bd=d;best=p;}
+    });
+    if(bd<12&&best){
+      const badge=best.s==='U'?'<span class="badge bu">↑ Up</span>':best.s==='D'?'<span class="badge bd2c">↓ Down</span>':'';
+      const descTxt=best.d&&best.d.trim()?'<div class="tl" style="font-style:italic;color:#8b949e;">'+best.d+'</div>':'';
+      tt.innerHTML='<div class="tg">'+(best.g||best.n||'—')+'</div>'+
+        descTxt+
+        '<div class="tl">x='+parseFloat(best.x).toFixed(2)+' y='+parseFloat(best.y).toFixed(2)+'</div>'+
+        '<div class="tl">LFC='+parseFloat(best.lfc).toFixed(3)+' p='+parseFloat(best.pv).toExponential(2)+'</div>'+badge;
+      tt.style.display='block';tt.style.left=(e.clientX+14)+'px';tt.style.top=(e.clientY-10)+'px';
+    }else tt.style.display='none';
+  };
+  canvas.onmouseleave=()=>{tt.style.display='none';};
+}
+
+/* ── CANVAS EXPORT (PNG) ── */
+function exportChartToCanvas(canvasId, filename){
+  // Chart.js canvas can be exported directly
+  exportCanvas(canvasId, filename);
+}
+function exportCanvas(canvasId, filename){
+  const canvas=document.getElementById(canvasId);
+  if(!canvas){console.warn('Canvas not found:',canvasId);return;}
+  const link=document.createElement('a');
+  link.download=filename+'.png';
+  link.href=canvas.toDataURL('image/png',1.0);
+  link.click();
+}
+function exportChartCanvas(canvasId, filename){
+  exportCanvas(canvasId, filename);
+}
+
+</script>
+</body>
+</html>
