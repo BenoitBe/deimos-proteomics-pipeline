@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="deimos_mark.svg" width="80" />
+</p>
+
 # Deimos
 
 **DIA Expression Integrated Multi-Omics Suite**
