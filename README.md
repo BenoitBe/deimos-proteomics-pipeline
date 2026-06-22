@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="deimos_mark.svg" width="80" />
+  <img src="deimos_icon.svg" width="160" />
 </p>
 
 # Deimos
