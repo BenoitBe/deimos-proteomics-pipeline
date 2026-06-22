@@ -1021,16 +1021,35 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         p_thr   = params["volcano_p_thresh"]
 
         def _one_iteration(seed):
-            """Une imputation + fit → matrice (n_prot × n_contr) de succès 0/1."""
+            """Une imputation + fit → matrice (n_prot × n_contr) de succès 0/1.
+
+            IMPORTANT : si DEqMS est la statistique principale (use_deqms), on
+            réapplique DEqMS à chaque itération pour que le robustness teste la
+            MÊME statistique que celle affichée dans les colonnes _p.val/_p.adj.
+            Le comptage peptidique (pep_count) ne dépend pas de l'imputation des
+            intensités : on le réutilise tel quel à chaque tirage.
+            """
             rng = np.random.default_rng(seed)
             mat_imp_tmp = impute_minprob(mat_filt, rng=rng)
             expr_tmp = mat_imp_tmp.values.astype(float)
             fit_tmp   = lm_fit(expr_tmp, design_mat)
             fit_tmp_c = contrasts_fit(fit_tmp, contrast_mat)
             fit_tmp_e = ebayes(fit_tmp_c, fdr_global=params.get("fdr_global", False))
+
+            # Statistique de référence pour le critère de succès
+            if use_deqms and fit_dq is not None:
+                try:
+                    fit_ref = spectra_count_ebayes(
+                        fit_tmp_c, np.nan_to_num(pc_for_fit, nan=1.0),
+                        fdr_global=params.get("fdr_global", False))
+                except Exception:
+                    fit_ref = fit_tmp_e   # repli limma si DEqMS échoue sur ce tirage
+            else:
+                fit_ref = fit_tmp_e
+
             out = np.zeros((n_prot, n_contr), dtype=np.int8)
             for i in range(n_contr):
-                tt_tmp = top_table(fit_tmp_e, i)
+                tt_tmp = top_table(fit_ref, i)
                 passed = ((np.abs(tt_tmp["logFC"].values) >= lfc_min) &
                           (tt_tmp[p_key].values < p_thr))
                 out[:, i] = passed.astype(np.int8)
@@ -2720,7 +2739,7 @@ def _wgcna_color_palette(n: int) -> list:
     wgcna_colors = [
         "grey", "turquoise", "blue", "brown", "yellow", "green",
         "red", "black", "pink", "magenta", "purple", "greenyellow",
-        "tan", "salmon", "cyan", "midnightblue", "lightcyan", "#999999",
+        "tan", "salmon", "cyan", "midnightblue", "lightcyan", "grey60",
         "lightgreen", "lightyellow", "royalblue", "darkred", "darkgreen",
         "darkturquoise", "darkgrey", "orange", "darkorange", "white",
         "skyblue", "saddlebrown", "steelblue", "paleturquoise", "violet",
