@@ -599,6 +599,44 @@ def plot_qc(mat: pd.DataFrame, meta: pd.DataFrame, design: pd.DataFrame,
     plt.close(fig)
     files.append(f)
 
+    # --- RLE plot (Relative Log Expression) ---
+    # Diagnostic de normalisation résiduelle APRÈS DIA-NN (cross-run RT-dependent).
+    # Pour chaque protéine, on soustrait sa médiane across-samples ; on boxplote
+    # ces écarts par échantillon. Attendu si la normalisation tient : toutes les
+    # boîtes centrées sur 0, de dispersion comparable. Un run dont la médiane RLE
+    # s'écarte de 0 ou dont la boîte est anormalement étalée signale un effet
+    # technique résiduel (le RLE neutralise le signal biologique commun, ce que
+    # le boxplot de distribution brute ne fait pas). Aucune donnée n'est modifiée.
+    rle = mat.sub(mat.median(axis=1), axis=0)   # écart à la médiane par protéine
+    data_rle = [rle[c].dropna().values for c in mat.columns]
+    med_rle = np.array([np.median(d) if len(d) else np.nan for d in data_rle])
+    cond_col = _condition_colors(conditions)
+    fig, ax = plt.subplots(figsize=(max(10, len(mat.columns) * 0.4), 5))
+    bp = ax.boxplot(data_rle, patch_artist=True, showfliers=False,
+                    medianprops=dict(color="black", linewidth=1),
+                    whiskerprops=dict(color="grey"))
+    for patch, c in zip(bp["boxes"], conditions):
+        patch.set_facecolor(cond_col[c]); patch.set_alpha(0.75)
+    ax.axhline(0, color="red", linestyle="--", linewidth=0.8, zorder=0)
+    ax.set_xticks(range(1, len(mat.columns) + 1))
+    ax.set_xticklabels(design["label"].values, rotation=90, fontsize=7)
+    ax.set_ylabel("Relative Log Expression (log2)")
+    # Borne l'axe Y sur l'IQR agrégé pour rester lisible malgré les protéines extrêmes
+    all_vals = np.concatenate([d for d in data_rle if len(d)])
+    if all_vals.size:
+        ylim = np.nanpercentile(np.abs(all_vals), 99)
+        ax.set_ylim(-ylim, ylim)
+    worst = np.nanmax(np.abs(med_rle)) if np.isfinite(med_rle).any() else 0.0
+    ax.set_title(f"RLE plot — residual normalization check "
+                 f"(max |median| = {worst:.2f} log2)")
+    handles = [mpatches.Patch(color=v, label=k) for k, v in cond_col.items()]
+    ax.legend(handles=handles, fontsize=7, loc="upper right")
+    fig.tight_layout()
+    f = os.path.join(out_dir, "qc_rle.png")
+    fig.savefig(f, dpi=150)
+    plt.close(fig)
+    files.append(f)
+
     # --- Missing values heatmap ---
     fig, ax = plt.subplots(figsize=(max(8, len(mat.columns) * 0.35),
                                     min(12, len(mat) * 0.02 + 2)))
