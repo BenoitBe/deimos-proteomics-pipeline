@@ -583,7 +583,7 @@ def plot_qc(mat: pd.DataFrame, meta: pd.DataFrame, design: pd.DataFrame,
 
     # --- Normalisation (boxplots) ---
     fig, ax = plt.subplots(figsize=(max(10, len(mat.columns) * 0.4), 5))
-    data_box = [mat[c].dropna().values for c in mat.columns]
+    data_box = [mat[c].dropna().values.flatten() for c in mat.columns]
     ax.boxplot(data_box, patch_artist=True,
                boxprops=dict(facecolor="#AED6F1"),
                medianprops=dict(color="red"),
@@ -608,7 +608,7 @@ def plot_qc(mat: pd.DataFrame, meta: pd.DataFrame, design: pd.DataFrame,
     # technique résiduel (le RLE neutralise le signal biologique commun, ce que
     # le boxplot de distribution brute ne fait pas). Aucune donnée n'est modifiée.
     rle = mat.sub(mat.median(axis=1), axis=0)   # écart à la médiane par protéine
-    data_rle = [rle[c].dropna().values for c in mat.columns]
+    data_rle = [rle[c].dropna().values.flatten() for c in mat.columns]
     med_rle = np.array([np.median(d) if len(d) else np.nan for d in data_rle])
     cond_col = _condition_colors(conditions)
     fig, ax = plt.subplots(figsize=(max(10, len(mat.columns) * 0.4), 5))
@@ -694,7 +694,7 @@ def impute_minprob(mat: pd.DataFrame, q: float = 0.01, rng=None) -> pd.DataFrame
             continue
         mu_low = np.quantile(vals, q)
         sd_low = np.std(vals) * 0.3  # σ réduit comme dans DEP
-        n_miss = mat_imp[col].isna().sum()
+        n_miss = int(mat_imp[col].isna().sum())
         if n_miss > 0:
             mat_imp.loc[mat_imp[col].isna(), col] = draw(mu_low, sd_low, n_miss)
     return mat_imp
@@ -715,7 +715,7 @@ def impute_qrilc(mat: pd.DataFrame, rng=None) -> pd.DataFrame:
     for col in mat_imp.columns:
         s = mat_imp[col]
         obs = s.dropna().values
-        n_miss = s.isna().sum()
+        n_miss = int(s.isna().sum())
         if n_miss == 0 or len(obs) < 3:
             if n_miss > 0 and len(obs) > 0:
                 mat_imp.loc[s.isna(), col] = obs.min()
@@ -2550,7 +2550,7 @@ WGCNA_CONFIG = {
     # La TOM est en O(N²) en mémoire et O(N²·échantillons) en temps ; au-delà de
     # ~5000 protéines le calcul devient lourd. Les protéines peu variables
     # n'apportent rien à l'analyse de co-expression.
-    "max_proteins":     5000,   # None = pas de filtrage | int = top-N par variance
+    "max_proteins":     2000,   # None = pas de filtrage | int = top-N par variance
 }
 
 
@@ -2777,7 +2777,7 @@ def _wgcna_color_palette(n: int) -> list:
     wgcna_colors = [
         "grey", "turquoise", "blue", "brown", "yellow", "green",
         "red", "black", "pink", "magenta", "purple", "greenyellow",
-        "tan", "salmon", "cyan", "midnightblue", "lightcyan", "grey60",
+        "tan", "salmon", "cyan", "midnightblue", "lightcyan", "#999999",
         "lightgreen", "lightyellow", "royalblue", "darkred", "darkgreen",
         "darkturquoise", "darkgrey", "orange", "darkorange", "white",
         "skyblue", "saddlebrown", "steelblue", "paleturquoise", "violet",
@@ -3135,6 +3135,17 @@ def main():
 
     # --- 2. Matrice expression ---
     mat_log2, meta, design_filt, lfq_cols = build_expression_matrix(tsv, design)
+
+    # Sécurité : colonnes dupliquées → crash dans pandas lors de l'imputation
+    # Doit être fait AVANT plot_qc pour garder mat_log2 et design_filt synchronisés
+    if mat_log2.columns.duplicated().any():
+        n_dup = mat_log2.columns.duplicated().sum()
+        print(f"  [WARN] {n_dup} duplicate sample column(s) in matrix — keeping first occurrence.")
+        dup_labels = mat_log2.columns[mat_log2.columns.duplicated()].tolist()
+        print(f"         Duplicates: {dup_labels}")
+        keep_mask_dup = ~pd.Series(mat_log2.columns).duplicated().values
+        mat_log2    = mat_log2.loc[:, keep_mask_dup]
+        design_filt = design_filt[keep_mask_dup].reset_index(drop=True)
 
     # --- 3. QC ---
     print("\n[QC] Quality control...")
