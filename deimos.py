@@ -50,7 +50,9 @@ from limma_ebayes import (lm_fit, contrasts_fit, ebayes, top_table,
 # Module GO/gProfiler optionnel (import protégé : si absent, le pipeline tourne)
 try:
     from go_enrichment import (ask_go_params, run_go_enrichment,
-                               export_go_sheets)
+                               export_go_sheets,
+                               run_go_enrichment_clusters,
+                               export_go_cluster_sheets)
     _GO_AVAILABLE = True
 except ImportError:
     _GO_AVAILABLE = False
@@ -3314,6 +3316,15 @@ def main():
         if go_results:
             export_go_sheets(wb, go_results, _write_df, _ins_img)
             print(f"  [OK] {len(go_results)} GO sheet(s) added.")
+
+        # GO par cluster de la heatmap ANOVA (réutilise cluster_mapping)
+        if cluster_mapping:
+            go_cluster_results = run_go_enrichment_clusters(
+                cluster_mapping, params, go_params, out_dir)
+            if go_cluster_results:
+                export_go_cluster_sheets(
+                    wb, go_cluster_results, _write_df, _ins_img)
+                print(f"  [OK] {len(go_cluster_results)} GO cluster sheet(s) added.")
 
     wb.save(output_name)
 

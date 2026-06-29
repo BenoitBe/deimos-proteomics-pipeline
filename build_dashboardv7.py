@@ -548,10 +548,77 @@ def build_top20_pi(df_comp, contrasts):
 # INTERSECTIONS + UPSET
 # ──────────────────────────────────────────────────────────────────────────────
 def short_label(part):
-    """Label court d'une condition (Monoculture->M, Polyculture_1->P1...)."""
+    """Label court d'une condition, SANS contexte (rétrocompat / fallback).
+    Conserve le mapping historique Monoculture/Polyculture, mais ne tronque plus
+    aveuglément au début (source du bug X180/X180 sur préfixes communs) : on
+    privilégie la fin distinctive si le nom est long.
+    """
     s = part.replace('Polyculture_', 'P').replace('Polyculture.', 'P').replace('Monoculture', 'M')
     s = ''.join(s.split('_'))
-    return s[:4]
+    if len(s) <= 6:
+        return s
+    return s[-6:]   # garde la fin (souvent distinctive) plutôt que le début
+
+
+def _strip_common_affix(conditions):
+    """À partir de la liste complète des conditions, retire le préfixe ET le
+    suffixe communs à TOUTES, pour ne garder que la partie discriminante.
+
+    Ex: ['18-009IG01Ctrl','18-009IG01di6h','18-009IG01di24h']
+        -> {'18-009IG01Ctrl':'Ctrl', '18-009IG01di6h':'di6h', '18-009IG01di24h':'di24h'}
+
+    Garanties :
+    - jamais de label vide (repli sur le nom complet tronqué)
+    - unicité des labels (suffixe numérique #i ajouté en cas de collision)
+    """
+    conds = list(dict.fromkeys(conditions))  # uniques, ordre conservé
+    if len(conds) <= 1:
+        return {c: (c[:10] if len(c) > 10 else c) for c in conds}
+
+    # Préfixe commun (sur caractères)
+    pre = os.path.commonprefix(conds)
+    # Suffixe commun (via reverse)
+    suf = os.path.commonprefix([c[::-1] for c in conds])[::-1]
+
+    # On ne coupe le préfixe/suffixe que s'il reste quelque chose de non vide
+    # pour TOUTES les conditions (sinon on annulerait la coupe).
+    def _trim(c):
+        core = c
+        if pre and core.startswith(pre):
+            core = core[len(pre):]
+        if suf and core.endswith(suf) and len(core) > len(suf):
+            core = core[:len(core) - len(suf)]
+        core = core.strip(' _-.')
+        return core if core else c   # jamais vide
+
+    trimmed = {c: _trim(c) for c in conds}
+
+    # Si la coupe a rendu des labels vides ou tous identiques, on annule la coupe
+    vals = list(trimmed.values())
+    if any(not v for v in vals) or len(set(vals)) < len(vals):
+        # Tentative : ne couper que le préfixe (garder le suffixe distinctif)
+        def _trim_pre_only(c):
+            core = c[len(pre):] if (pre and c.startswith(pre)) else c
+            core = core.strip(' _-.')
+            return core if core else c
+        trimmed2 = {c: _trim_pre_only(c) for c in conds}
+        if len(set(trimmed2.values())) == len(trimmed2):
+            trimmed = trimmed2
+
+    # Raccourcir les labels trop longs (garde le début de la partie distinctive)
+    out = {}
+    seen = {}
+    for c, lbl in trimmed.items():
+        s = lbl if len(lbl) <= 8 else lbl[:8]
+        # Garantir l'unicité
+        if s in seen.values():
+            i = 2
+            while f"{s[:6]}#{i}" in seen.values():
+                i += 1
+            s = f"{s[:6]}#{i}"
+        seen[c] = s
+        out[c] = s
+    return out
 
 
 def build_intersections(df_inter, contrasts):
@@ -574,11 +641,20 @@ def build_intersections(df_inter, contrasts):
         inter_rows.append(rec)
 
     # UPSET : labels courts par contraste
+    # On collecte d'abord TOUTES les conditions (les 2 côtés de chaque contraste)
+    # pour retirer le préfixe/suffixe commun à l'ensemble (évite le bug X180/X180
+    # quand les conditions partagent un long préfixe de code projet/date/lignée).
+    all_conds = []
+    for c in contrasts:
+        parts = c.split('_vs_')
+        all_conds.extend(parts)
+    cond_label = _strip_common_affix(all_conds)
+
     contrast_short = {}
     for c in contrasts:
         parts = c.split('_vs_')
-        a = short_label(parts[0]) if len(parts) > 0 else c[:3]
-        b = short_label(parts[1]) if len(parts) > 1 else ''
+        a = cond_label.get(parts[0], short_label(parts[0])) if len(parts) > 0 else c[:3]
+        b = cond_label.get(parts[1], short_label(parts[1])) if len(parts) > 1 else ''
         contrast_short[c] = (a + '/' + b) if b else a
 
     sets = list(contrast_short.values())
@@ -695,16 +771,68 @@ def build_scatter(df_comp, contrasts, cond_map):
 # GO — données, images, chord
 # ──────────────────────────────────────────────────────────────────────────────
 def map_go_sheet(sheet, contrasts):
-    """Apparie une sheet GO_* au contraste le plus proche (normalisation + similarité)."""
-    s = sheet.replace('GO_', '')
-    s_norm = re.sub(r'([a-z\d])v([A-Z])', r'\1_vs_\2', s).lower().replace('_', '')
-    best, best_score = None, -1
+    """Apparie une sheet GO_* au contraste correspondant.
+
+    Les onglets sont nommés 'GO_<contrast>' avec '_vs_' -> 'v' et tronqués à 31
+    caractères (limite Excel). L'ancienne version comparait des caractères triés
+    (similarité floue), ce qui échoue dès que les contrastes partagent un long
+    préfixe commun : plusieurs onglets se mappaient au même contraste et un
+    contraste restait orphelin (colonne vide dans la heatmap).
+
+    Nouvelle stratégie : on encode chaque contraste comme le pipeline encode le
+    nom d'onglet (remplacement '_vs_' -> 'v', suppression de '_', troncature à
+    28 caractères = 31 - len('GO_')), puis on cherche une correspondance EXACTE
+    sur ce préfixe. Repli sur la plus longue sous-chaîne commune seulement si
+    aucune correspondance exacte n'est trouvée.
+    """
+    s = sheet[3:] if sheet.startswith('GO_') else sheet  # retire 'GO_'
+
+    # Les noms d'onglets sont désormais construits à partir des conditions
+    # STRIPPÉES de leur préfixe/suffixe commun (cf. _make_go_sheet_names dans
+    # go_enrichment.py). On reproduit ici le même stripping pour matcher.
+    all_conds = []
     for c in contrasts:
-        c_norm = c.lower().replace('_', '')
-        score = sum(1 for a, b in zip(sorted(s_norm), sorted(c_norm)) if a == b)
-        if score > best_score:
-            best_score, best = score, c
-    return best
+        all_conds.extend(c.split('_vs_'))
+    cond_label = _strip_common_affix(all_conds)
+
+    def _encode_stripped(contrast):
+        parts = contrast.split('_vs_')
+        a = cond_label.get(parts[0], parts[0])[:12] if parts else contrast[:12]
+        b = cond_label.get(parts[1], parts[1])[:12] if len(parts) > 1 else ""
+        return f"{a}v{b}" if b else a
+
+    def _encode_legacy(contrast):
+        # ancien schéma (conditions complètes) — rétrocompat fichiers anciens
+        return contrast.replace('_vs_', 'v').replace('_', '')
+
+    # 1) Correspondance exacte sur le schéma strippé (nominal)
+    for c in contrasts:
+        enc = _encode_stripped(c)
+        if enc[:len(s)] == s or enc == s:
+            return c
+
+    # 2) Correspondance exacte sur l'ancien schéma (anciens classeurs)
+    for c in contrasts:
+        for enc in (_encode_legacy(c),
+                    c.replace('_vs_', 'v')):   # ancien format gardant les '_'
+            if enc[:len(s)] == s or enc == s:
+                return c
+
+    # 3) Repli : meilleur préfixe commun (strippé), avec seuil de fiabilité
+    def _lcp(a, b):
+        n = 0
+        for x, y in zip(a, b):
+            if x == y:
+                n += 1
+            else:
+                break
+        return n
+    best, best_len = None, -1
+    for c in contrasts:
+        n = max(_lcp(_encode_stripped(c), s), _lcp(_encode_legacy(c), s))
+        if n > best_len:
+            best_len, best = n, c
+    return best if best_len >= max(3, len(s) // 2) else None
 
 
 def read_go_table(path, sheet):
@@ -949,11 +1077,11 @@ def build_go_heatmap(path, contrasts):
     Termes triés par source (BP/MF/CC) puis par variance décroissante.
     """
     if not path or not os.path.isfile(path):
-        return {'terms': [], 'contrasts': contrasts, 'z_min': -1, 'z_max': 1}
+        return {'terms': [], 'contrasts': contrasts, 'labels': contrasts, 'z_min': -1, 'z_max': 1}
     try:
         xl = pd.ExcelFile(path)
     except Exception:
-        return {'terms': [], 'contrasts': contrasts, 'z_min': -1, 'z_max': 1}
+        return {'terms': [], 'contrasts': contrasts, 'labels': contrasts, 'z_min': -1, 'z_max': 1}
 
     go_sheets = [s for s in xl.sheet_names if 'go' in s.lower() or s.startswith('GO_')]
     term_dict = {}  # tid -> {name, src, data: {contrast: z}}
@@ -980,7 +1108,7 @@ def build_go_heatmap(path, contrasts):
             term_dict[tid]['data'][c] = round(float(r['z_score']), 4)
 
     if not term_dict:
-        return {'terms': [], 'contrasts': contrasts, 'z_min': -1, 'z_max': 1}
+        return {'terms': [], 'contrasts': contrasts, 'labels': contrasts, 'z_min': -1, 'z_max': 1}
 
     # Trier : source BP > MF > CC > autre, puis variance décroissante
     src_order = {'GO:BP': 0, 'GO:MF': 1, 'GO:CC': 2}
@@ -1009,9 +1137,24 @@ def build_go_heatmap(path, contrasts):
         })
 
     z_abs_max = max(abs(z) for z in all_z) if all_z else 1.0
+
+    # Labels courts lisibles pour l'axe colonnes : on retire le préfixe/suffixe
+    # commun aux conditions (évite 'X18009IG01Ctrl/X18009IG01di6h' illisible).
+    all_conds = []
+    for c in contrasts:
+        all_conds.extend(c.split('_vs_'))
+    cond_label = _strip_common_affix(all_conds)
+    contrast_labels = []
+    for c in contrasts:
+        parts = c.split('_vs_')
+        a = cond_label.get(parts[0], parts[0][:8]) if parts else c
+        b = cond_label.get(parts[1], parts[1][:8]) if len(parts) > 1 else ''
+        contrast_labels.append(f"{a}/{b}" if b else a)
+
     return {
         'terms':     terms_out,
-        'contrasts': contrasts,
+        'contrasts': contrasts,          # noms complets (tooltips / mapping)
+        'labels':    contrast_labels,    # labels courts lisibles (affichage)
         'z_min':     round(-z_abs_max, 3),
         'z_max':     round(z_abs_max, 3),
     }
@@ -1961,14 +2104,14 @@ function drawGOHeatmap(){
 
   const SRC_COL={'GO:BP':'#388bfd','GO:MF':'#3fb950','GO:CC':'#d29922'};
 
-  // En-têtes colonnes — labels courts horizontaux
-  const shortLabel = function(c){
-    return c.replace(/Monoculture/g,'Mono').replace(/Polyculture_/g,'P').replace(/_vs_/,'/').replace(/_/g,'');
-  };
+  // En-têtes colonnes — labels courts pré-calculés côté Python (préfixe commun
+  // retiré). Repli sur le nom complet si 'labels' absent (rétrocompat).
+  const colLabels = (GO_HEATMAP.labels && GO_HEATMAP.labels.length===nC)
+                    ? GO_HEATMAP.labels : contrasts;
   contrasts.forEach((c,ci)=>{
     const x=lW+ci*cellW+cellW/2;
     ctx.fillStyle='#c9d1d9';ctx.font='bold 9px sans-serif';ctx.textAlign='center';
-    ctx.fillText(shortLabel(c), x, topH-6);
+    ctx.fillText(colLabels[ci], x, topH-6);
   });
 
   // Titre
@@ -5725,13 +5868,13 @@ def inject(template_html, data):
 
 def main():
     ap = argparse.ArgumentParser(description="Génère le dashboard protéomique HTML depuis les XLSX des scripts R.")
-    ap.add_argument('--uploads', default='.', help="Dossier d'auto-détection des XLSX")
+    ap.add_argument('--uploads', default='/Data/Dashboard/upload', help="Dossier d'auto-détection des XLSX")
     ap.add_argument('--stats', help="Chemin rapportstatistique.xlsx (obligatoire si pas d'auto-détection)")
     ap.add_argument('--go', help="Chemin rapportenrichissementGO.xlsx (optionnel)")
     ap.add_argument('--wgcna', help="Chemin WGCNA_Emotional.xlsx (optionnel)")
     ap.add_argument('--umap',  help="Chemin umap.xlsx avec sheet UMAP_Output (optionnel)")
     ap.add_argument('--template', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard_template.html'))
-    ap.add_argument('--out', default='proteogen_dashboard.html')
+    ap.add_argument('--out', default='/Data/Dashboard/outputs/proteogen_dashboard.html')
     ap.add_argument('--params-json', dest='params_json', default=None,
                     help="JSON des seuils choisis dans le pipeline (optionnel)")
     args = ap.parse_args()

@@ -29,6 +29,57 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
+
+def _strip_common_affix(conditions):
+    """Retire le préfixe ET le suffixe communs à TOUTES les conditions, pour ne
+    garder que la partie discriminante. Identique à la fonction du dashboard
+    (build_dashboardv7.py) — gardée synchronisée pour un nommage d'onglets et un
+    appariement cohérents de part et d'autre.
+
+    Ex: ['X18_009IG01Ctrl','X18_009IG01di6h','X18_009IG01di24h']
+        -> {'...Ctrl':'Ctrl', '...di6h':'di6h', '...di24h':'di24h'}
+
+    Garanties : jamais de label vide, labels uniques (suffixe #i si collision).
+    """
+    conds = list(dict.fromkeys(conditions))
+    if len(conds) <= 1:
+        return {c: (c[:10] if len(c) > 10 else c) for c in conds}
+
+    pre = os.path.commonprefix(conds)
+    suf = os.path.commonprefix([c[::-1] for c in conds])[::-1]
+
+    def _trim(c):
+        core = c
+        if pre and core.startswith(pre):
+            core = core[len(pre):]
+        if suf and core.endswith(suf) and len(core) > len(suf):
+            core = core[:len(core) - len(suf)]
+        core = core.strip(" _-.")
+        return core if core else c
+
+    trimmed = {c: _trim(c) for c in conds}
+    vals = list(trimmed.values())
+    if any(not v for v in vals) or len(set(vals)) < len(vals):
+        def _trim_pre_only(c):
+            core = c[len(pre):] if (pre and c.startswith(pre)) else c
+            core = core.strip(" _-.")
+            return core if core else c
+        trimmed2 = {c: _trim_pre_only(c) for c in conds}
+        if len(set(trimmed2.values())) == len(trimmed2):
+            trimmed = trimmed2
+
+    out, seen = {}, {}
+    for c, lbl in trimmed.items():
+        s = lbl if len(lbl) <= 8 else lbl[:8]
+        if s in seen.values():
+            i = 2
+            while f"{s[:6]}#{i}" in seen.values():
+                i += 1
+            s = f"{s[:6]}#{i}"
+        seen[c] = s
+        out[c] = s
+    return out
+
 # Sources d'enrichissement (comme le script R)
 GO_SOURCES = ["GO:BP", "GO:CC", "GO:MF", "REAC", "KEGG"]
 
@@ -662,9 +713,185 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
         return None
 
 
+def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
+                               out_dir: str) -> dict | None:
+    """
+    Enrichissement GO par cluster de la heatmap ANOVA.
+
+    Contrairement à run_go_enrichment (qui part des DEP par contraste), on prend
+    ici les protéines regroupées par profil d'expression (clusters k-means de la
+    heatmap). Background = protéome connu de l'espèce (domain_scope='known').
+
+    Parameters
+    ----------
+    cluster_mapping : liste de tuples (protein_name, "Cluster_N") — telle que
+                      produite par run_anova_heatmaps.
+    params, go_params, out_dir : identiques à run_go_enrichment.
+
+    Retourne {cluster_id: {"table": df, "lollipop": path, "dotplot": path}}.
+    Entièrement protégé : n'interrompt jamais le pipeline.
+
+    Note z-score : les protéines d'un cluster proviennent de contrastes variés,
+    il n'existe pas de LFC unique par protéine au niveau cluster. Le z_score des
+    termes est donc neutralisé (0) ici — l'information portée par le cluster est
+    le profil d'expression, pas un sens de régulation par contraste.
+    """
+    if go_params is None:
+        return None
+
+    try:
+        organism = go_params["organism"]
+        # Regrouper les protéines par cluster
+        from collections import defaultdict
+        clusters = defaultdict(list)
+        for prot, cid in cluster_mapping:
+            if cid:  # ignorer les non-assignés ("")
+                clusters[cid].append(str(prot).split(";")[0].strip())
+
+        if not clusters:
+            return None
+
+        print(f"\n[GO] Cluster GO enrichment — species '{organism}' "
+              f"({len(clusters)} clusters)")
+
+        results = {}
+        for cid in sorted(clusters.keys()):
+            prots = list(dict.fromkeys(clusters[cid]))  # dédup, ordre conservé
+            try:
+                if len(prots) <= 5:
+                    print(f"  [SKIP] {cid}: too few proteins ({len(prots)}), skipped.")
+                    continue
+
+                print(f"  [GO] {cid}: {len(prots)} proteins -> gProfiler...")
+                gost_df = run_gost(prots, organism)
+                if gost_df is None or gost_df.empty:
+                    print(f"     No significant enrichment.")
+                    continue
+
+                # df_local vide → process_enrichment neutralise le z-score (0.0)
+                tab = process_enrichment(gost_df, pd.DataFrame())
+                if tab.empty:
+                    print(f"     No term after filtering (term_size, roots).")
+                    continue
+
+                def _safe_plot(fn, *a):
+                    try:
+                        return fn(*a)
+                    except Exception as ex:
+                        print(f"        (plot {fn.__name__} skipped: "
+                              f"{type(ex).__name__})")
+                        return None
+                # On réutilise les plots existants ; l'étiquette = cid
+                f_lol = _safe_plot(plot_lollipop_faceted, tab, cid, out_dir)
+                f_dot = _safe_plot(plot_dotplot_faceted, tab, cid, out_dir)
+
+                tab_export = tab.copy()
+                if "intersection" in tab_export.columns:
+                    tab_export["intersection"] = tab_export["intersection"].apply(
+                        lambda x: ",".join(map(str, x))
+                        if isinstance(x, (list, tuple, np.ndarray)) else str(x))
+                tab_export = tab_export.drop(columns=["term_short", "minus_log10_p"],
+                                             errors="ignore")
+
+                results[cid] = {"table": tab_export,
+                                "lollipop": f_lol, "dotplot": f_dot}
+                n_bp = (tab["source"] == "GO:BP").sum()
+                print(f"     [OK] {len(tab)} enriched terms ({n_bp} GO:BP).")
+
+            except Exception as e:
+                detail = f"missing column/key: {e}" if isinstance(e, KeyError) else str(e)[:80]
+                print(f"     [WARN] Error on {cid}: {type(e).__name__} ({detail}) — skipped.")
+                continue
+
+        if not results:
+            print("  [INFO] No significant GO enrichment across all clusters.")
+            return None
+        return results
+
+    except Exception as e:
+        print(f"  [WARN] Cluster GO enrichment interrupted ({type(e).__name__}) — "
+              f"the main pipeline is not affected.")
+        return None
+
+
+def export_go_cluster_sheets(wb, go_cluster_results: dict, write_df_fn, ins_img_fn):
+    """Ajoute un onglet Cluster_Enrich_N par cluster au classeur Excel.
+
+    IMPORTANT — nommage : on n'utilise PAS le préfixe 'GO_' ici. Le dashboard
+    (build_dashboardv7.py) capte toute feuille dont le nom contient 'go' pour
+    construire sa heatmap GO cross-contrastes, puis apparie de force chaque
+    feuille à un contraste (sans seuil de rejet). Des onglets de CLUSTER (qui ne
+    correspondent à aucun contraste) y seraient appariés à tort et casseraient la
+    heatmap. Le préfixe 'Cluster_Enrich_' échappe à tous les filtres du dashboard
+    ('go' in name / startswith('GO_')), donc ces onglets restent visibles dans
+    l'Excel sans perturber le dashboard.
+    """
+    if not go_cluster_results:
+        return
+    for cid, data in go_cluster_results.items():
+        # cid = "Cluster_1" → onglet "Cluster_Enrich_1"
+        n = cid.replace("Cluster_", "")
+        sheet_name = f"Cluster_Enrich_{n}"[:31]
+        ws = wb.create_sheet(sheet_name)
+        df = data["table"]
+        start_col = 21
+        for j, col in enumerate(df.columns):
+            ws.cell(row=1, column=start_col + j, value=str(col))
+        for i, row in enumerate(df.itertuples(index=False), start=2):
+            for j, val in enumerate(row):
+                if isinstance(val, float) and np.isnan(val):
+                    val = None
+                elif isinstance(val, (list, tuple, np.ndarray)):
+                    val = ",".join(map(str, val))
+                ws.cell(row=i, column=start_col + j, value=val)
+        ins_img_fn(ws, data.get("lollipop"), "A2")
+        ins_img_fn(ws, data.get("dotplot"),  "A60")
+
+
 # ==============================================================================
 # 6. EXPORT EXCEL (onglets GO ajoutés au classeur principal)
 # ==============================================================================
+
+def _make_go_sheet_names(contrasts):
+    """Construit des noms d'onglets GO courts, lisibles et GARANTIS uniques
+    (<= 31 car., contrainte Excel).
+
+    Problème résolu : avec de longs préfixes communs aux conditions
+    (ex: 'X18_009IG01Ctrl_vs_X18_009IG01di6h'), une troncature naïve à 31 car.
+    garde le préfixe commun et produit des noms IDENTIQUES pour deux contrastes
+    différents -> Excel corrompt /xl/workbook.xml ('Réparations...').
+
+    Stratégie : retirer le préfixe/suffixe commun aux conditions (partie
+    discriminante), recomposer 'GO_<a>v<b>', tronquer, et dédupliquer avec un
+    suffixe numérique si nécessaire.
+
+    Retourne {contrast: sheet_name}.
+    """
+    # Conditions = les 2 côtés de chaque contraste
+    all_conds = []
+    for c in contrasts:
+        all_conds.extend(c.split("_vs_"))
+    cond_label = _strip_common_affix(all_conds)
+
+    names = {}
+    used = set()
+    for c in contrasts:
+        parts = c.split("_vs_")
+        a = cond_label.get(parts[0], parts[0])[:12] if parts else c[:12]
+        b = cond_label.get(parts[1], parts[1])[:12] if len(parts) > 1 else ""
+        base = f"GO_{a}v{b}" if b else f"GO_{a}"
+        base = base[:31]
+        name = base
+        i = 2
+        # Dédup anti-collision (réserve 3 car. pour le suffixe #NN)
+        while name in used:
+            suffix = f"#{i}"
+            name = (base[:31 - len(suffix)]) + suffix
+            i += 1
+        used.add(name)
+        names[c] = name
+    return names
+
 
 def export_go_sheets(wb, go_results: dict, write_df_fn, ins_img_fn):
     """
@@ -675,8 +902,10 @@ def export_go_sheets(wb, go_results: dict, write_df_fn, ins_img_fn):
     if not go_results:
         return
 
+    sheet_names = _make_go_sheet_names(list(go_results.keys()))
+
     for contrast, data in go_results.items():
-        sheet_name = f"GO_{contrast.replace('_vs_', 'v')}"[:31]
+        sheet_name = sheet_names[contrast]
         ws = wb.create_sheet(sheet_name)
 
         # Données décalées en colonne 21 (U) comme le script R
