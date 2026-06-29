@@ -518,12 +518,33 @@ def build_expression_matrix(tsv: pd.DataFrame, design: pd.DataFrame
     lfq_cols = [c for c in tsv.columns if c.startswith("LFQ.intensity.")]
 
     # Alignement design → colonnes LFQ
+    # IMPORTANT : appariement EXACT et non par sous-chaîne. Après nettoyage, les
+    # colonnes sont nommées 'LFQ.intensity.<label>'. Un test 'lbl in c' provoque
+    # des collisions de préfixe numérique : 'Sple-2' est une sous-chaîne de
+    # 'Sple-28' / 'Sple-29', 'Sple-3' de 'Sple-30', etc. → un même run pouvait
+    # être attribué à plusieurs labels (doublon de colonnes, perte d'échantillon).
     sample_map = {}
+    unmatched = []
     for _, row in design.iterrows():
-        lbl = row["label"]
-        match = [c for c in lfq_cols if lbl in c]
-        if match:
-            sample_map[lbl] = match[0]
+        lbl = str(row["label"])
+        target = f"LFQ.intensity.{lbl}"
+        if target in lfq_cols:
+            sample_map[lbl] = target
+        else:
+            # Repli : match par segment de fin exact (col se terminant par '.<lbl>'),
+            # tolère un préfixe LFQ différent sans retomber dans la sous-chaîne.
+            cand = [c for c in lfq_cols
+                    if c == lbl or c.endswith(f".{lbl}") or c.endswith(f"-{lbl}")]
+            if len(cand) == 1:
+                sample_map[lbl] = cand[0]
+            elif len(cand) > 1:
+                sample_map[lbl] = min(cand, key=len)
+            else:
+                unmatched.append(lbl)
+
+    if unmatched:
+        print(f"  [WARN] {len(unmatched)} design label(s) without a matching "
+              f"LFQ column: {unmatched}")
 
     ordered_lfq = [sample_map[lbl] for lbl in design["label"] if lbl in sample_map]
     design_filt = design[design["label"].isin(sample_map.keys())].reset_index(drop=True)
