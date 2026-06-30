@@ -1110,15 +1110,46 @@ def build_go_heatmap(path, contrasts):
     if not term_dict:
         return {'terms': [], 'contrasts': contrasts, 'labels': contrasts, 'z_min': -1, 'z_max': 1}
 
-    # Trier : source BP > MF > CC > autre, puis variance décroissante
-    src_order = {'GO:BP': 0, 'GO:MF': 1, 'GO:CC': 2}
+    # Trier : par variance inter-contrastes décroissante (les termes qui
+    # DIFFÉRENCIENT le plus les contrastes sont les plus informatifs dans une
+    # heatmap cross-contrastes), source en départage.
+    src_order = {'GO:BP': 0, 'GO:MF': 1, 'GO:CC': 2, 'REAC': 3, 'KEGG': 4}
+
+    def _variance(v):
+        zvals = list(v['data'].values())
+        return float(np.var(zvals)) if len(zvals) > 1 else 0.0
+
     def sort_key(item):
         tid, v = item
-        zvals = list(v['data'].values())
-        variance = float(np.var(zvals)) if len(zvals) > 1 else 0.0
-        return (src_order.get(v['src'], 3), -variance)
+        return (-_variance(v), src_order.get(v['src'], 5))
 
     sorted_terms = sorted(term_dict.items(), key=sort_key)
+
+    # PLAFOND : un canvas avec des milliers de lignes dépasse la limite de
+    # hauteur des navigateurs (~32767px) et ne s'affiche PAS (silencieusement).
+    # On garde au plus MAX_TERMS lignes, en réservant un quota par source pour
+    # que REAC/KEGG ne soient pas noyés sous les GO:BP les plus nombreux.
+    MAX_TERMS = 150
+    if len(sorted_terms) > MAX_TERMS:
+        from collections import defaultdict
+        by_src = defaultdict(list)
+        for it in sorted_terms:
+            by_src[it[1]['src']].append(it)
+        # Quota minimal garanti par source présente (le reste au mérite global)
+        n_src = len(by_src)
+        quota = max(10, MAX_TERMS // (n_src * 2)) if n_src else MAX_TERMS
+        picked, picked_ids = [], set()
+        for src, items in by_src.items():
+            for it in items[:quota]:
+                picked.append(it); picked_ids.add(it[0])
+        # Compléter avec les meilleurs termes globaux non encore retenus
+        for it in sorted_terms:
+            if len(picked) >= MAX_TERMS:
+                break
+            if it[0] not in picked_ids:
+                picked.append(it); picked_ids.add(it[0])
+        # Re-trier l'ensemble retenu (variance puis source) pour l'affichage
+        sorted_terms = sorted(picked, key=sort_key)[:MAX_TERMS]
 
     # Construire les lignes de la matrice
     all_z = []
@@ -1192,7 +1223,18 @@ def build_go_network(path, contrasts):
             continue
         df = df.dropna(subset=['term_id'])
 
-        # Index des termes enrichis
+        # PLAFOND : un graphe de plusieurs milliers de nœuds sature le rendu
+        # (canvas/SVG illisible et très lent, voire vide). On garde les
+        # MAX_NODES termes les plus significatifs (p-value croissante). Les
+        # relations parent-enfant restent cohérentes (filtrées sur les nœuds
+        # retenus plus bas, via term_ids).
+        MAX_NODES = 150
+        if 'p_value' in df.columns and len(df) > MAX_NODES:
+            df = df.sort_values('p_value', ascending=True, na_position='last').head(MAX_NODES)
+        elif len(df) > MAX_NODES:
+            df = df.head(MAX_NODES)
+
+        # Index des termes enrichis (après plafonnement)
         term_ids = set(df['term_id'].astype(str))
 
         # Nœuds
@@ -2438,10 +2480,12 @@ def patch_go_heatmap_js(html):
         '<div style="display:flex;gap:8px;align-items:center;">'
         '<select id="goHmSrc" style="background:var(--bg2);border:1px solid var(--bd);'
         'color:var(--tx);border-radius:4px;padding:3px 8px;font-size:11px;">'
-        '<option value="all">Toutes sources</option>'
-        '<option value="GO:BP">BP</option>'
-        '<option value="GO:MF">MF</option>'
-        '<option value="GO:CC">CC</option>'
+        '<option value="all">All sources</option>'
+        '<option value="GO:BP">GO:BP</option>'
+        '<option value="GO:MF">GO:MF</option>'
+        '<option value="GO:CC">GO:CC</option>'
+        '<option value="REAC">Reactome</option>'
+        '<option value="KEGG">KEGG</option>'
         '</select>'
         '<button id="goHmExportBtn" class="exp-btn" style="padding:3px 9px;font-size:10px;">&#11015; PNG</button>'
         '</div></div>\n'
@@ -5475,10 +5519,12 @@ GO_BUBBLE_HTML = """\
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <select id="goBubbleContrast" style="background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:4px;padding:3px 8px;font-size:11px;"></select>
       <select id="goBubbleSrc" style="background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:4px;padding:3px 8px;font-size:11px;">
-        <option value="all">Toutes sources</option>
-        <option value="GO:BP">BP</option>
-        <option value="GO:MF">MF</option>
-        <option value="GO:CC">CC</option>
+        <option value="all">All sources</option>
+        <option value="GO:BP">GO:BP</option>
+        <option value="GO:MF">GO:MF</option>
+        <option value="GO:CC">GO:CC</option>
+        <option value="REAC">Reactome</option>
+        <option value="KEGG">KEGG</option>
       </select>
       <button class="exp-btn" onclick="exportGOBubble()" style="padding:3px 9px;font-size:10px;">&#11015; PNG</button>
     </div>
