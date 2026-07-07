@@ -48,12 +48,24 @@ def _build_label_mapping(design: pd.DataFrame) -> dict:
     Builds the label → 'Condition_Replicate' mapping expected by the dashboard.
     E.g. label='Sple.S01', condition='Ctrl' → 'Ctrl_1'
     Replicates are numbered by order of appearance within each condition.
+
+    IMPORTANT — the pipeline applies R-style make.names() to condition names when
+    building contrasts: a name starting with a digit gets an 'X' prefix
+    (e.g. '20-048_SCtrl' → 'X20_048_SCtrl'). The dashboard matches sample columns
+    to contrasts via a normalized comparison (norm() drops '.', '_', '-'), so the
+    leading 'X' is the ONE character that must agree. We therefore prefix the
+    condition here exactly like make.names() does, otherwise the scatter/MA plots
+    get empty intensity columns (x=y=0) because the names don't line up.
     """
+    def _make_names(cond):
+        # R make.names(): prefix 'X' if the name starts with a digit
+        return f"X{cond}" if cond[:1].isdigit() else cond
+
     mapping = {}
     counters = {}
     for _, row in design.iterrows():
         label = str(row["label"])
-        cond  = str(row["condition"])
+        cond  = _make_names(str(row["condition"]))
         # Sanitize the condition so it doesn't contain stray '_' characters
         cond_clean = re.sub(r"_+", "-", cond)
         counters[cond_clean] = counters.get(cond_clean, 0) + 1

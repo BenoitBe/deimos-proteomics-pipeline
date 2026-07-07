@@ -3132,17 +3132,30 @@ INIT_GUARD_JS = """\
     var terms=(typeof goInvertActive!=='undefined'&&goInvertActive)
       ? GO_DATA[c].map(function(t){return Object.assign({},t,{z_score:-(t.z_score||0)});})
       : GO_DATA[c];
-    var srcColors={'GO:BP':'#388bfd','GO:MF':'#3fb950','GO:CC':'#d29922'};
+    var srcColors={'GO:BP':'#388bfd','GO:MF':'#3fb950','GO:CC':'#d29922',
+                   'REAC':'#9b59b6','KEGG':'#e67e22'};
+    var srcTitles={'GO:BP':'GO:BP','GO:MF':'GO:MF','GO:CC':'GO:CC',
+                   'REAC':'Reactome','KEGG':'KEGG'};
 
     // Panels par source
     var panelsDiv=document.getElementById('goSourcePanels');
     if(panelsDiv){
       panelsDiv.innerHTML='';
-      ['GO:BP','GO:MF','GO:CC'].forEach(function(src){
+      // Nombre variable de sources (3 à 5) -> flex-wrap plutôt que grille fixe 3 col.
+      panelsDiv.style.display='flex';
+      panelsDiv.style.flexWrap='wrap';
+      panelsDiv.style.gap='14px';
+      // N'afficher que les sources réellement présentes pour ce contraste
+      var srcOrder=['GO:BP','GO:MF','GO:CC','REAC','KEGG'];
+      var presentSrc=srcOrder.filter(function(src){
+        return terms.some(function(t){return t.source===src;});
+      });
+      presentSrc.forEach(function(src){
         var st=terms.filter(function(t){return t.source===src;})
                     .sort(function(a,b){return a.p_value-b.p_value;}).slice(0,10);
         if(!st.length)return;
         var col=srcColors[src]||'#888';
+        var title=srcTitles[src]||src;
         var maxZ=Math.max.apply(null,st.map(function(t){return Math.abs(t.z_score);}));
         var rows=st.map(function(t){
           var pct=Math.abs(t.z_score)/maxZ*100;
@@ -3155,9 +3168,10 @@ INIT_GUARD_JS = """\
             '<td style="padding:3px 6px;font-size:10px;color:'+col+';text-align:right;white-space:nowrap;">'+ps+'</td></tr>';
         }).join('');
         var p=document.createElement('div');p.className='panel';p.style.flex='1';
-        p.innerHTML='<div class="ph"><h2 style="color:'+col+';">'+src+'</h2></div>'+
+        p.style.minWidth='240px';
+        p.innerHTML='<div class="ph"><h2 style="color:'+col+';">'+title+'</h2></div>'+
           '<table style="width:100%;border-collapse:collapse;"><thead><tr style="border-bottom:1px solid var(--bd);">'+
-          '<th style="padding:3px 6px;text-align:left;font-size:9px;color:var(--tx2);">Terme</th>'+
+          '<th style="padding:3px 6px;text-align:left;font-size:9px;color:var(--tx2);">Term</th>'+
           '<th style="padding:3px 6px;font-size:9px;color:var(--tx2);">z-score</th>'+
           '<th style="padding:3px 6px;text-align:right;font-size:9px;color:var(--tx2);">p-value</th>'+
           '</tr></thead><tbody>'+rows+'</tbody></table>';
