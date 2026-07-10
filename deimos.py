@@ -2972,14 +2972,36 @@ def wgcna_module_summary(df_final: pd.DataFrame, df_cor: pd.DataFrame,
 
     df_summary = pd.DataFrame(rows).sort_values("N_proteins", ascending=False)
 
-    fig, ax = plt.subplots(figsize=(max(8, len(df_summary) * 0.5), 4))
-    mods_plot = df_summary[df_summary["Module"] != "grey"]
-    ax.bar(mods_plot["Module"], mods_plot["N_proteins"],
-           color=[str(c) for c in mods_plot["Module"].values], edgecolor="white")
+    # Le module 'grey' n'est PAS un module de co-expression : il regroupe les
+    # protéines NON assignées (ne corrèlent avec aucun réseau). On l'affiche
+    # quand même — son poids renseigne sur la qualité du clustering — mais
+    # visuellement distinct (hachures + placé en dernier) pour ne pas le
+    # confondre avec un vrai module co-régulé.
+    real_mods = df_summary[df_summary["Module"] != "grey"]
+    grey_mod  = df_summary[df_summary["Module"] == "grey"]
+    mods_plot = pd.concat([real_mods, grey_mod])  # grey toujours en dernier
+
+    fig, ax = plt.subplots(figsize=(max(8, len(mods_plot) * 0.5), 4))
+    bars = ax.bar(mods_plot["Module"], mods_plot["N_proteins"],
+                  color=[str(c) for c in mods_plot["Module"].values],
+                  edgecolor="black", linewidth=0.6)
+    # Distinguer la barre grey : hachures + libellé
+    for bar, mod in zip(bars, mods_plot["Module"].values):
+        if mod == "grey":
+            bar.set_hatch("///")
+            bar.set_edgecolor("#555555")
+            ax.annotate("unassigned", (bar.get_x() + bar.get_width() / 2,
+                        bar.get_height()), ha="center", va="bottom",
+                        fontsize=7, color="#555555", style="italic")
     ax.set_xlabel("Module")
     ax.set_ylabel("Number of proteins")
+    ax.set_xticks(range(len(mods_plot)))
     ax.set_xticklabels(mods_plot["Module"], rotation=45, ha="right", fontsize=8)
-    ax.set_title("WGCNA module sizes")
+    n_grey = int(grey_mod["N_proteins"].iloc[0]) if len(grey_mod) else 0
+    n_total = int(df_summary["N_proteins"].sum())
+    pct_grey = (100 * n_grey / n_total) if n_total else 0
+    ax.set_title(f"WGCNA module sizes  (grey = unassigned: "
+                 f"{n_grey}, {pct_grey:.0f}%)")
     fig.tight_layout()
     f_sizes = os.path.join(out_dir, "wgcna_module_sizes.png")
     fig.savefig(f_sizes, dpi=150)

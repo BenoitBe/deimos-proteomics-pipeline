@@ -1507,12 +1507,15 @@ function drawScatter(){
   ctx.scale(dpr,dpr);
   const pad={l:58,r:20,t:28,b:52};
   const pw=W-pad.l-pad.r,ph=H-pad.t-pad.b;
-  const xs=pts.map(p=>p.x),ys=pts.map(p=>p.y);
-  if(!xs.length)return;
-  const allv=[];
-  for(let i=0;i<xs.length;i++){ if(xs[i]>0)allv.push(xs[i]); if(ys[i]>0)allv.push(ys[i]); }
-  if(!allv.length)return;
-  const mn=_minOf(allv)-0.5,mx=_maxOf(allv)+0.5;
+  // Ne considérer que les points valides (x>0 ET y>0), comme le scatter matplotlib
+  const valid=pts.filter(p=>p.x>0&&p.y>0);
+  if(!valid.length)return;
+  // Bornes communes = min/max sur l'UNION de x et y des points valides
+  // (échelle carrée symétrique autour de la diagonale, comme matplotlib).
+  let lo=Infinity,hi=-Infinity;
+  valid.forEach(p=>{ if(p.x<lo)lo=p.x; if(p.y<lo)lo=p.y; if(p.x>hi)hi=p.x; if(p.y>hi)hi=p.y; });
+  const pad_ax=(hi-lo)*0.04||0.5;
+  const mn=lo-pad_ax,mx=hi+pad_ax;
   const sx=v=>(v-mn)/(mx-mn)*pw+pad.l;
   const sy=v=>(1-(v-mn)/(mx-mn))*ph+pad.t;
   ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
@@ -1522,17 +1525,27 @@ function drawScatter(){
     const x=pad.l+i*pw/4;ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,pad.t+ph);ctx.stroke();
     const y=pad.t+i*ph/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();
   }
-  // Diagonal y=x
+  // Diagonale y=x + lignes de seuil ±ratio (log2FC), comme le scatter matplotlib
+  const lfcThr=(typeof LFC_THRESH!=='undefined')?LFC_THRESH:(obj.lfc_thresh||0.585);
   ctx.strokeStyle='rgba(240,246,252,.25)';ctx.lineWidth=1;ctx.setLineDash([4,4]);
   ctx.beginPath();ctx.moveTo(sx(mn),sy(mn));ctx.lineTo(sx(mx),sy(mx));ctx.stroke();
   ctx.setLineDash([]);
-  // Points
-  pts.forEach(p=>{
-    if(p.x<=0||p.y<=0)return;
-    const col=p.s==='U'?'rgba(63,185,80,.8)':p.s==='D'?'rgba(248,81,73,.8)':'rgba(100,110,120,.35)';
-    const r=p.s!=='N'?3.5:1.8;
-    ctx.beginPath();ctx.arc(sx(p.x),sy(p.y),r,0,Math.PI*2);
-    ctx.fillStyle=col;ctx.fill();
+  ctx.strokeStyle='rgba(240,246,252,.12)';ctx.lineWidth=.7;ctx.setLineDash([2,3]);
+  ctx.beginPath();ctx.moveTo(sx(mn),sy(mn+lfcThr));ctx.lineTo(sx(mx-lfcThr),sy(mx));ctx.stroke();
+  ctx.beginPath();ctx.moveTo(sx(mn+lfcThr),sy(mn));ctx.lineTo(sx(mx),sy(mx-lfcThr));ctx.stroke();
+  ctx.setLineDash([]);
+  // Points : dessiner les NON-significatifs D'ABORD (dessous), puis U/D par-dessus.
+  // Couleurs alignées sur le scatter Excel : Up=orange, Down=cyan, NS=gris.
+  const colU='rgba(243,165,131,.85)';  // Up regulated (orange)
+  const colD='rgba(146,218,221,.85)';  // Down regulated (cyan)
+  const colN='rgba(150,150,150,.35)';  // Not changed (gris)
+  valid.filter(p=>p.s==='N').forEach(p=>{
+    ctx.beginPath();ctx.arc(sx(p.x),sy(p.y),1.8,0,Math.PI*2);
+    ctx.fillStyle=colN;ctx.fill();
+  });
+  valid.filter(p=>p.s!=='N').forEach(p=>{
+    ctx.beginPath();ctx.arc(sx(p.x),sy(p.y),3.2,0,Math.PI*2);
+    ctx.fillStyle=p.s==='U'?colU:colD;ctx.fill();
   });
   // Axis labels
   ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
@@ -1541,22 +1554,22 @@ function drawScatter(){
   ctx.fillText((obj.label_b||'')+' — mean log₂ intensity',0,0);ctx.restore();
   // Ticks
   ctx.font='9px sans-serif';ctx.fillStyle='#6e7681';
-  const step=Math.ceil((mx-mn)/5);
+  const step=Math.max(1,Math.ceil((mx-mn)/5));
   for(let v=Math.ceil(mn);v<=mx;v+=step){
     ctx.textAlign='center';ctx.fillText(v.toFixed(0),sx(v),H-32);
     ctx.textAlign='right';ctx.fillText(v.toFixed(0),pad.l-4,sy(v)+3);
   }
   // Counts + r
-  const su=pts.filter(p=>p.s==='U').length;
-  const sd=pts.filter(p=>p.s==='D').length;
+  const su=valid.filter(p=>p.s==='U').length;
+  const sd=valid.filter(p=>p.s==='D').length;
   ctx.font='bold 11px sans-serif';ctx.textAlign='left';
-  ctx.fillStyle='rgba(63,185,80,.9)';ctx.fillText('↑ '+su,pad.l+6,pad.t+16);
-  ctx.fillStyle='rgba(248,81,73,.9)';ctx.fillText('↓ '+sd,pad.l+6,pad.t+30);
+  ctx.fillStyle=colU;ctx.fillText('↑ '+su,pad.l+6,pad.t+16);
+  ctx.fillStyle=colD;ctx.fillText('↓ '+sd,pad.l+6,pad.t+30);
   ctx.fillStyle='#8b949e';ctx.font='10px sans-serif';ctx.textAlign='right';
-  ctx.fillText('r = '+(obj.r||'').toFixed(4),pad.l+pw-4,pad.t+14);
+  ctx.fillText('r = '+(obj.r||0).toFixed(4),pad.l+pw-4,pad.t+14);
   // Tooltip
   const tt=document.getElementById('scatterTip');
-  canvas._pts=pts;canvas._sx=sx;canvas._sy=sy;
+  canvas._pts=valid;canvas._sx=sx;canvas._sy=sy;
   canvas.onmousemove=function(e){
     const rect=canvas.getBoundingClientRect();
     const mx2=e.clientX-rect.left,my2=e.clientY-rect.top;
