@@ -371,18 +371,30 @@ def top_table(fit_eb: dict, coef_idx: int, protein_names=None) -> pd.DataFrame:
 # ------------------------------------------------------------------------------
 # 5. make_contrasts — génère la matrice de contrastes (toutes paires)
 # ------------------------------------------------------------------------------
-def make_all_contrasts(group_names: list) -> tuple[np.ndarray, list[str]]:
+def make_all_contrasts(group_names: list, n_total_cols: "int | None" = None
+                       ) -> tuple[np.ndarray, list[str]]:
     """
     Génère toutes les paires de groupes sous forme de matrice de contrastes.
 
+    Parameters
+    ----------
+    group_names : noms des colonnes de CONDITION (celles sur lesquelles on
+                  contraste).
+    n_total_cols : si fourni (design apparié ~0 + condition + subject), la
+                  matrice est paddée à n_total_cols lignes avec des zéros pour
+                  les colonnes nuisance (sujet) placées APRÈS les conditions.
+                  Les contrastes ne portent donc que sur les conditions.
+
     Returns
     -------
-    contrast_matrix : np.ndarray (n_groups × n_contrasts)
+    contrast_matrix : np.ndarray (n_rows × n_contrasts)
+                      n_rows = n_total_cols si fourni, sinon len(group_names)
     contrast_names  : list de str, ex: ["GroupA_vs_GroupB", ...]
     """
     n = len(group_names)
+    n_rows = n_total_cols if n_total_cols is not None else n
     pairs = list(combinations(range(n), 2))
-    contrast_matrix = np.zeros((n, len(pairs)))
+    contrast_matrix = np.zeros((n_rows, len(pairs)))
     contrast_names = []
 
     for k, (i, j) in enumerate(pairs):
@@ -428,6 +440,60 @@ def make_design_matrix(conditions: list) -> tuple[np.ndarray, list[str]]:
         design[i, j] = 1.0
 
     return design, group_names
+
+
+def make_paired_design_matrix(conditions: list, subjects: list
+                              ) -> tuple[np.ndarray, list[str], list[str]]:
+    """
+    Design matrix pour un plan APPARIÉ : ~0 + condition + subject.
+
+    Le même sujet apparaît dans plusieurs conditions. On ajoute un intercept par
+    sujet (effet fixe) pour absorber sa ligne de base individuelle : c'est
+    l'équivalent d'un test t apparié généralisé, qui retire la variabilité
+    inter-sujets et récupère la puissance statistique.
+
+    Encodage : one-hot des conditions (comme le modèle non apparié) PUIS one-hot
+    des sujets en retirant le premier sujet (référence) pour éviter la
+    colinéarité avec l'intercept implicite des conditions. Les contrastes ne
+    portent QUE sur les colonnes de condition (le sujet est un nuisance factor).
+
+    Returns
+    -------
+    design        : np.ndarray (n_samples × (n_cond + n_subject-1))
+    group_names   : noms des colonnes de CONDITION (pour makeContrasts)
+    all_col_names : noms de TOUTES les colonnes (condition + subject)
+    """
+    import re
+    # --- Colonnes de condition (identique à make_design_matrix) ---
+    clean_c = [re.sub(r"[^A-Za-z0-9_]", ".", c) for c in conditions]
+    clean_c = ["X" + c if c[0].isdigit() else c for c in clean_c]
+    group_names = []
+    for c in clean_c:
+        if c not in group_names:
+            group_names.append(c)
+
+    # --- Colonnes de sujet (one-hot, 1er sujet = référence, retiré) ---
+    clean_s = [re.sub(r"[^A-Za-z0-9_]", ".", str(s)) for s in subjects]
+    clean_s = ["S" + s if s[0].isdigit() else s for s in clean_s]
+    subj_levels = []
+    for s in clean_s:
+        if s not in subj_levels:
+            subj_levels.append(s)
+    subj_ref = subj_levels[0]                    # référence (absorbée)
+    subj_cols = [s for s in subj_levels if s != subj_ref]
+
+    n_samples = len(clean_c)
+    n_cond = len(group_names)
+    n_subj = len(subj_cols)
+
+    design = np.zeros((n_samples, n_cond + n_subj))
+    for i in range(n_samples):
+        design[i, group_names.index(clean_c[i])] = 1.0     # condition
+        if clean_s[i] in subj_cols:                        # subject (non-ref)
+            design[i, n_cond + subj_cols.index(clean_s[i])] = 1.0
+
+    all_col_names = group_names + [f"subject_{s}" for s in subj_cols]
+    return design, group_names, all_col_names
 
 
 # ------------------------------------------------------------------------------

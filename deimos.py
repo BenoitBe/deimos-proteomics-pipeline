@@ -45,7 +45,8 @@ logging.getLogger("adjustText").setLevel(logging.ERROR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from limma_ebayes import (lm_fit, contrasts_fit, ebayes, top_table,
                            spectra_count_ebayes,
-                           make_all_contrasts, make_design_matrix)
+                           make_all_contrasts, make_design_matrix,
+                           make_paired_design_matrix)
 
 # Module GO/gProfiler optionnel (import protégé : si absent, le pipeline tourne)
 try:
@@ -77,42 +78,53 @@ def ask_params() -> dict:
     Asks the user 2 questions at launch and returns the thresholds.
     The volcano thresholds also govern the robustness score and the facet volcano.
     """
+    def _ask_choice(prompt, valid):
+        """Pose une question à choix jusqu'à réponse valide.
+        Tolère une (ou des) première(s) ligne(s) vide(s) sans réafficher le
+        prompt en double (buffer d'entrée résiduel fréquent sous PowerShell) :
+        une entrée vide fait simplement re-lire l'entrée, pas ré-imprimer.
+        """
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        while True:
+            ans = input().strip()
+            if ans in valid:
+                return ans
+            if ans == "":
+                # ligne vide parasite : on re-lit sans réafficher le prompt
+                continue
+            # réponse non vide mais invalide : on réaffiche le prompt
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+
+    def _ask_float(prompt):
+        while True:
+            raw = input(prompt).strip()
+            if raw == "":
+                continue
+            try:
+                return float(raw)
+            except ValueError:
+                print("  Invalid input, try again.")
+
     print("\n" + "="*60)
     print("  PROTEOMICS PIPELINE — Statistical threshold configuration")
     print("="*60)
 
     # --- Question 1: Volcanos + Robustness ---
     print("\n[1/2] Individual volcanos, facet volcano & robustness score")
-    v_type = ""
-    while v_type not in ("1", "2"):
-        v_type = input("  Use (1) raw p.value  or  (2) p.adj / FDR [BH] ? -> ").strip()
+    v_type = _ask_choice("  Use (1) raw p.value  or  (2) p.adj / FDR [BH] ? -> ",
+                         ("1", "2"))
 
-    v_val = None
-    while v_val is None:
-        try:
-            v_val = float(input("  Threshold value (e.g. 0.05, 0.01) -> ").strip())
-        except ValueError:
-            print("  Invalid input, try again.")
-
-    v_ratio = None
-    while v_ratio is None:
-        try:
-            v_ratio = float(input("  Minimum ratio (e.g. 1.5, 2.0) -> ").strip())
-        except ValueError:
-            print("  Invalid input, try again.")
+    v_val = _ask_float("  Threshold value (e.g. 0.05, 0.01) -> ")
+    v_ratio = _ask_float("  Minimum ratio (e.g. 1.5, 2.0) -> ")
 
     # --- Question 2: ANOVA / Heatmap ---
     print("\n[2/2] ANOVA & heatmaps (significant protein selection)")
-    a_type = ""
-    while a_type not in ("1", "2"):
-        a_type = input("  Use (1) raw p.value  or  (2) p.adj / FDR [BH] ? -> ").strip()
+    a_type = _ask_choice("  Use (1) raw p.value  or  (2) p.adj / FDR [BH] ? -> ",
+                         ("1", "2"))
 
-    a_val = None
-    while a_val is None:
-        try:
-            a_val = float(input("  Threshold value (e.g. 0.05, 0.01) -> ").strip())
-        except ValueError:
-            print("  Invalid input, try again.")
+    a_val = _ask_float("  Threshold value (e.g. 0.05, 0.01) -> ")
 
     # Number of protein clusters (k-means) for the clustered heatmap
     n_clusters = None
@@ -979,11 +991,66 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
     conditions = design["condition"].values
     expr = mat_imp.values.astype(float)          # (n_prot × n_samples)
 
-    # --- Design matrix ---
-    design_mat, group_names = make_design_matrix(conditions.tolist())
-    contrast_mat, contrast_names = make_all_contrasts(group_names)
+    # --- Design matrix : apparié (~0 + condition + subject) si colonne 'subject'
+    #     présente et valide, sinon modèle standard (~0 + condition). ---
+    paired = False
+    subj_col = None
+    for cand in ("subject", "pair", "patient", "individual"):
+        if cand in design.columns:
+            subj_col = cand
+            break
+    if subj_col is not None:
+        # Alerte si des valeurs 'subject' sont manquantes (NaN) : cela vient
+        # souvent d'un séparateur erroné dans le CSV (virgule au lieu de ';')
+        # qui décale les colonnes et vide 'subject' sur certaines lignes.
+        n_missing = design[subj_col].isna().sum()
+        if n_missing > 0:
+            miss_labels = design.loc[design[subj_col].isna(), "label"].tolist() \
+                          if "label" in design.columns else []
+            print(f"  [WARN] {n_missing} sample(s) have an EMPTY 'subject' value "
+                  f"{miss_labels} — check your CSV separator (';' expected). "
+                  f"These samples cannot be paired.")
+        # Normalisation robuste des identifiants de sujet : on retire les
+        # espaces parasites et le suffixe '.0' des identifiants numériques lus
+        # comme flottants (1.0 -> 1). Sans ça, '1.0' et '1.0 ' (espace) sont vus
+        # comme DEUX sujets distincts et l'appariement se casse silencieusement.
+        raw_subj = design[subj_col].astype(str).str.strip()
+        raw_subj = raw_subj.str.replace(r"\.0$", "", regex=True)  # 1.0 -> 1
+        subjects = raw_subj.values
+        n_raw = design[subj_col].astype(str).str.strip().nunique()
+        n_clean = pd.Series(subjects).nunique()
+        if n_clean < n_raw:
+            print(f"  [INFO] Subject IDs normalized: {n_raw} -> {n_clean} "
+                  f"unique subjects (removed spacing/'.0' variants).")
 
-    print(f"\n[MODEL] {len(contrast_names)} contrasts generated: {contrast_names[:5]}{'...' if len(contrast_names)>5 else ''}")
+        # Apparié seulement si au moins un sujet couvre >= 2 conditions
+        # (sinon 'subject' redondant avec les échantillons -> non identifiable).
+        pairing = pd.DataFrame({"s": subjects, "c": conditions})
+        n_cond_per_subj = pairing.groupby("s")["c"].nunique()
+        n_subj = pairing["s"].nunique()
+        # Avertir si certains sujets ne couvrent qu'une condition (appariement
+        # partiel — ils ne bénéficient pas de la correction inter-sujets).
+        lonely = n_cond_per_subj[n_cond_per_subj < 2]
+        if len(lonely) > 0 and (n_cond_per_subj >= 2).any():
+            print(f"  [WARN] {len(lonely)} subject(s) appear in only ONE "
+                  f"condition: {list(lonely.index)} — they are not paired.")
+        if (n_cond_per_subj >= 2).any() and n_subj >= 2 and n_subj < len(subjects):
+            paired = True
+
+    if paired:
+        design_mat, group_names, all_cols = make_paired_design_matrix(
+            conditions.tolist(), subjects.tolist())
+        contrast_mat, contrast_names = make_all_contrasts(
+            group_names, n_total_cols=len(all_cols))
+        n_subj_terms = len(all_cols) - len(group_names)
+        print(f"\n[MODEL] PAIRED design (~0 + condition + subject): "
+              f"{n_subj} subjects, {n_subj_terms} subject terms absorbed.")
+    else:
+        design_mat, group_names = make_design_matrix(conditions.tolist())
+        contrast_mat, contrast_names = make_all_contrasts(group_names)
+
+    print(f"[MODEL] {len(contrast_names)} contrasts generated: "
+          f"{contrast_names[:5]}{'...' if len(contrast_names)>5 else ''}")
 
     # --- Modèle de référence (limma eBayes) ---
     fdr_global = params.get("fdr_global", False)
@@ -2172,7 +2239,23 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
                "Variance moderated by information borrowing across proteins — "
                "essential for small sample sizes (n=3). "
                "DEqMS not available (no pr_matrix peptide count)")
-    put_kv("Design matrix", "~0 + condition", "One-hot encoding of conditions")
+    _has_subj = any(c in design.columns for c in
+                    ("subject", "pair", "patient", "individual"))
+    _paired = False
+    if _has_subj:
+        _sc = next(c for c in ("subject", "pair", "patient", "individual")
+                   if c in design.columns)
+        _pp = design.groupby(_sc)["condition"].nunique()
+        _paired = (_pp >= 2).any() and design[_sc].nunique() >= 2 \
+                  and design[_sc].nunique() < len(design)
+    if _paired:
+        put_kv("Design matrix", "~0 + condition + subject",
+               "Paired design: subject added as fixed effect to absorb "
+               "inter-individual baseline (generalized paired t-test). "
+               "Contrasts are on conditions only.")
+    else:
+        put_kv("Design matrix", "~0 + condition",
+               "One-hot encoding of conditions")
     put_kv("Contrasts", "All pairs", "makeContrasts equivalent")
     put_kv("Multiple correction", "Benjamini-Hochberg",
            "Global FDR (all comparisons, one test family)"
@@ -3167,7 +3250,8 @@ def main():
 
     # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None
     _go_org   = params.get("go_organism")
-    go_params = {"organism": _go_org} if (_GO_AVAILABLE and _go_org) else None
+    go_params = ({"organism": _go_org, "run_gsea": params.get("run_gsea", False)}
+                 if (_GO_AVAILABLE and _go_org) else None)
 
     _makedirs(out_dir)
 
@@ -3347,6 +3431,19 @@ def main():
                 export_go_cluster_sheets(
                     wb, go_cluster_results, _write_df, _ins_img)
                 print(f"  [OK] {len(go_cluster_results)} GO cluster sheet(s) added.")
+
+        # GSEA rank-based (optionnel, complément de l'ORA)
+        if go_params.get("run_gsea"):
+            try:
+                from gsea_enrichment import run_gsea, export_gsea_sheets
+                gsea_results = run_gsea(
+                    df_results, contrast_names, params, go_params, out_dir)
+                if gsea_results:
+                    export_gsea_sheets(wb, gsea_results, _ins_img)
+                    print(f"  [OK] {len(gsea_results)} GSEA sheet(s) added.")
+            except Exception as e:
+                print(f"  [WARN] GSEA step skipped ({type(e).__name__}) — "
+                      f"pipeline not affected.")
 
     wb.save(output_name)
 

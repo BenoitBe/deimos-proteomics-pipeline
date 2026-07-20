@@ -44,6 +44,7 @@ _DEFAULTS = {
     "impute_method":       "qrilc",
     # Modules optionnels
     "go_organism":         None,    # None = désactivé
+    "run_gsea":            False,    # GSEA rank-based (optionnel, complément ORA)
     "make_wgcna":          False,
     "make_dashboard":      True,
     "use_deqms":           False,
@@ -342,6 +343,8 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
             params["make_dashboard"] = dash_available
         if "go_organism" not in params:
             params["go_organism"] = None
+        if "run_gsea" not in params:
+            params["run_gsea"] = False
 
         print_config_summary(params)
         return params
@@ -369,10 +372,14 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
 
     # GO
     go_organism = None
+    run_gsea = False
     if go_available:
         go_result = ask_go_params_fn()
-        go_organism = go_result.get("organism") if go_result else None
+        if go_result:
+            go_organism = go_result.get("organism")
+            run_gsea = bool(go_result.get("run_gsea", False))
     params["go_organism"] = go_organism
+    params["run_gsea"] = run_gsea
 
     # WGCNA
     rep = input("\n  Run the WGCNA co-expression analysis? "

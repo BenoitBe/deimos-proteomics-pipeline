@@ -123,7 +123,20 @@ def ask_go_params() -> dict | None:
         print("  [WARN] No species provided — step skipped.\n")
         return None
 
-    return {"organism": organism}
+    params = {"organism": organism, "run_gsea": False}
+
+    # GSEA rank-based (optionnel, complément de l'ORA)
+    print("\n  --- GSEA (rank-based, optional) ---")
+    print("  Complements ORA: ranks ALL proteins by -log10(p) x sign(LFC) and")
+    print("  detects coordinated pathway shifts (even below the DEP threshold).")
+    print("  [!] Requires 'gseapy' installed and internet access to Enrichr.")
+    print("  [!] Gene sets are human-centric (Enrichr): most informative for")
+    print("      human/mouse data mapped by gene symbol.")
+    rep_gsea = input("  Also run GSEA? (y/N) -> ").strip().lower()
+    if rep_gsea in ("o", "oui", "y", "yes"):
+        params["run_gsea"] = True
+
+    return params
 
 
 # ==============================================================================
