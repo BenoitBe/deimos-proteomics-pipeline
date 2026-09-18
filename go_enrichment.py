@@ -143,6 +143,186 @@ def ask_go_params() -> dict | None:
 # 1. APPEL gProfiler (gost)
 # ==============================================================================
 
+def _benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
+    """BH standard, implémentation locale (cohérente avec le reste de
+    l'écosystème Deimos qui réimplémente ses propres statistiques plutôt
+    que d'ajouter une dépendance pour une fonction de quelques lignes)."""
+    n = len(pvals)
+    order = np.argsort(pvals)
+    ranked = pvals[order] * n / (np.arange(n) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    adj = np.empty(n)
+    adj[order] = np.clip(ranked, 0, 1)
+    return adj
+
+
+def run_local_ora(query: list[str], background: list[str],
+                  annotation_long: pd.DataFrame,
+                  min_term_size: int = 3, source_label: str = "GO:PERSEVERANCE"
+                  ) -> pd.DataFrame | None:
+    """
+    Remplace run_gost() par un test d'enrichissement local (hypergéométrique
+    + BH), SANS appel réseau, à partir d'une annotation fournie par
+    l'utilisateur — typiquement le transfert par orthologie de Perseverance pour
+    un organisme non-modèle mal couvert par gProfiler.
+
+    Le "background" (univers statistique) est ici l'ensemble des protéines
+    RÉELLEMENT QUANTIFIÉES dans l'expérience Deimos en cours (toutes les
+    lignes de la matrice, pas le protéome entier de l'espèce) — c'est le
+    choix standard et recommandé pour l'ORA en protéomique (contrairement
+    au génome entier utilisé par défaut par la plupart des outils GO), car
+    seules les protéines quantifiables pouvaient de toute façon apparaître
+    comme significatives.
+
+    Parameters
+    ----------
+    query           : IDs des protéines significatives (sortie de
+                      isolate_significant)
+    background      : IDs de TOUTES les protéines quantifiées (univers)
+    annotation_long : DataFrame avec au moins les colonnes 'protein_id' et
+                      'GO' (GO en liste ';'-séparée OU déjà explosée, une
+                      ligne par (protéine, terme))
+    min_term_size   : taille minimum d'un terme dans le background pour
+                      être testé (évite les termes anecdotiques)
+    source_label    : valeur de la colonne 'source' en sortie (permet de
+                      distinguer visuellement des sources gProfiler dans
+                      les mêmes graphiques/exports)
+
+    Returns
+    -------
+    DataFrame au même format que run_gost() (colonnes natives gProfiler),
+    prêt à passer directement à process_enrichment(), ou None si rien de
+    testable/significatif.
+    """
+    from scipy.stats import hypergeom
+
+    df = annotation_long[["protein_id", "GO"]].dropna(subset=["GO"]).copy()
+    df["GO"] = df["GO"].astype(str)
+    if df["GO"].str.contains(";").any():
+        df = df.assign(GO=df["GO"].str.split(";")).explode("GO")
+    df["GO"] = df["GO"].str.strip()
+    df = df[df["GO"] != ""]
+
+    background_set = set(background)
+    df = df[df["protein_id"].isin(background_set)]
+    if df.empty:
+        print("    [WARN] Aucune protéine du background n'a d'annotation "
+              "GO fournie (Perseverance) — ORA local impossible.")
+        return None
+
+    annotated_background = set(df["protein_id"].unique())
+    N = len(annotated_background)
+    query_annotated = [p for p in query if p in annotated_background]
+    n = len(query_annotated)
+    if n == 0:
+        print("    [INFO] Aucune protéine significative n'a d'annotation "
+              "GO transférée — pas de test possible pour ce contraste.")
+        return None
+    query_set = set(query_annotated)
+
+    rows = []
+    for go_id, members in df.groupby("GO")["protein_id"].apply(set).items():
+        K = len(members)
+        if K < min_term_size:
+            continue
+        inter = members & query_set
+        k = len(inter)
+        if k == 0:
+            continue
+        pval = hypergeom.sf(k - 1, N, K, n)
+        rows.append({
+            "native": go_id, "name": go_id, "p_value": pval,
+            "term_size": K, "query_size": n, "intersection_size": k,
+            "source": source_label, "intersections": sorted(inter),
+        })
+
+    if not rows:
+        return None
+
+    res = pd.DataFrame(rows)
+    res["p_value"] = _benjamini_hochberg(res["p_value"].values)
+    res = res[res["p_value"] < 0.05].sort_values("p_value").reset_index(drop=True)
+    return res if not res.empty else None
+
+
+def diagnose_gprofiler_coverage(protein_ids: list, organism: str,
+                                sample_size: int = 200, min_coverage: float = 0.30
+                                ) -> dict:
+    """
+    Diagnostic de couverture gProfiler AVANT de lancer un enrichissement GO
+    complet — utilise g:Convert (gp.convert), pas gost(), pour mesurer le
+    taux de reconnaissance des accessions sans dépendre des résultats
+    différentiels. Peut tourner tôt dans le pipeline, sur la liste brute des
+    Protein.Group du run.
+
+    Sert à objectiver la décision "gProfiler direct" vs "passer par une
+    espèce de référence via Perseverance" — même philosophie que
+    diagnose_deqms_reliability()/diagnose_batch_effect() : informer, pas
+    décider silencieusement à la place de l'utilisateur.
+
+    Parameters
+    ----------
+    protein_ids  : IDs bruts du run (groupes composites "A;B" nettoyés en
+                   1er accession automatiquement)
+    organism     : code organisme gProfiler à tester (ex: 'bnapus')
+    sample_size  : g:Convert accepte de grandes listes, mais un échantillon
+                   suffit pour un diagnostic rapide et limite la charge
+                   réseau sur un run répété plusieurs fois en dev/debug
+    min_coverage : taux de reconnaissance minimum jugé exploitable
+
+    Returns
+    -------
+    dict : available (bool, False si package/réseau indisponible),
+           organism_valid (bool), coverage (float ou None), reliable (bool),
+           recommendation (str)
+    """
+    try:
+        from gprofiler import GProfiler
+    except ImportError:
+        return {"available": False, "organism_valid": None, "coverage": None,
+                "reliable": None,
+                "recommendation": "gprofiler-official non installé — diagnostic impossible."}
+
+    ids_clean = list(dict.fromkeys(str(p).split(";")[0].strip() for p in protein_ids))
+    if len(ids_clean) > sample_size:
+        rng = np.random.RandomState(0)
+        sample = list(rng.choice(ids_clean, sample_size, replace=False))
+    else:
+        sample = ids_clean
+
+    try:
+        gp = GProfiler(return_dataframe=True)
+        res = gp.convert(organism=organism, query=sample, target_namespace="ENSG")
+    except Exception as e:
+        return {"available": False, "organism_valid": False, "coverage": None,
+                "reliable": False,
+                "recommendation": (f"Échec gProfiler pour l'organisme '{organism}' "
+                                   f"({type(e).__name__}) — organisme probablement "
+                                   f"invalide ou inconnu de gProfiler. Perseverance "
+                                   f"(orthologie vers une espèce de référence) recommandé.")}
+
+    if res is None or len(res) == 0:
+        return {"available": False, "organism_valid": True, "coverage": None,
+                "reliable": False,
+                "recommendation": "Réponse vide de g:Convert — diagnostic non concluant."}
+
+    n_total = len(res)
+    unmapped = res["converted"].isna() | res["converted"].astype(str).isin(["None", "N/A", "nan"])
+    n_converted = int((~unmapped).sum())
+    coverage = n_converted / n_total if n_total else 0.0
+    reliable = coverage >= min_coverage
+
+    reco = (f"{coverage:.0%} des accessions reconnues par gProfiler pour "
+           f"'{organism}' (échantillon n={n_total}). ")
+    reco += ("Couverture suffisante pour un enrichissement direct." if reliable
+            else "Couverture trop faible — Perseverance (orthologie vers une "
+                 "espèce mieux annotée) recommandé.")
+
+    return {"available": True, "organism_valid": True, "n_sampled": n_total,
+           "n_converted": n_converted, "coverage": round(coverage, 3),
+           "reliable": reliable, "recommendation": reco}
+
+
 def run_gost(query: list[str], organism: str) -> pd.DataFrame | None:
     """
     Appelle gProfiler (équivalent de gost() en R).
@@ -641,11 +821,31 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
         return None
 
     try:
-        organism = go_params["organism"]
-        print(f"\n[GO] GO/gProfiler enrichment — species '{organism}'")
+        organism = go_params.get("organism")
+        custom_annotation = go_params.get("custom_annotation")   # DataFrame Perseverance (annotation transferee), ou None
+        ortholog_map = go_params.get("ortholog_map")              # dict protein_id -> ortholog_id (RBH), ou None
+        background = go_params.get("background")
+        if background is None and custom_annotation is not None:
+            id_col = "name" if "name" in df_comparaison.columns else df_comparaison.columns[0]
+            background = (df_comparaison[id_col].astype(str)
+                          .str.split(";").str[0].tolist())
+
+        use_local = custom_annotation is not None
+        use_ortholog = (ortholog_map is not None) and not use_local
+        if use_local:
+            print(f"\n[GO] Enrichissement LOCAL (annotation custom — Perseverance/orthologue), "
+                  f"pas d'appel gProfiler.")
+        elif use_ortholog:
+            print(f"\n[GO] gProfiler via orthologues (Perseverance RBH) — "
+                  f"espèce de référence '{organism}'")
+        else:
+            print(f"\n[GO] GO/gProfiler enrichment — species '{organism}'")
         print(f"   Seuils (volcanos) : "
               f"{'p.adj' if params['volcano_use_padj'] else 'p.val'} < "
               f"{params['volcano_p_thresh']} | ratio ≥ {params['volcano_ratio_min']}")
+
+        reverse_ortholog_map = ({v: k for k, v in ortholog_map.items()}
+                                if use_ortholog else None)
 
         results = {}
         for contrast in contrast_names:
@@ -656,8 +856,34 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                     print(f"  [SKIP] {contrast}: too few proteins ({len(prots)}), skipped.")
                     continue
 
-                print(f"  [GO] {contrast}: {len(prots)} proteins -> gProfiler...")
-                gost_df = run_gost(prots, organism)
+                if use_local:
+                    print(f"  [GO] {contrast}: {len(prots)} proteins -> ORA local (Perseverance)...")
+                    gost_df = run_local_ora(prots, background, custom_annotation)
+                elif use_ortholog:
+                    translated = [ortholog_map[p] for p in prots if p in ortholog_map]
+                    n_dropped = len(prots) - len(translated)
+                    if n_dropped:
+                        print(f"  [GO] {contrast}: {n_dropped}/{len(prots)} protéine(s) "
+                              f"sans orthologue -> exclue(s) de la requête gProfiler.")
+                    if len(translated) <= 5:
+                        print(f"  [SKIP] {contrast}: too few translatable orthologs "
+                              f"({len(translated)}), skipped.")
+                        continue
+                    print(f"  [GO] {contrast}: {len(translated)} orthologue(s) -> "
+                          f"gProfiler ({organism})...")
+                    gost_df = run_gost(translated, organism)
+                    if gost_df is not None and not gost_df.empty and "intersections" in gost_df.columns:
+                        # Retraduit les IDs de l'espece de reference vers les IDs
+                        # d'origine AVANT process_enrichment, sinon son calcul de
+                        # z_score (lookup par ID d'origine) echoue silencieusement
+                        # pour tout le monde (0.0 partout).
+                        gost_df = gost_df.copy()
+                        gost_df["intersections"] = gost_df["intersections"].apply(
+                            lambda inter: [reverse_ortholog_map.get(x, x) for x in inter]
+                            if isinstance(inter, (list, tuple, np.ndarray)) else inter)
+                else:
+                    print(f"  [GO] {contrast}: {len(prots)} proteins -> gProfiler...")
+                    gost_df = run_gost(prots, organism)
                 if gost_df is None or gost_df.empty:
                     print(f"     Aucun enrichissement significatif.")
                     continue
@@ -699,7 +925,13 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                     "lollipop": f_lol, "dotplot": f_dot,
                 }
                 n_bp = (tab["source"] == "GO:BP").sum()
-                print(f"     [OK] {len(tab)} enriched terms ({n_bp} GO:BP).")
+                if use_local:
+                    lbl = "Perseverance/orthologue (ORA local)"
+                elif use_ortholog:
+                    lbl = f"{n_bp} GO:BP, via orthologues {organism}"
+                else:
+                    lbl = f"{n_bp} GO:BP"
+                print(f"     [OK] {len(tab)} enriched terms ({lbl}).")
 
             except Exception as e:
                 import traceback

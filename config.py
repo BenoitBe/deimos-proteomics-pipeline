@@ -44,10 +44,23 @@ _DEFAULTS = {
     "impute_method":       "qrilc",
     # Modules optionnels
     "go_organism":         None,    # None = désactivé
+    "perseverance_annotation_path": None,  # TSV Perseverance (protein_id, GO, KEGG, Pfam) -> ORA local, independant de go_organism
+    "control_condition":   "__auto__",  # "__auto__"=detection par synonymes, str=explicite, False=desactive
+    "control_synonyms":    None,     # None = liste par defaut (ctl, ctrl, control, wt, mock...)
+    "run_perseverance":    "__auto__",  # "__auto__"=demande, True/False=explicite
+    "perseverance_reference_organism": None,  # code gProfiler de l'espece de reference (ex: "athaliana")
+    "perseverance_fasta_a": None,    # chemin FASTA explicite (sinon auto-scan du dossier de tsv_path)
+    "perseverance_fasta_b": None,
+    "perseverance_min_identity": 25.0,
+    "perseverance_min_coverage": 50.0,
     "run_gsea":            False,    # GSEA rank-based (optionnel, complément ORA)
     "make_wgcna":          False,
     "make_dashboard":      True,
     "use_deqms":           False,
+    "deqms_min_r2":        0.10,   # R2 min variance~comptage (sous-ensemble count>1)
+    "deqms_max_pseudocount_pct": 50.0,  # % max de proteines a count<=1 tolere
+    "deqms_force":         False,  # bypass le diagnostic, force DEqMS meme si defavorable
+    "batch_column":        None,   # colonne ExperimentalDesign.csv a controler comme covariable
     # Chemins (peuvent être surchargés)
     "tsv_path":            "report.pg_matrix.tsv",
     "design_path":         "ExperimentalDesign.csv",
@@ -251,6 +264,14 @@ def parse_cli_args() -> argparse.Namespace:
         default=None,
         help="Dossier de sortie (surcharge la config).",
     )
+    parser.add_argument(
+        "--batch-column",
+        metavar="batch",
+        default=None,
+        help=("Nom de colonne dans ExperimentalDesign.csv à contrôler comme "
+              "covariable nuisance dans le design (batch, plaque, ordre "
+              "d'injection catégorisé...). Surcharge la config."),
+    )
     return parser.parse_args()
 
 
@@ -332,6 +353,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.tsv:     params["tsv_path"]    = args.tsv
         if args.design:  params["design_path"] = args.design
         if args.out_dir: params["out_dir"]     = args.out_dir
+        if args.batch_column: params["batch_column"] = args.batch_column
 
         # Les flags optionnels liés à la présence de fichiers/modules
         # peuvent ne pas être dans la config — on les complète
@@ -345,6 +367,8 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
             params["go_organism"] = None
         if "run_gsea" not in params:
             params["run_gsea"] = False
+        if "batch_column" not in params:
+            params["batch_column"] = None
 
         print_config_summary(params)
         return params
@@ -357,6 +381,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.tsv:     reloaded["tsv_path"]    = args.tsv
         if args.design:  reloaded["design_path"] = args.design
         if args.out_dir: reloaded["out_dir"]      = args.out_dir
+        if args.batch_column: reloaded["batch_column"] = args.batch_column
         return reloaded
 
     # ── C. Questions interactives ──────────────────────────────────────────────
@@ -369,6 +394,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
     if args.tsv:     params["tsv_path"]    = args.tsv
     if args.design:  params["design_path"] = args.design
     if args.out_dir: params["out_dir"]     = args.out_dir
+    if args.batch_column: params["batch_column"] = args.batch_column
 
     # GO
     go_organism = None

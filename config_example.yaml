@@ -57,6 +57,12 @@ impute_method:       qrilc
 # Examples: hsapiens, mmusculus, bnapus, athaliana, efa (E. faecalis), rnorvegicus
 # null (or absent) = GO enrichment disabled
 go_organism:         null
+# Annotation par orthologie (Beagle) — organisme non-modele mal couvert par gProfiler.
+# Independant de go_organism : si renseigne, remplace l'appel gProfiler par un test
+# d'enrichissement LOCAL (hypergeometrique+BH, sans reseau) sur cette annotation.
+# Genere par : python beagle.py --query ... --reference ... --out beagle_annot.tsv
+#              puis deimos_to_beagle.remap_annotation_to_protein_groups(...)
+beagle_annotation_path: null       # ex: "beagle_annotation_protein_group.tsv"
 
 # WGCNA — Co-expression module analysis (longest step)
 # Set to false for exploratory analyses
@@ -67,6 +73,19 @@ make_dashboard:      true
 
 # DEqMS — Peptide-count weighting (requires report.pr_matrix.tsv)
 use_deqms:           false
+# Diagnostic automatique avant activation reelle de DEqMS (diagnostic_deqms.png) :
+# desactive DEqMS si la relation variance~comptage n'est pas exploitable sur ce run,
+# meme si use_deqms=true ci-dessus.
+deqms_min_r2:              0.10   # R2 min (log-variance ~ log2-comptage), proteines count>1
+deqms_max_pseudocount_pct: 50.0   # % max de proteines a comptage <=1 tolere
+deqms_force:               false  # true = ignore le diagnostic et force DEqMS
+
+# Correction de batch (optionnelle) — nom de colonne dans ExperimentalDesign.csv
+# a controler comme covariable nuisance dans le design (PAS une correction
+# appliquee a la matrice avant les tests : voir diagnostic_batch_correction.png
+# pour la justification AVANT/APRES et la mise en garde methodologique).
+# Equivalent CLI : --batch-column batch
+batch_column:              null    # ex: "batch", ou "plaque" ; null = desactive
 
 
 # ── Input file paths ──────────────────────────────────────────────────────────

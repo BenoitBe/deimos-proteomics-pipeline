@@ -371,6 +371,70 @@ def top_table(fit_eb: dict, coef_idx: int, protein_names=None) -> pd.DataFrame:
 # ------------------------------------------------------------------------------
 # 5. make_contrasts — génère la matrice de contrastes (toutes paires)
 # ------------------------------------------------------------------------------
+DEFAULT_CONTROL_SYNONYMS = [
+    "ctl", "ctrl", "control", "wt", "mock", "vehicle", "veh",
+    "untreated", "naive", "temoin", "témoin", "dmso",
+]
+
+
+def detect_control_condition(group_names: list, synonyms: "list | None" = None,
+                             explicit: "str | None" = None) -> "str | None":
+    """
+    Détecte automatiquement une condition de type "contrôle" par correspondance
+    EXACTE (insensible à la casse) contre une liste de synonymes courants — pas
+    de correspondance partielle/substring, pour éviter un faux positif du type
+    "CS8" match "ctl" sur un préfixe accidentel.
+
+    Parameters
+    ----------
+    explicit  : nom exact d'une condition à forcer comme contrôle (prioritaire
+                sur la détection automatique) — utile quand le nom réel ne
+                matche aucun synonyme standard (ex: "CS8" dans un design où
+                cette condition EST le contrôle mais nommée autrement).
+    synonyms  : liste de synonymes à tester, défaut DEFAULT_CONTROL_SYNONYMS.
+
+    Returns
+    -------
+    Le nom du groupe contrôle détecté (str), ou None si :
+      - aucune correspondance trouvée
+      - plusieurs conditions matchent (ambigu : on ne devine pas, on
+        prévient l'appelant de trancher explicitement via `explicit`)
+    """
+    if explicit:
+        if explicit in group_names:
+            return explicit
+        print(f"  [WARN] control_condition='{explicit}' introuvable parmi "
+              f"les conditions {group_names} — ignoré.")
+        return None
+
+    syn = set(s.lower() for s in (synonyms or DEFAULT_CONTROL_SYNONYMS))
+    matches = [g for g in group_names if g.lower() in syn]
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"  [WARN] Plusieurs conditions ressemblent à un contrôle "
+              f"{matches} — ambigu, aucune n'est choisie automatiquement. "
+              f"Préciser control_condition dans la config pour trancher.")
+    return None
+
+
+def reorder_control_last(group_names: list, control_name: str) -> list:
+    """
+    Replace control_name en DERNIÈRE position de group_names.
+
+    Dans make_all_contrasts (i<j -> nom "{g1}_vs_{g2}", g1=numérateur), une
+    condition à l'index le plus haut est TOUJOURS dénominateur (g2) dans
+    chacun de ses contrastes -> c'est la position en dernier qui garantit
+    "exp_vs_ctl" plutôt que "ctl_vs_exp" pour toutes les paires impliquant
+    le contrôle, pas la première position.
+    """
+    if control_name not in group_names:
+        return group_names
+    reordered = [g for g in group_names if g != control_name] + [control_name]
+    return reordered
+
+
 def make_all_contrasts(group_names: list, n_total_cols: "int | None" = None
                        ) -> tuple[np.ndarray, list[str]]:
     """
@@ -410,9 +474,19 @@ def make_all_contrasts(group_names: list, n_total_cols: "int | None" = None
 # ------------------------------------------------------------------------------
 # 6. make_design_matrix — matrice design ~0 + condition
 # ------------------------------------------------------------------------------
-def make_design_matrix(conditions: list) -> tuple[np.ndarray, list[str]]:
+def make_design_matrix(conditions: list,
+                       control_condition: "str | None" = None
+                       ) -> tuple[np.ndarray, list[str]]:
     """
     Crée la design matrix indicator ~0 + condition (one-hot encoding).
+
+    Parameters
+    ----------
+    control_condition : si fourni (déjà résolu par detect_control_condition),
+                        placé en DERNIÈRE position de group_names — garantit
+                        que ce groupe est systématiquement le dénominateur
+                        ("exp_vs_ctl") dans tous les contrastes générés par
+                        make_all_contrasts (cf. reorder_control_last).
 
     Returns
     -------
@@ -424,13 +498,18 @@ def make_design_matrix(conditions: list) -> tuple[np.ndarray, list[str]]:
     clean = [re.sub(r"[^A-Za-z0-9_]", ".", c) for c in conditions]
     clean = ["X" + c if c[0].isdigit() else c for c in clean]
 
-    group_names = sorted(set(clean), key=lambda x: clean.index(x))
     # Ordre stable = ordre d'apparition
     seen = []
     for c in clean:
         if c not in seen:
             seen.append(c)
     group_names = seen
+
+    if control_condition is not None:
+        clean_control = re.sub(r"[^A-Za-z0-9_]", ".", control_condition)
+        if clean_control[0].isdigit():
+            clean_control = "X" + clean_control
+        group_names = reorder_control_last(group_names, clean_control)
 
     n_samples = len(clean)
     n_groups = len(group_names)
@@ -442,7 +521,8 @@ def make_design_matrix(conditions: list) -> tuple[np.ndarray, list[str]]:
     return design, group_names
 
 
-def make_paired_design_matrix(conditions: list, subjects: list
+def make_paired_design_matrix(conditions: list, subjects: list,
+                              control_condition: "str | None" = None
                               ) -> tuple[np.ndarray, list[str], list[str]]:
     """
     Design matrix pour un plan APPARIÉ : ~0 + condition + subject.
@@ -456,6 +536,11 @@ def make_paired_design_matrix(conditions: list, subjects: list
     des sujets en retirant le premier sujet (référence) pour éviter la
     colinéarité avec l'intercept implicite des conditions. Les contrastes ne
     portent QUE sur les colonnes de condition (le sujet est un nuisance factor).
+
+    Parameters
+    ----------
+    control_condition : cf. make_design_matrix — placé en dernière position
+                        de group_names (dénominateur systématique).
 
     Returns
     -------
@@ -471,6 +556,12 @@ def make_paired_design_matrix(conditions: list, subjects: list
     for c in clean_c:
         if c not in group_names:
             group_names.append(c)
+
+    if control_condition is not None:
+        clean_control = re.sub(r"[^A-Za-z0-9_]", ".", control_condition)
+        if clean_control[0].isdigit():
+            clean_control = "X" + clean_control
+        group_names = reorder_control_last(group_names, clean_control)
 
     # --- Colonnes de sujet (one-hot, 1er sujet = référence, retiré) ---
     clean_s = [re.sub(r"[^A-Za-z0-9_]", ".", str(s)) for s in subjects]
@@ -494,6 +585,60 @@ def make_paired_design_matrix(conditions: list, subjects: list
 
     all_col_names = group_names + [f"subject_{s}" for s in subj_cols]
     return design, group_names, all_col_names
+
+
+def add_covariate_columns(design: np.ndarray, all_col_names: list,
+                          values: list, prefix: str
+                          ) -> tuple[np.ndarray, list]:
+    """
+    Ajoute une covariable catégorielle nuisance (batch, plaque, ordre
+    d'injection catégorisé, etc.) à une design matrix EXISTANTE — même
+    principe que le terme 'subject' de make_paired_design_matrix : one-hot
+    avec le premier niveau retiré (référence absorbée dans l'intercept
+    implicite des conditions) pour préserver le rang plein de la matrice.
+
+    Compose avec un design standard OU apparié : appeler APRÈS
+    make_design_matrix / make_paired_design_matrix, puis repasser
+    len(all_col_names_étendu) à make_all_contrasts(..., n_total_cols=...)
+    pour que les contrastes ne portent que sur les conditions.
+
+    Parameters
+    ----------
+    design        : design matrix existante (n_samples × n_cols)
+    all_col_names : noms de TOUTES les colonnes existantes de `design`
+    values        : valeurs de la covariable, une par échantillon (même
+                    ordre que les lignes de `design`)
+    prefix        : préfixe des nouveaux noms de colonnes (ex. "batch")
+
+    Returns
+    -------
+    design_étendue, all_col_names_étendus
+    """
+    import re
+    clean = [re.sub(r"[^A-Za-z0-9_]", ".", str(v)) for v in values]
+    clean = ["X" + c if c[0].isdigit() else c for c in clean]
+
+    levels = []
+    for c in clean:
+        if c not in levels:
+            levels.append(c)
+
+    if len(levels) < 2:
+        print(f"  [WARN] Covariate '{prefix}' has a single level — ignored "
+              "(nothing to control for).")
+        return design, all_col_names
+
+    ref = levels[0]                          # référence (absorbée)
+    extra_levels = [l for l in levels if l != ref]
+    n_samples = design.shape[0]
+    extra = np.zeros((n_samples, len(extra_levels)))
+    for i, c in enumerate(clean):
+        if c != ref:
+            extra[i, extra_levels.index(c)] = 1.0
+
+    design_ext = np.hstack([design, extra])
+    names_ext = list(all_col_names) + [f"{prefix}_{l}" for l in extra_levels]
+    return design_ext, names_ext
 
 
 # ------------------------------------------------------------------------------

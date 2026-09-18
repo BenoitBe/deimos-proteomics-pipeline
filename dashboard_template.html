@@ -2,6 +2,17 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
+<script>
+// Appliqué AVANT le rendu du <body> pour éviter un flash du mauvais thème
+// (FOUC) au rechargement — priorité : choix mémorisé > préférence système > sombre par défaut.
+(function(){
+  try{
+    var saved=localStorage.getItem('deimos-theme');
+    var theme=saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', theme);
+  }catch(e){document.documentElement.setAttribute('data-theme','dark');}
+})();
+</script>
 <title>Proteogen — Proteomics Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -13,6 +24,18 @@
   --up:#3fb950;--dn:#f85149;--bl:#388bfd;--am:#d29922;--pu:#bc8cff;--ac:#1f6feb;
   --cl1:#f0e68c;--cl2:#87ceeb;--cl3:#dda0dd;
 }
+html[data-theme="light"]{
+  --bg:#ffffff;--bg2:#f6f8fa;--bg3:#eaeef2;--bg4:#dde3e9;
+  --bd:rgba(31,35,40,.12);--bd2:rgba(31,35,40,.22);
+  --tx:#1f2328;--tx2:#57606a;--tx3:#6e7781;
+  --up:#1a7f37;--dn:#cf222e;--bl:#0969da;--am:#9a6700;--pu:#8250df;--ac:#0969da;
+  --cl1:#b08900;--cl2:#0969da;--cl3:#8250df;
+}
+html,body{transition:background-color .2s ease,color .2s ease;}
+.theme-toggle{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;
+  border-radius:8px;border:1px solid var(--bd2);background:var(--bg3);color:var(--tx2);
+  cursor:pointer;margin-left:auto;transition:all .15s;font-size:16px;}
+.theme-toggle:hover{border-color:var(--ac);color:var(--tx);}
 *{margin:0;padding:0;box-sizing:border-box;}
 body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.5;}
 nav{background:var(--bg2);border-bottom:1px solid var(--bd);padding:0 20px;display:flex;align-items:center;gap:2px;height:60px;position:sticky;top:0;z-index:200;}
@@ -66,7 +89,7 @@ input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
 .cbtn:hover{border-color:var(--ac);color:var(--tx);}
 .cbtn.active{background:var(--ac);border-color:var(--ac);color:#fff;}
 .hm-legend{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--tx2);margin-bottom:8px;flex-wrap:wrap;}
-.hm-grad{width:90px;height:7px;border-radius:3px;background:linear-gradient(to right,#388bfd,#21262d,#f85149);}
+.hm-grad{width:90px;height:7px;border-radius:3px;background:linear-gradient(to right,var(--bl),var(--bg3),var(--dn));}
 .hm-cl{display:inline-flex;align-items:center;gap:4px;margin-left:6px;}
 .hm-dot{width:8px;height:8px;border-radius:2px;}
 .pt{width:100%;border-collapse:collapse;font-size:12px;}
@@ -104,6 +127,7 @@ input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
   <a onclick="showPage('proteins')">DEP Table</a>
   <a onclick="showPage('qcpage')">QC / PCA</a>
   <a onclick="showPage('wgcna')">WGCNA</a>
+  <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="Basculer clair / sombre">🌙</button>
 </nav>
 
 <!-- OVERVIEW -->
@@ -252,8 +276,8 @@ input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
     <input type="text" id="hmSearch" placeholder="Gene…" style="margin-left:auto;width:140px;">
   </div>
   <div class="hm-legend">
-    <span>Z-score :</span><span style="color:#388bfd;">−2</span>
-    <div class="hm-grad"></div><span style="color:#f85149;">+2</span>
+    <span>Z-score :</span><span style="color:var(--bl);">−2</span>
+    <div class="hm-grad"></div><span style="color:var(--dn);">+2</span>
     <span id="hmClusterLegend"></span>
     <span style="margin-left:8px;font-size:10px;color:var(--tx3);" id="hmInfo"></span>
     <button class="exp-btn" onclick="exportCanvas('hmCanvas','proteogen_heatmap')" style="padding:3px 9px;font-size:10px;margin-left:8px;">⬇ PNG</button>
@@ -399,6 +423,22 @@ input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
 __DATA_INJECTION__
 </script>
 <script>
+/* ── THEME (clair/sombre) — DOIT rester tout en haut du script : tout le
+   reste (polyfill, Chart.defaults, fonctions draw*) suppose THEME déjà
+   initialisé. ── */
+function cssVar(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim();}
+let THEME={};
+function refreshThemeVars(){
+  THEME={
+    bg:cssVar('--bg'),bg2:cssVar('--bg2'),bg3:cssVar('--bg3'),bg4:cssVar('--bg4'),
+    tx:cssVar('--tx'),tx2:cssVar('--tx2'),tx3:cssVar('--tx3'),
+    bd:cssVar('--bd'),bd2:cssVar('--bd2'),ac:cssVar('--ac'),
+    up:cssVar('--up'),dn:cssVar('--dn'),bl:cssVar('--bl'),am:cssVar('--am'),pu:cssVar('--pu'),
+    cl1:cssVar('--cl1'),cl2:cssVar('--cl2'),cl3:cssVar('--cl3'),
+  };
+}
+refreshThemeVars();
+
 /* ── POLYFILL ── */
 if(!CanvasRenderingContext2D.prototype.roundRect){
   CanvasRenderingContext2D.prototype.roundRect=function(x,y,w,h,r){
@@ -409,9 +449,76 @@ if(!CanvasRenderingContext2D.prototype.roundRect){
     this.lineTo(x,y+r);this.arcTo(x,y,x+r,y,r);this.closePath();return this;
   };
 }
-Chart.defaults.color='#8b949e';
-Chart.defaults.borderColor='rgba(240,246,252,.06)';
+Chart.defaults.color=THEME.tx2;
+Chart.defaults.borderColor=THEME.bd;
 Chart.defaults.font.size=11;
+
+function _safeCall(fn){try{fn();}catch(e){/* page/canvas pas active, ignore */}}
+
+function refreshAllForTheme(){
+  refreshThemeVars();
+  // Chart.js : re-applique les couleurs de grille/texte sur toutes les
+  // instances existantes plutot que de les recreer.
+  Chart.defaults.color=THEME.tx2;
+  Object.values(Chart.instances||{}).forEach(ch=>{
+    try{
+      if(ch.options.plugins && ch.options.plugins.legend && ch.options.plugins.legend.labels)
+        ch.options.plugins.legend.labels.color=THEME.tx2;
+      if(ch.options.scales){
+        Object.values(ch.options.scales).forEach(sc=>{
+          if(sc.ticks) sc.ticks.color=THEME.tx2;
+          if(sc.grid) sc.grid.color=THEME.bd;
+        });
+      }
+      ch.update();
+    }catch(e){}
+  });
+  // Canvas dessinés à la main : re-invoqués (ils relisent THEME à chaque appel).
+  // Enveloppés individuellement : une page/canvas absent(e) du DOM ne doit
+  // pas bloquer le redraw des autres.
+  [drawVolcano, drawHeatmap, drawPCA, drawScatter, typeof drawGOHeatmap!=='undefined'?drawGOHeatmap:null,
+   typeof drawModuleTrait!=='undefined'?drawModuleTrait:null,
+   typeof drawRankedAbundance!=='undefined'?drawRankedAbundance:null,
+   typeof drawCVPlot!=='undefined'?drawCVPlot:null,
+   typeof drawViolinPlot!=='undefined'?drawViolinPlot:null,
+   typeof drawMissingValues!=='undefined'?drawMissingValues:null,
+   typeof drawMAPlot!=='undefined'?drawMAPlot:null,
+   typeof drawRepScatter!=='undefined'?drawRepScatter:null,
+   typeof drawUMAP!=='undefined'?drawUMAP:null,
+   typeof drawWGCNANetwork!=='undefined'?drawWGCNANetwork:null,
+   typeof drawGOBubble!=='undefined'?drawGOBubble:null,
+  ].forEach(fn=>{ if(fn) _safeCall(fn); });
+
+  // Tables HTML générées par JS : le HTML (couleurs incluses) est figé au
+  // moment du rendu ('color:'+THEME.tx+'...' produit une chaîne statique,
+  // pas une référence CSS vivante) — sans ce ré-appel, elles gardent les
+  // couleurs de l'ANCIEN thème après bascule (trouvé en testant sur un run
+  // réel avec WGCNA actif : la table restait en couleurs du thème précédent
+  // malgré la bascule).
+  [typeof renderAbout!=='undefined'?renderAbout:null,
+   typeof renderGO!=='undefined'?renderGO:null,
+   typeof renderGOTable!=='undefined'?renderGOTable:null,
+   typeof renderIntersect!=='undefined'?renderIntersect:null,
+   typeof renderProtTable!=='undefined'?renderProtTable:null,
+   typeof renderQCReport!=='undefined'?renderQCReport:null,
+   typeof renderWGCNATable!=='undefined'?renderWGCNATable:null,
+  ].forEach(fn=>{ if(fn) _safeCall(fn); });
+}
+
+function toggleTheme(){
+  const html=document.documentElement;
+  const next=html.getAttribute('data-theme')==='light' ? 'dark' : 'light';
+  html.setAttribute('data-theme', next);
+  try{localStorage.setItem('deimos-theme', next);}catch(e){}
+  document.getElementById('themeToggleBtn').textContent = next==='light' ? '☀️' : '🌙';
+  refreshAllForTheme();
+}
+// Icone initiale cohérente avec le thème déjà appliqué par le script du <head>
+document.addEventListener('DOMContentLoaded',()=>{
+  const cur=document.documentElement.getAttribute('data-theme')||'dark';
+  const btn=document.getElementById('themeToggleBtn');
+  if(btn) btn.textContent = cur==='light' ? '☀️' : '🌙';
+});
 
 /* ── Robust numeric helpers (avoid Math.min(...bigArray) which freezes) ── */
 function _minOf(arr){var m=Infinity;for(var i=0;i<arr.length;i++){if(arr[i]<m)m=arr[i];}return m;}
@@ -474,8 +581,8 @@ function initOverview(){
       {label:'Up',data:CONTRASTS.map(c=>STATS.contrasts_summary[c].up),backgroundColor:'rgba(63,185,80,.65)',borderRadius:3},
       {label:'Down',data:CONTRASTS.map(c=>-STATS.contrasts_summary[c].down),backgroundColor:'rgba(248,81,73,.65)',borderRadius:3}
     ]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b949e'}}},
-      scales:{x:{ticks:{color:'#8b949e',maxRotation:30}},y:{ticks:{color:'#8b949e'}}}}
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:THEME.tx2}}},
+      scales:{x:{ticks:{color:THEME.tx2,maxRotation:30}},y:{ticks:{color:THEME.tx2}}}}
   });
 
   const clKeys=Object.keys(STATS.clusters);
@@ -485,7 +592,7 @@ function initOverview(){
       datasets:[{data:clKeys.map(k=>STATS.clusters[k]),
         backgroundColor:['rgba(240,232,140,.45)','rgba(135,206,235,.45)','rgba(221,160,221,.45)'],
         borderColor:['#f0e68c','#87ceeb','#dda0dd'],borderWidth:1.5}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b949e'}}}}
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:THEME.tx2}}}}
   });
 
   new Chart(document.getElementById('piChart'),{
@@ -496,14 +603,14 @@ function initOverview(){
     options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
       plugins:{legend:{display:false},
         tooltip:{callbacks:{label:ctx=>' Pi = '+ctx.raw.toFixed(2),afterLabel:ctx=>{const d=TOP20_PI[ctx.dataIndex].desc;return d?'  '+d:'';} }}},
-      scales:{x:{ticks:{color:'#8b949e'}},y:{ticks:{color:'#8b949e',font:{size:10}}}}}
+      scales:{x:{ticks:{color:THEME.tx2}},y:{ticks:{color:THEME.tx2,font:{size:10}}}}}
   });
 
   document.getElementById('piDescList').innerHTML=TOP20_PI.map((p,i)=>`
     <div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;border-bottom:1px solid var(--bd);">
       <span style="font-size:10px;color:var(--tx3);min-width:16px;text-align:right;">${i+1}</span>
       <div style="flex:1;min-width:0;">
-        <div style="font-size:12px;font-weight:600;color:#c9d1d9;">${p.gene||p.name}</div>
+        <div style="font-size:12px;font-weight:600;color:'+THEME.tx+';">${p.gene||p.name}</div>
         <div style="font-size:10px;color:var(--tx2);line-height:1.4;" title="${p.desc}">${p.desc||'—'}</div>
       </div>
       <span style="font-size:11px;font-weight:700;color:var(--bl);flex-shrink:0;">${p.pi.toFixed(1)}</span>
@@ -522,7 +629,7 @@ function initOverview(){
       datasets:[{label:'Nb contrastes',data:topGO.map(e=>e[1]),backgroundColor:'rgba(188,140,255,.6)',borderRadius:2}]},
     options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
       plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:'#8b949e',stepSize:1,precision:0},beginAtZero:true},y:{ticks:{color:'#8b949e',font:{size:10}}}}}
+      scales:{x:{ticks:{color:THEME.tx2,stepSize:1,precision:0},beginAtZero:true},y:{ticks:{color:THEME.tx2,font:{size:10}}}}}
   });
 }
 
@@ -597,27 +704,28 @@ function drawVolcano(){
   const ymax=Math.max(_maxOf(yv),ythresh+1)+0.5;
   const sx=v=>(v-xmin)/(xmax-xmin)*pw+pad.l;
   const sy=v=>ph-(v/ymax)*ph+pad.t;
-  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
-  ctx.strokeStyle='rgba(240,246,252,.05)';ctx.lineWidth=.5;
+  ctx.fillStyle=THEME.bg2;ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle=THEME.bd;ctx.lineWidth=.5;
   for(let i=0;i<=5;i++){const y=pad.t+i*ph/5;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();}
-  ctx.strokeStyle='rgba(240,246,252,.22)';ctx.lineWidth=.8;ctx.setLineDash([4,4]);
+  ctx.strokeStyle=THEME.bd2;ctx.lineWidth=.8;ctx.setLineDash([4,4]);
   [fc,-fc].forEach(v=>{ctx.beginPath();ctx.moveTo(sx(v),pad.t);ctx.lineTo(sx(v),pad.t+ph);ctx.stroke();});
   ctx.beginPath();ctx.moveTo(pad.l,sy(ythresh));ctx.lineTo(pad.l+pw,sy(ythresh));ctx.stroke();
   ctx.setLineDash([]);
   let su=0,sd=0;
+  const outlineCol=document.documentElement.getAttribute('data-theme')==='light' ? 'rgba(31,35,40,.6)' : 'rgba(255,255,255,.6)';
   pts.forEach(p=>{
     const x=sx(p.d),y=sy(p.lp);
     const sig=isSig(p,fc,ptype,thresh);
     const isU=sig&&p.d>fc,isD=sig&&p.d<-fc;
     const hit=search&&((p.Genes||'').toLowerCase().includes(search)||(p.name||'').toLowerCase().includes(search));
-    let col='#2d333b',r=2.2;
+    let col=THEME.bg4,r=2.2;
     if(isU){col='rgba(63,185,80,.75)';su++;}
     if(isD){col='rgba(248,81,73,.75)';sd++;}
-    if(hit){col='#ffd700';r=6;ctx.strokeStyle='rgba(255,255,255,.6)';ctx.lineWidth=.8;}
+    if(hit){col='#ffd700';r=6;ctx.strokeStyle=outlineCol;ctx.lineWidth=.8;}
     ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();
     if(hit)ctx.stroke();
   });
-  ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillStyle=THEME.tx2;ctx.font='11px sans-serif';ctx.textAlign='center';
   ctx.fillText(invertActive?'log₂ Fold Change (inverted)':'log₂ Fold Change',pad.l+pw/2,H-8);
   ctx.save();ctx.translate(14,pad.t+ph/2);ctx.rotate(-Math.PI/2);ctx.fillText('−log₁₀(p-value)',0,0);ctx.restore();
   ctx.font='10px sans-serif';
@@ -628,9 +736,9 @@ function drawVolcano(){
   ctx.fillStyle='rgba(63,185,80,.9)';ctx.fillText('↑ '+su,pad.l+pw-52,pad.t+16);
   ctx.fillStyle='rgba(248,81,73,.9)';ctx.fillText('↓ '+sd,pad.l+pw-52,pad.t+32);
   // label ptype
-  ctx.fillStyle='#6e7681';ctx.font='10px sans-serif';ctx.textAlign='right';
+  ctx.fillStyle=THEME.tx3;ctx.font='10px sans-serif';ctx.textAlign='right';
   ctx.fillText('seuil '+ptype+' ≤ '+thresh,pad.l+pw-2,sy(ythresh)-4);
-  ctx.fillStyle='#6e7681';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillStyle=THEME.tx3;ctx.font='11px sans-serif';ctx.textAlign='center';
   const parts=activeContrast.split('_vs_');
   const contrastLabel=invertActive
     ? (parts[1]||'').replace(/_/g,' ')+' vs '+(parts[0]||'').replace(/_/g,' ')
@@ -656,9 +764,9 @@ function initVolcTooltip(){
       const sig=isSig(best,canvas._fc,canvas._ptype,canvas._thresh);
       const isU=sig&&best.d>canvas._fc,isD=sig&&best.d<-canvas._fc;
       const badge=isU?'<span class="badge bu">↑ Up</span>':isD?'<span class="badge bd2c">↓ Down</span>':'<span class="badge bn">NS</span>';
-      const descTxt=best.desc&&best.desc.trim()?'<div class="tl" style="font-style:italic;color:#8b949e;margin-top:1px;">'+best.desc+'</div>':'';
+      const descTxt=best.desc&&best.desc.trim()?'<div class="tl" style="font-style:italic;color:'+THEME.tx2+';margin-top:1px;">'+best.desc+'</div>':'';
       tt.innerHTML='<div class="tg">'+(best.Genes||best.name||'—')+'</div>'+
-        '<div class="tl"><code style="font-size:10px;color:#6e7681;">'+best.name+'</code></div>'+
+        '<div class="tl"><code style="font-size:10px;color:'+THEME.tx3+';">'+best.name+'</code></div>'+
         descTxt+
         '<div class="tl" style="margin-top:3px;">LFC:<b>'+best.d.toFixed(3)+'</b> p.val:<b>'+parseFloat(best.p).toExponential(2)+'</b> p.adj:<b>'+parseFloat(best.padj).toExponential(2)+'</b></div>'+
         '<div class="tl">Pi:<b>'+parseFloat(best.pi).toFixed(3)+'</b> · Robustesse:<b>'+best.r+'/100</b></div>'+badge;
@@ -732,7 +840,7 @@ function renderGO(c){
     const terms=data.filter(t=>t.source===src).sort((a,b)=>a.p_value-b.p_value).slice(0,12);
     if(!terms.length){
       canvas.style.display='none';
-      canvas.insertAdjacentHTML('afterend','<div style="color:#6e7681;font-size:11px;padding:8px;">Aucun terme</div>');
+      canvas.insertAdjacentHTML('afterend','<div style="color:'+THEME.tx3+';font-size:11px;padding:8px;">Aucun terme</div>');
       return;
     }
     // Apply GO inversion: flip z_score sign
@@ -747,10 +855,10 @@ function renderGO(c){
     canvas.style.height=H+'px';
     const ctx=canvas.getContext('2d');
     ctx.scale(dpr,dpr);
-    ctx.fillStyle='#161b22'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle=THEME.bg2; ctx.fillRect(0,0,W,H);
 
     const srcAccentColors={'GO:BP':'#388bfd','GO:CC':'#3fb950','GO:MF':'#d29922','REAC':'#bc8cff','KEGG':'#f85149'};
-    const accentCol=srcAccentColors[src]||'#8b949e';
+    const accentCol=srcAccentColors[src]||THEME.tx2;
 
     termsMod.forEach((t,i)=>{
       const y=PAD.t+i*ROW;
@@ -758,15 +866,15 @@ function renderGO(c){
       const barCol=z>=0?'rgba(248,81,73,.8)':'rgba(56,139,253,.8)';
       const bw=Math.round(Math.abs(z)/maxZ*BAR_ZONE);
       // row bg
-      ctx.fillStyle=i%2===0?'#161b22':'#1a1f27';
+      ctx.fillStyle=i%2===0?THEME.bg2:THEME.bg3;
       ctx.fillRect(0,y,W,ROW);
       // term label
       const label=t.term_name.length>26?t.term_name.slice(0,25)+'…':t.term_name;
-      ctx.fillStyle='#c9d1d9'; ctx.font='10px sans-serif'; ctx.textAlign='left';
+      ctx.fillStyle=THEME.tx; ctx.font='10px sans-serif'; ctx.textAlign='left';
       ctx.fillText(label,PAD.l,y+ROW/2+4);
       // z-score bar background
       const barX=LABEL_W;
-      ctx.fillStyle='#21262d';
+      ctx.fillStyle=THEME.bg3;
       ctx.fillRect(barX,y+6,BAR_ZONE,ROW-12);
       // z-score bar fill
       if(bw>0){
@@ -774,7 +882,7 @@ function renderGO(c){
         ctx.fillRect(barX,y+6,bw,ROW-12);
       }
       // p-value label
-      ctx.fillStyle='#6e7681'; ctx.font='9px sans-serif'; ctx.textAlign='right';
+      ctx.fillStyle=THEME.tx3; ctx.font='9px sans-serif'; ctx.textAlign='right';
       ctx.fillText(t.p_value.toExponential(1),W-PAD.r+62,y+ROW/2+3);
       // z-score value
       ctx.fillStyle=z>=0?'rgba(248,81,73,.9)':'rgba(56,139,253,.9)';
@@ -784,7 +892,7 @@ function renderGO(c){
     // Header line
     ctx.fillStyle=accentCol; ctx.fillRect(0,0,3,H);
     // Column headers
-    ctx.fillStyle='#6e7681'; ctx.font='8px sans-serif'; ctx.textAlign='left';
+    ctx.fillStyle=THEME.tx3; ctx.font='8px sans-serif'; ctx.textAlign='left';
     ctx.fillText('Terme',PAD.l,PAD.t-1);
     ctx.textAlign='right';
     ctx.fillText('p-value',W-PAD.r+62,PAD.t-1);
@@ -803,7 +911,7 @@ function renderGO(c){
         backgroundColor:topAllMod.map(t=>(t.z_score||0)>=0?'rgba(248,81,73,.7)':'rgba(56,139,253,.7)'),borderRadius:3}]},
     options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
       plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' z='+ctx.raw.toFixed(3)+' | p='+topAllMod[ctx.dataIndex].p_value.toExponential(2)}}},
-      scales:{x:{title:{display:true,text:'Z-score (+ = up-regulated)',color:'#8b949e',font:{size:10}}},y:{ticks:{font:{size:10}}}}}
+      scales:{x:{title:{display:true,text:'Z-score (+ = up-regulated)',color:THEME.tx2,font:{size:10}}},y:{ticks:{font:{size:10}}}}}
   });
 
   // --- Source breakdown chart ---
@@ -817,7 +925,7 @@ function renderGO(c){
     data:{labels:srcK,datasets:[{label:'Termes',data:srcK.map(s=>srcCnt[s]),
       backgroundColor:srcK.map(s=>srcColors[s]||'rgba(100,100,100,.6)'),borderRadius:3}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:'#8b949e'}},y:{ticks:{color:'#8b949e',stepSize:1}}}}
+      scales:{x:{ticks:{color:THEME.tx2}},y:{ticks:{color:THEME.tx2,stepSize:1}}}}
   });
 
   // --- GO figures from Excel ---
@@ -884,14 +992,14 @@ function drawHeatmap(){
   canvas.style.width=W+'px';canvas.style.height=H+'px';
   const ctx=canvas.getContext('2d');
   ctx.scale(dpr,dpr);
-  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=THEME.bg2;ctx.fillRect(0,0,W,H);
 
   // Condition separator lines + colored headers
   let xCursor=lW;
   CONDITIONS.forEach(cond=>{
     const cols=COND_MAP[cond]||[];
     const condW=cols.length*cW;
-    const col=COND_COLORS[cond]||'#888';
+    const col=COND_COLORS[cond]||THEME.tx3;
     // Color bar under header
     ctx.fillStyle=col;
     ctx.fillRect(xCursor,lH-6,condW,4);
@@ -900,7 +1008,7 @@ function drawHeatmap(){
     ctx.fillText(cond.replace('Polyculture.','Poly '),xCursor+condW/2,lH-10);
     // Vertical separator
     if(xCursor>lW){
-      ctx.strokeStyle='rgba(240,246,252,.15)';ctx.lineWidth=1;
+      ctx.strokeStyle=THEME.bd2;ctx.lineWidth=1;
       ctx.beginPath();ctx.moveTo(xCursor,0);ctx.lineTo(xCursor,H);ctx.stroke();
     }
     xCursor+=condW;
@@ -909,16 +1017,16 @@ function drawHeatmap(){
   // Column labels (rotated sample names)
   SAMPLE_COLS.forEach((col,i)=>{
     ctx.save();ctx.translate(lW+i*cW+cW/2,lH-12);ctx.rotate(-Math.PI/3);
-    ctx.fillStyle='#8b949e';ctx.font='8px sans-serif';ctx.textAlign='right';
+    ctx.fillStyle=THEME.tx2;ctx.font='8px sans-serif';ctx.textAlign='right';
     ctx.fillText(col.replace(/^.*_(\d+)$/,'$1'),0,0); // just the replicate number
     ctx.restore();
   });
 
-  const CLC={'Cluster_1':'#f0e68c','Cluster_2':'#87ceeb','Cluster_3':'#dda0dd','NA':'#555'};
+  const CLC={'Cluster_1':THEME.cl1,'Cluster_2':THEME.cl2,'Cluster_3':THEME.cl3,'NA':THEME.tx3};
   data.forEach((row,ri)=>{
     const y=lH+ri*cH;
-    ctx.fillStyle=CLC[row.cl]||'#555';ctx.fillRect(0,y+1,4,cH-2);
-    ctx.fillStyle='#c9d1d9';ctx.font='10px sans-serif';ctx.textAlign='right';
+    ctx.fillStyle=CLC[row.cl]||THEME.tx3;ctx.fillRect(0,y+1,4,cH-2);
+    ctx.fillStyle=THEME.tx;ctx.font='10px sans-serif';ctx.textAlign='right';
     ctx.fillText(row.g.slice(0,14),lW-7,y+cH-3);
     row.v.forEach((val,ci)=>{
       const v=Math.max(-2,Math.min(2,typeof val==='number'?val:0));
@@ -946,7 +1054,7 @@ function initUpset(){
   canvas.width=TOTAL_W*dpr;canvas.height=TOTAL_H*dpr;
   canvas.style.width=TOTAL_W+'px';canvas.style.height=TOTAL_H+'px';
   const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);
-  ctx.fillStyle='#161b22';ctx.fillRect(0,0,TOTAL_W,TOTAL_H);
+  ctx.fillStyle=THEME.bg2;ctx.fillRect(0,0,TOTAL_W,TOTAL_H);
   const maxCnt=Math.max(...INTERS.map(x=>x.count),1);
   const maxSz=Math.max(...Object.values(SET_SIZES),1);
   const colX=i=>SET_W+LBL_W+i*COL_W+COL_W/2;
@@ -956,14 +1064,14 @@ function initUpset(){
     const x=colX(i);const bh=Math.round(inter.count/maxCnt*(BAR_H-8));const by=barBot-bh;
     ctx.fillStyle='rgba(56,139,253,.75)';
     ctx.beginPath();ctx.roundRect(x-COL_W/2+6,by,COL_W-12,bh,3);ctx.fill();
-    ctx.fillStyle='#c9d1d9';ctx.font='bold 9px sans-serif';ctx.textAlign='center';
+    ctx.fillStyle=THEME.tx;ctx.font='bold 9px sans-serif';ctx.textAlign='center';
     ctx.fillText(inter.count,x,by-3);
   });
-  ctx.fillStyle='#6e7681';ctx.font='9px sans-serif';ctx.textAlign='right';
+  ctx.fillStyle=THEME.tx3;ctx.font='9px sans-serif';ctx.textAlign='right';
   [0,.25,.5,.75,1].forEach(f=>{
     const val=Math.round(f*maxCnt);const y=barBot-Math.round(f*(BAR_H-8));
     ctx.fillText(val,SET_W+LBL_W-4,y+3);
-    ctx.strokeStyle='rgba(240,246,252,.04)';ctx.lineWidth=.5;
+    ctx.strokeStyle=THEME.bd;ctx.lineWidth=.5;
     ctx.beginPath();ctx.moveTo(SET_W+LBL_W,y);ctx.lineTo(TOTAL_W-10,y);ctx.stroke();
   });
   SETS.forEach((_,si)=>{
@@ -971,14 +1079,14 @@ function initUpset(){
     ctx.fillRect(SET_W+LBL_W,rowY(si)-DOT_H/2,nI*COL_W,DOT_H);
   });
   SETS.forEach((s,si)=>{
-    ctx.fillStyle='#c9d1d9';ctx.font='11px sans-serif';ctx.textAlign='right';
+    ctx.fillStyle=THEME.tx;ctx.font='11px sans-serif';ctx.textAlign='right';
     ctx.fillText(s,SET_W+LBL_W-8,rowY(si)+4);
   });
   SETS.forEach((s,si)=>{
     const y=rowY(si);const bw=Math.round((SET_SIZES[s]||0)/maxSz*(SET_W-8));
     ctx.fillStyle='rgba(188,140,255,.6)';
     ctx.beginPath();ctx.roundRect(SET_W-4-bw,y-DOT_H/2+3,bw,DOT_H-6,2);ctx.fill();
-    ctx.fillStyle='#8b949e';ctx.font='9px sans-serif';ctx.textAlign='right';
+    ctx.fillStyle=THEME.tx2;ctx.font='9px sans-serif';ctx.textAlign='right';
     ctx.fillText(SET_SIZES[s]||0,SET_W-8-bw,y+4);
   });
   INTERS.forEach((inter,i)=>{
@@ -991,7 +1099,7 @@ function initUpset(){
     SETS.forEach((s,si)=>{
       const isA=inter.sets.includes(s);
       ctx.beginPath();ctx.arc(x,rowY(si),isA?6:4,0,Math.PI*2);
-      ctx.fillStyle=isA?'#388bfd':'#2d333b';ctx.fill();
+      ctx.fillStyle=isA?'#388bfd':THEME.bg4;ctx.fill();
       if(isA){ctx.strokeStyle='rgba(56,139,253,.35)';ctx.lineWidth=1.5;ctx.stroke();}
     });
   });
@@ -1046,7 +1154,7 @@ function renderIntersect(){
     const nbCol=r.nb>=4?'var(--up)':r.nb>=2?'var(--am)':'var(--tx2)';
     const tr=document.createElement('tr');
     let cells='<td class="mono">'+r.pg+'</td>'+
-      '<td style="color:#c9d1d9;font-weight:600;">'+r.g+'</td>'+
+      '<td style="color:'+THEME.tx+';font-weight:600;">'+r.g+'</td>'+
       '<td style="font-size:10px;color:var(--tx2);" title="'+(r.desc||'')+'">'+((r.desc||'').slice(0,40)||'—')+'</td>'+
       '<td><span style="font-weight:700;color:'+nbCol+'">'+r.nb+'</span></td>';
     for(let i=0;i<nC;i++){
@@ -1095,14 +1203,14 @@ function renderProtTable(){
     const descShort=(p.desc||'').slice(0,40)+((p.desc||'').length>40?'…':'');
     const tr=document.createElement('tr');
     tr.innerHTML='<td class="mono">'+p.name+'</td>'+
-      '<td style="color:#c9d1d9;font-weight:600;">'+(p.Genes||'—')+'</td>'+
+      '<td style="color:'+THEME.tx+';font-weight:600;">'+(p.Genes||'—')+'</td>'+
       '<td style="font-size:11px;color:var(--tx2);" title="'+(p.desc||'')+'">'+descShort+'</td>'+
       '<td>'+badge+'</td>'+
       '<td style="color:'+(isU?'#3fb950':'#f85149')+';font-weight:600;">'+p.d.toFixed(3)+'</td>'+
       '<td style="color:var(--tx2);">'+parseFloat(p.p).toExponential(2)+'</td>'+
       '<td style="color:var(--tx2);">'+parseFloat(p.padj).toExponential(2)+'</td>'+
       '<td style="color:var(--bl);">'+parseFloat(p.pi).toFixed(3)+'</td>'+
-      '<td><span style="color:'+(p.r>=75?'#3fb950':p.r>=40?'#d29922':'#8b949e')+'">'+p.r+'</span></td>';
+      '<td><span style="color:'+(p.r>=75?'#3fb950':p.r>=40?'#d29922':THEME.tx2)+'">'+p.r+'</span></td>';
     tbody.appendChild(tr);
   });
   document.getElementById('protCount').textContent=pts.length+' DEP proteins (max 300)';
@@ -1126,7 +1234,7 @@ function initWGCNA(){
   // Hub chart (top 5 per module stacked)
   const labels=[];const datasets=[];
   const modColors={blue:'#388bfd',turquoise:'#00bcd4',green:'#3fb950',yellow:'#d29922',
-                   red:'#f85149',brown:'#cd853f',black:'#8b949e'};
+                   red:'#f85149',brown:'#cd853f',black:THEME.tx2};
   WGCNA_MODS.forEach(mod=>{
     const top=(WGCNA_TOP5[mod]||[]).slice(0,5);
     top.forEach(p=>{if(!labels.includes(p.g))labels.push(p.g);});
@@ -1137,15 +1245,15 @@ function initWGCNA(){
       const found=top.find(p=>p.g===l);
       return found?found.hub:0;
     });
-    datasets.push({label:mod,data,backgroundColor:(modColors[mod]||'#888')+'99',borderColor:modColors[mod]||'#888',borderWidth:1,borderRadius:2});
+    datasets.push({label:mod,data,backgroundColor:(modColors[mod]||THEME.tx3)+'99',borderColor:modColors[mod]||THEME.tx3,borderWidth:1,borderRadius:2});
   });
   new Chart(document.getElementById('wgcnaHubChart'),{
     type:'bar',
     data:{labels,datasets},
     options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
-      plugins:{legend:{labels:{color:'#8b949e',font:{size:10}}}},
-      scales:{x:{stacked:false,ticks:{color:'#8b949e'},title:{display:true,text:'kME (Hub Score)',color:'#8b949e',font:{size:10}}},
-              y:{ticks:{color:'#8b949e',font:{size:10}}}}}
+      plugins:{legend:{labels:{color:THEME.tx2,font:{size:10}}}},
+      scales:{x:{stacked:false,ticks:{color:THEME.tx2},title:{display:true,text:'kME (Hub Score)',color:THEME.tx2,font:{size:10}}},
+              y:{ticks:{color:THEME.tx2,font:{size:10}}}}}
   });
 
   // Pie modules
@@ -1153,10 +1261,10 @@ function initWGCNA(){
     type:'doughnut',
     data:{labels:WGCNA_MODS,datasets:[{
       data:WGCNA_MODS.map(m=>modCounts[m]||0),
-      backgroundColor:WGCNA_MODS.map(m=>(modColors[m]||'#888')+'88'),
-      borderColor:WGCNA_MODS.map(m=>modColors[m]||'#888'),borderWidth:1.5
+      backgroundColor:WGCNA_MODS.map(m=>(modColors[m]||THEME.tx3)+'88'),
+      borderColor:WGCNA_MODS.map(m=>modColors[m]||THEME.tx3),borderWidth:1.5
     }]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}}}
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:THEME.tx2,font:{size:11}}}}}
   });
 
   // Module select
@@ -1174,12 +1282,12 @@ function renderWGCNATable(){
   if(search)rows=rows.filter(r=>r.g.toLowerCase().includes(search)||(r.desc||'').toLowerCase().includes(search));
   rows.sort((a,b)=>b.hub-a.hub);
   const modColors={blue:'#388bfd',turquoise:'#00bcd4',green:'#3fb950',yellow:'#d29922',
-                   red:'#f85149',brown:'#cd853f',black:'#8b949e'};
+                   red:'#f85149',brown:'#cd853f',black:THEME.tx2};
   const tbody=document.getElementById('wgcnaBody');tbody.innerHTML='';
   rows.slice(0,300).forEach(r=>{
     const tr=document.createElement('tr');
-    tr.innerHTML='<td style="color:#c9d1d9;font-weight:600;">'+r.g+'</td>'+
-      '<td><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;background:'+(modColors[r.mod]||'#888')+'22;color:'+(modColors[r.mod]||'#888')+';font-weight:600;">'+r.mod+'</span></td>'+
+    tr.innerHTML='<td style="color:'+THEME.tx+';font-weight:600;">'+r.g+'</td>'+
+      '<td><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;background:'+(modColors[r.mod]||THEME.tx3)+'22;color:'+(modColors[r.mod]||THEME.tx3)+';font-weight:600;">'+r.mod+'</span></td>'+
       '<td style="color:var(--bl);font-weight:600;">'+r.hub.toFixed(4)+'</td>'+
       '<td style="font-size:11px;color:var(--tx2);" title="'+(r.desc||'')+'">'+((r.desc||'').slice(0,55)||'—')+'</td>';
     tbody.appendChild(tr);
@@ -1421,22 +1529,22 @@ function drawPCA(){
   const ymn=Math.min(...ys)-0.3,ymx=Math.max(...ys)+0.3;
   const sx=v=>(v-xmn)/(xmx-xmn)*pw+pad.l;
   const sy=v=>ph-(v-ymn)/(ymx-ymn)*ph+pad.t;
-  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=THEME.bg2;ctx.fillRect(0,0,W,H);
   // Axes
-  ctx.strokeStyle='rgba(240,246,252,.08)';ctx.lineWidth=.5;
+  ctx.strokeStyle=THEME.bd;ctx.lineWidth=.5;
   for(let i=0;i<=4;i++){
     const x=pad.l+i*pw/4;ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,pad.t+ph);ctx.stroke();
     const y=pad.t+i*ph/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();
   }
   // Zero lines
-  if(xmn<0&&xmx>0){ctx.strokeStyle='rgba(240,246,252,.2)';ctx.lineWidth=.8;ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(sx(0),pad.t);ctx.lineTo(sx(0),pad.t+ph);ctx.stroke();}
+  if(xmn<0&&xmx>0){ctx.strokeStyle=THEME.bd2;ctx.lineWidth=.8;ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(sx(0),pad.t);ctx.lineTo(sx(0),pad.t+ph);ctx.stroke();}
   if(ymn<0&&ymx>0){ctx.beginPath();ctx.moveTo(pad.l,sy(0));ctx.lineTo(pad.l+pw,sy(0));ctx.stroke();}
   ctx.setLineDash([]);
   // Points + ellipses per condition
   const condPts={};
   pts.forEach(p=>{(condPts[p.cond]=condPts[p.cond]||[]).push(p);});
   CONDITIONS.forEach(cond=>{
-    const col=COND_COLORS[cond]||'#888';
+    const col=COND_COLORS[cond]||THEME.tx3;
     const cpts=(condPts[cond]||[]);
     // Ellipse (rough bounding)
     if(cpts.length>1){
@@ -1452,7 +1560,7 @@ function drawPCA(){
     cpts.forEach(p=>{
       ctx.beginPath();ctx.arc(sx(p[pcKeys[xi]]),sy(p[pcKeys[yi]]),6,0,Math.PI*2);
       ctx.fillStyle=col;ctx.fill();
-      ctx.strokeStyle='#161b22';ctx.lineWidth=1.5;ctx.stroke();
+      ctx.strokeStyle=THEME.bg2;ctx.lineWidth=1.5;ctx.stroke();
     });
     // Labels
     if(cpts.length){
@@ -1464,12 +1572,12 @@ function drawPCA(){
   });
   // Axis labels
   const ve=PCA_DATA.var_exp;
-  ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillStyle=THEME.tx2;ctx.font='11px sans-serif';ctx.textAlign='center';
   ctx.fillText('PC'+(xi+1)+' ('+ve[xi]+'%)',pad.l+pw/2,H-6);
   ctx.save();ctx.translate(12,pad.t+ph/2);ctx.rotate(-Math.PI/2);
   ctx.fillText('PC'+(yi+1)+' ('+ve[yi]+'%)',0,0);ctx.restore();
   // Axis ticks
-  ctx.font='9px sans-serif';ctx.fillStyle='#6e7681';
+  ctx.font='9px sans-serif';ctx.fillStyle=THEME.tx3;
   [-2,-1,0,1,2].filter(v=>v>=xmn&&v<=xmx).forEach(v=>{ctx.textAlign='center';ctx.fillText(v.toFixed(0),sx(v),H-22);});
   ctx.textAlign='right';
   [-2,-1,0,1,2].filter(v=>v>=ymn&&v<=ymx).forEach(v=>{ctx.fillText(v.toFixed(0),pad.l-4,sy(v)+3);});
@@ -1520,19 +1628,19 @@ function drawScatter(){
   const mn=lo-pad_ax,mx=hi+pad_ax;
   const sx=v=>(v-mn)/(mx-mn)*pw+pad.l;
   const sy=v=>(1-(v-mn)/(mx-mn))*ph+pad.t;
-  ctx.fillStyle='#161b22';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=THEME.bg2;ctx.fillRect(0,0,W,H);
   // Grid
-  ctx.strokeStyle='rgba(240,246,252,.05)';ctx.lineWidth=.5;
+  ctx.strokeStyle=THEME.bd;ctx.lineWidth=.5;
   for(let i=0;i<=4;i++){
     const x=pad.l+i*pw/4;ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,pad.t+ph);ctx.stroke();
     const y=pad.t+i*ph/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();
   }
   // Diagonale y=x + lignes de seuil ±ratio (log2FC), comme le scatter matplotlib
   const lfcThr=(typeof LFC_THRESH!=='undefined')?LFC_THRESH:(obj.lfc_thresh||0.585);
-  ctx.strokeStyle='rgba(240,246,252,.25)';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+  ctx.strokeStyle=THEME.bd2;ctx.lineWidth=1;ctx.setLineDash([4,4]);
   ctx.beginPath();ctx.moveTo(sx(mn),sy(mn));ctx.lineTo(sx(mx),sy(mx));ctx.stroke();
   ctx.setLineDash([]);
-  ctx.strokeStyle='rgba(240,246,252,.12)';ctx.lineWidth=.7;ctx.setLineDash([2,3]);
+  ctx.strokeStyle=THEME.bd;ctx.lineWidth=.7;ctx.setLineDash([2,3]);
   ctx.beginPath();ctx.moveTo(sx(mn),sy(mn+lfcThr));ctx.lineTo(sx(mx-lfcThr),sy(mx));ctx.stroke();
   ctx.beginPath();ctx.moveTo(sx(mn+lfcThr),sy(mn));ctx.lineTo(sx(mx),sy(mx-lfcThr));ctx.stroke();
   ctx.setLineDash([]);
@@ -1550,12 +1658,12 @@ function drawScatter(){
     ctx.fillStyle=p.s==='U'?colU:colD;ctx.fill();
   });
   // Axis labels
-  ctx.fillStyle='#8b949e';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillStyle=THEME.tx2;ctx.font='11px sans-serif';ctx.textAlign='center';
   ctx.fillText((obj.label_a||'')+' — mean log₂ intensity',pad.l+pw/2,H-8);
   ctx.save();ctx.translate(12,pad.t+ph/2);ctx.rotate(-Math.PI/2);
   ctx.fillText((obj.label_b||'')+' — mean log₂ intensity',0,0);ctx.restore();
   // Ticks
-  ctx.font='9px sans-serif';ctx.fillStyle='#6e7681';
+  ctx.font='9px sans-serif';ctx.fillStyle=THEME.tx3;
   const step=Math.max(1,Math.ceil((mx-mn)/5));
   for(let v=Math.ceil(mn);v<=mx;v+=step){
     ctx.textAlign='center';ctx.fillText(v.toFixed(0),sx(v),H-32);
@@ -1567,7 +1675,7 @@ function drawScatter(){
   ctx.font='bold 11px sans-serif';ctx.textAlign='left';
   ctx.fillStyle=colU;ctx.fillText('↑ '+su,pad.l+6,pad.t+16);
   ctx.fillStyle=colD;ctx.fillText('↓ '+sd,pad.l+6,pad.t+30);
-  ctx.fillStyle='#8b949e';ctx.font='10px sans-serif';ctx.textAlign='right';
+  ctx.fillStyle=THEME.tx2;ctx.font='10px sans-serif';ctx.textAlign='right';
   ctx.fillText('r = '+(obj.r||0).toFixed(4),pad.l+pw-4,pad.t+14);
   // Tooltip
   const tt=document.getElementById('scatterTip');
@@ -1584,7 +1692,7 @@ function drawScatter(){
     });
     if(bd<12&&best){
       const badge=best.s==='U'?'<span class="badge bu">↑ Up</span>':best.s==='D'?'<span class="badge bd2c">↓ Down</span>':'';
-      const descTxt=best.d&&best.d.trim()?'<div class="tl" style="font-style:italic;color:#8b949e;">'+best.d+'</div>':'';
+      const descTxt=best.d&&best.d.trim()?'<div class="tl" style="font-style:italic;color:'+THEME.tx2+';">'+best.d+'</div>':'';
       tt.innerHTML='<div class="tg">'+(best.g||best.n||'—')+'</div>'+
         descTxt+
         '<div class="tl">x='+parseFloat(best.x).toFixed(2)+' y='+parseFloat(best.y).toFixed(2)+'</div>'+

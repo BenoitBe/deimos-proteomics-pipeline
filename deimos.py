@@ -46,14 +46,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from limma_ebayes import (lm_fit, contrasts_fit, ebayes, top_table,
                            spectra_count_ebayes,
                            make_all_contrasts, make_design_matrix,
-                           make_paired_design_matrix)
+                           make_paired_design_matrix, detect_control_condition)
 
 # Module GO/gProfiler optionnel (import protégé : si absent, le pipeline tourne)
 try:
     from go_enrichment import (ask_go_params, run_go_enrichment,
                                export_go_sheets,
                                run_go_enrichment_clusters,
-                               export_go_cluster_sheets)
+                               export_go_cluster_sheets,
+                               diagnose_gprofiler_coverage)
     _GO_AVAILABLE = True
 except ImportError:
     _GO_AVAILABLE = False
@@ -64,6 +65,15 @@ try:
     _DASHBOARD_AVAILABLE = True
 except ImportError:
     _DASHBOARD_AVAILABLE = False
+
+# Module Perseverance optionnel (recherche d'orthologues, import protégé)
+try:
+    from rbh import compute_rbh
+    from deimos_to_perseverance import (export_query_fasta, detect_fasta_roles,
+                                        build_ortholog_map)
+    _PERSEVERANCE_AVAILABLE = True
+except ImportError:
+    _PERSEVERANCE_AVAILABLE = False
 
 # Module config YAML réutilisable
 from config import resolve_config
@@ -418,6 +428,246 @@ def load_data(tsv_path: str, design_path: str) -> tuple[pd.DataFrame, pd.DataFra
     return tsv, design
 
 
+def detect_species_tags(tsv: pd.DataFrame, col: str = "Protein.Names") -> pd.Series:
+    """
+    Extrait un tag d'organisme depuis le suffixe '_TAG' de Protein.Names
+    (convention type UniProt : GENE_SPECIESTAG, ex. '..._MAGGI', '..._OSHVF').
+    Générique : ne présuppose aucune liste fixe d'organismes.
+
+    Retourne une Series alignée sur l'index de tsv, NaN si aucun suffixe
+    reconnu (protéine sans tag exploitable — ni perdue ni mal classée).
+    """
+    first_entry = tsv[col].astype(str).str.split(";").str[0]
+    return first_entry.str.extract(r"_([A-Za-z0-9]{3,10})$")[0]
+
+
+def ask_species_split(tag_counts: pd.Series) -> bool:
+    """
+    Signale la présence de plusieurs organismes dans Protein.Names et demande
+    s'il faut lancer une analyse DEP complète et indépendante par organisme
+    (recommandé : FDR, imputation et normalisation propres à chaque compartiment
+    plutôt que mélangés dans une seule matrice hôte+pathogène).
+    """
+    print("\n" + "="*60)
+    print("  Plusieurs organismes détectés dans Protein.Names :")
+    for tag, n in tag_counts.items():
+        print(f"    _{tag} : {n} protein group(s)")
+    print("="*60)
+    while True:
+        raw = input("  Run a SEPARATE analysis per organism? [Y/n] -> ").strip().lower()
+        if raw in ("", "y", "yes", "o", "oui"):
+            return True
+        if raw in ("n", "no", "non"):
+            return False
+        print("  Answer: Y or N.")
+
+
+def ask_run_perseverance(coverage_diag: "dict | None" = None) -> bool:
+    """Demande si Perseverance (recherche d'orthologues par RBH) doit être
+    lancé après les analyses statistiques, avant le GO. Surchargeable en
+    non-interactif via params['run_perseverance']=True/False.
+
+    coverage_diag : résultat de diagnose_gprofiler_coverage(), si go_organism
+                   était configuré — informe la question sans décider à la
+                   place de l'utilisateur (le défaut proposé s'ajuste, mais
+                   la question reste posée dans tous les cas)."""
+    print("\n" + "="*60)
+    print("  Perseverance : recherche d'orthologues par RBH (DIAMOND)")
+    print("  Utile si l'espèce n'est pas/mal couverte par gProfiler —")
+    print("  traduit les protéines significatives vers une espèce de")
+    print("  référence bien annotée avant l'enrichissement GO.")
+    if coverage_diag and coverage_diag.get("available"):
+        print(f"  Diagnostic : {coverage_diag['recommendation']}")
+    print("="*60)
+    default_yes = bool(coverage_diag and coverage_diag.get("reliable") is False)
+    prompt = "  Lancer Perseverance avant le GO ? [Y/n] -> " if default_yes \
+        else "  Lancer Perseverance avant le GO ? [y/N] -> "
+    while True:
+        raw = input(prompt).strip().lower()
+        if raw == "":
+            return default_yes
+        if raw in ("y", "yes", "o", "oui"):
+            return True
+        if raw in ("n", "no", "non"):
+            return False
+        print("  Answer: Y or N.")
+
+
+def _scan_fasta_files(directory: str) -> list:
+    if not directory or not os.path.isdir(directory):
+        return []
+    exts = (".fasta", ".fa", ".faa")
+    return sorted(os.path.join(directory, f) for f in os.listdir(directory)
+                 if f.lower().endswith(exts))
+
+
+def ask_fasta_paths(candidates: list) -> "tuple[str, str]":
+    """Demande les deux chemins FASTA quand l'auto-scan ne trouve pas
+    exactement 2 fichiers, ou si l'utilisateur veut les préciser."""
+    if candidates:
+        print(f"  Fichiers FASTA trouvés dans le dossier scanné : {candidates}")
+    a = input("  Chemin du 1er FASTA (recherche OU référence, peu importe l'ordre) -> ").strip()
+    b = input("  Chemin du 2e FASTA -> ").strip()
+    return a, b
+
+
+def ask_reference_organism() -> str:
+    print("  Code organisme gProfiler pour l'espèce de RÉFÉRENCE (celle du "
+          "2e FASTA, bien annotée) — ex: 'athaliana', 'hsapiens', 'mmusculus'.")
+    return input("  Organisme de référence -> ").strip()
+
+
+def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
+                          ) -> "tuple[pd.DataFrame | None, dict | None]":
+    """
+    Orchestration complète de l'étape Perseverance, insérée après toutes les
+    analyses statistiques et avant le GO :
+      1. Demande (ou lit en config) si Perseverance doit tourner.
+      2. Localise les 2 FASTA (scan auto d'un dossier, ou chemins explicites).
+      3. Détecte automatiquement quel FASTA correspond à CE run Deimos
+         (recouvrement avec Protein.Group) et lequel est la référence.
+      4. RBH (DIAMOND) — recherche d'orthologues uniquement, pas de transfert
+         de GO (Perseverance ne sert ici qu'à faire le blastp réciproque).
+      5. Construit la table de correspondance protéine/orthologue (à
+         exporter) et le dict de traduction pour le GO.
+
+    Returns
+    -------
+    (correspondence_df, go_override) — (None, None) si désactivé/échec.
+    go_override : dict prêt à fusionner dans go_params
+                 ({"organism": ..., "ortholog_map": ..., "run_gsea": ...})
+    """
+    if not _PERSEVERANCE_AVAILABLE:
+        return None, None
+
+    cfg_run = params.get("run_perseverance", "__auto__")
+    if cfg_run is False:
+        return None, None
+    elif cfg_run == "__auto__":
+        coverage_diag = None
+        _org = params.get("go_organism")
+        if _org and _GO_AVAILABLE:
+            print(f"\n[DIAG] Vérification de la couverture gProfiler pour "
+                  f"'{_org}' avant de proposer Perseverance...")
+            id_col = "name" if "name" in df_results.columns else df_results.columns[0]
+            coverage_diag = diagnose_gprofiler_coverage(
+                df_results[id_col].tolist(), _org)
+            if coverage_diag.get("available"):
+                print(f"  [DIAG] {coverage_diag['recommendation']}")
+            else:
+                print(f"  [DIAG] {coverage_diag['recommendation']}")
+        if not ask_run_perseverance(coverage_diag):
+            return None, None
+    elif not cfg_run:
+        return None, None
+    else:
+        print(f"\n[CONFIG] run_perseverance={bool(cfg_run)} (from config)")
+        _org = params.get("go_organism")
+        if _org and _GO_AVAILABLE and bool(cfg_run) is False:
+            # Purement informatif : la decision est deja fixee par la config,
+            # mais utile de savoir a posteriori si gProfiler direct etait
+            # effectivement une option raisonnable.
+            coverage_diag = diagnose_gprofiler_coverage(
+                df_results[df_results.columns[0]].tolist(), _org)
+            if coverage_diag.get("available"):
+                print(f"  [DIAG, info] {coverage_diag['recommendation']}")
+
+    print("\n[STEP] Perseverance — recherche d'orthologues (RBH/DIAMOND)...")
+
+    fasta_a = params.get("perseverance_fasta_a")
+    fasta_b = params.get("perseverance_fasta_b")
+    if not (fasta_a and fasta_b):
+        scan_dir = params.get("perseverance_fasta_dir") or os.path.dirname(
+            os.path.abspath(params.get("tsv_path", ".")))
+        candidates = _scan_fasta_files(scan_dir)
+        if len(candidates) == 2:
+            fasta_a, fasta_b = candidates
+            print(f"  [AUTO] 2 FASTA trouvés dans {scan_dir} : "
+                  f"{[os.path.basename(c) for c in candidates]}")
+        else:
+            fasta_a, fasta_b = ask_fasta_paths(candidates)
+
+    if not (os.path.isfile(fasta_a) and os.path.isfile(fasta_b)):
+        print(f"  [WARN] FASTA introuvable(s) ({fasta_a}, {fasta_b}) — "
+              f"Perseverance ignoré.")
+        return None, None
+
+    id_col = "name" if "name" in df_results.columns else df_results.columns[0]
+    protein_groups = df_results[id_col].astype(str).tolist()
+
+    roles = detect_fasta_roles(fasta_a, fasta_b, protein_groups)
+    if roles["ambiguous"]:
+        print("  [WARN] Rôles ambigus — confirmation nécessaire.")
+        confirm = input(
+            f"  FASTA de recherche proposé : {roles['search_fasta']} "
+            f"(entrée pour valider, ou taper le bon chemin) -> ").strip()
+        if confirm:
+            roles["search_fasta"] = confirm
+            roles["reference_fasta"] = (fasta_b if confirm == fasta_a else fasta_a)
+
+    search_fasta = roles["search_fasta"]
+    reference_fasta = roles["reference_fasta"]
+    print(f"  [OK] FASTA de recherche (Protein.Group) : {os.path.basename(search_fasta)}")
+    print(f"  [OK] FASTA de référence (orthologie)     : {os.path.basename(reference_fasta)}")
+
+    persev_dir = os.path.join(out_dir, "perseverance")
+    _makedirs(persev_dir)
+    query_fasta = os.path.join(persev_dir, "query.fasta")
+    mapping_tsv = os.path.join(persev_dir, "mapping.tsv")
+    export_query_fasta(search_fasta, protein_groups, query_fasta, mapping_tsv)
+
+    min_identity = params.get("perseverance_min_identity", 25.0)
+    min_coverage = params.get("perseverance_min_coverage", 50.0)
+    try:
+        rbh_df = compute_rbh(query_fasta, reference_fasta, persev_dir,
+                             min_identity=min_identity, min_coverage=min_coverage)
+    except RuntimeError as e:
+        print(f"  [ERREUR] Perseverance/DIAMOND a échoué ({e}) — étape ignorée, "
+              f"le pipeline continue sans orthologues.")
+        return None, None
+
+    if rbh_df.empty:
+        print("  [WARN] Aucun orthologue trouvé (RBH vide) — vérifier les FASTA "
+              "ou assouplir --min-identity/--min-coverage.")
+        return None, None
+
+    ortholog_map = build_ortholog_map(rbh_df, mapping_tsv)
+    print(f"  [OK] {len(ortholog_map)} orthologue(s) identifié(s) sur "
+          f"{len(protein_groups)} protéines du run.")
+
+    reference_organism = params.get("perseverance_reference_organism")
+    if not reference_organism:
+        if not _GO_AVAILABLE:
+            print("  [WARN] gprofiler-official non installé — impossible de "
+                  "poursuivre en GO avec les orthologues. Table de correspondance "
+                  "tout de même exportée.")
+        else:
+            reference_organism = ask_reference_organism()
+
+    # Table de correspondance à exporter (une ligne par orthologue trouvé)
+    mapping = pd.read_csv(mapping_tsv, sep="\t")
+    corr = mapping.merge(rbh_df, left_on="accession", right_on="query_id", how="inner")
+    corr["protein_id"] = corr["protein_group"].str.split(";").str[0]
+    corr = corr.sort_values("bitscore", ascending=False).drop_duplicates("protein_id", keep="first")
+    correspondence_df = corr[["protein_id", "reference_id", "pident", "coverage", "confidence"]].rename(
+        columns={"reference_id": "ortholog_id"}).reset_index(drop=True)
+
+    go_override = None
+    if reference_organism:
+        go_override = {"organism": reference_organism, "ortholog_map": ortholog_map,
+                       "run_gsea": params.get("run_gsea", False)}
+
+    return correspondence_df, go_override
+
+
+def export_perseverance_sheet(wb, correspondence_df: pd.DataFrame, _write_df) -> None:
+    """Ajoute l'onglet de correspondance protéine/orthologue au classeur Excel."""
+    if correspondence_df is None or correspondence_df.empty:
+        return
+    ws = wb.create_sheet("Orthologues_Perseverance")
+    _write_df(ws, correspondence_df)
+
+
 def build_peptide_count_table(pr_path: str, protein_names: list,
                               count_level: str = "peptide") -> "pd.Series | None":
     """
@@ -567,9 +817,15 @@ def build_expression_matrix(tsv: pd.DataFrame, design: pd.DataFrame
     mat.replace(0, np.nan, inplace=True)
     mat = np.log2(mat)
 
-    meta = tsv[["name", "Protein.Group", "Protein.Names", "Genes",
-                "First.Protein.Description",
-                "N.Sequences", "N.Proteotypic.Sequences"]].copy()
+    meta_cols_wanted = ["name", "Protein.Group", "Protein.Names", "Genes",
+                       "First.Protein.Description",
+                       "N.Sequences", "N.Proteotypic.Sequences"]
+    for c in ("N.Sequences", "N.Proteotypic.Sequences"):
+        if c not in tsv.columns:
+            print(f"  [WARN] Colonne '{c}' absente du pg_matrix.tsv (metadonnee "
+                  f"optionnelle, ex: ancien export DIA-NN) — remplie a NaN.")
+            tsv[c] = np.nan
+    meta = tsv[meta_cols_wanted].copy()
 
     return mat, meta, design_filt, ordered_lfq
 
@@ -951,6 +1207,117 @@ def diagnose_missingness(mat: pd.DataFrame, design: pd.DataFrame,
     return metrics
 
 
+def diagnose_deqms_reliability(sigma2: np.ndarray, pep_count: np.ndarray,
+                               out_dir: str, min_r2: float = 0.10,
+                               max_pseudocount_pct: float = 50.0) -> dict:
+    """
+    Diagnostic de fiabilité de DEqMS pour objectiver son activation.
+
+    La prémisse de DEqMS (Zhu et al. 2020) est que la variance résiduelle
+    dépend du nombre de peptides quantifiés par protéine. Cette relation n'est
+    identifiable que si (a) suffisamment de protéines ont un comptage > 1 et
+    (b) la relation variance~comptage explique une part non négligeable de la
+    variance observée. Sans ça, l'ajustement loess est mal contraint (bascule
+    entre implémentations, quasi-singularités) et DEqMS n'apporte pas de gain
+    fiable sur limma seul.
+
+    Parameters
+    ----------
+    sigma2               : variance résiduelle par protéine (fit['sigma']**2,
+                            issu du lm_fit AVANT contrasts_fit/eBayes)
+    pep_count             : comptage peptidique par protéine (même ordre),
+                            NaN autorisé pour les protéines sans comptage
+    min_r2                : R² minimum de la régression log(variance) ~
+                            log2(comptage) sur le sous-ensemble informatif
+                            (comptage > 1) pour juger la relation exploitable
+    max_pseudocount_pct   : % maximum de protéines à comptage <= 1 (pseudo-
+                            comptées) au-delà duquel le signal est jugé trop
+                            dégénéré, même si le R² sur le sous-ensemble
+                            informatif est correct
+
+    Returns
+    -------
+    dict : pct_pseudocount, n_informative, r2, reliable (bool),
+           recommendation (str), plot (path ou None)
+    """
+    sigma2 = np.asarray(sigma2, dtype=float)
+    pep_count = np.asarray(pep_count, dtype=float)
+    valid = np.isfinite(pep_count) & np.isfinite(sigma2) & (sigma2 > 0)
+    n_total = len(pep_count)
+    pct_pseudocount = 100 * float(np.mean(~valid | (pep_count <= 1)))
+
+    informative = valid & (pep_count > 1)
+    n_informative = int(informative.sum())
+
+    if n_informative < 30:
+        r2 = None
+        reliable = False
+        reco = (f"Trop peu de protéines informatives (n={n_informative}) pour "
+                "évaluer la relation variance~comptage — DEqMS non fiable ici.")
+    else:
+        x = np.log2(pep_count[informative])
+        y = np.log(sigma2[informative])
+        r, _ = pearsonr(x, y)
+        r2 = float(r ** 2)
+        reliable = (pct_pseudocount < max_pseudocount_pct) and (r2 >= min_r2)
+        if reliable:
+            reco = (f"Relation variance~comptage exploitable (R²={r2:.3f} sur "
+                    f"{n_informative} protéines informatives, "
+                    f"{pct_pseudocount:.0f}% pseudocomptées) — DEqMS activé.")
+        elif r2 < min_r2:
+            reco = (f"R²={r2:.3f} < seuil ({min_r2}) : la variance n'est pas "
+                    "expliquée par le comptage peptidique sur ce run — DEqMS "
+                    "désactivé (limma seul utilisé). Forcer avec deqms_force: true.")
+        else:
+            reco = (f"{pct_pseudocount:.0f}% de protéines pseudocomptées "
+                    f"(seuil {max_pseudocount_pct:.0f}%) : trop de protéines "
+                    "sans signal de comptage exploitable — DEqMS désactivé. "
+                    "Forcer avec deqms_force: true.")
+
+    # --- Graphique diagnostic (dans le même style que diagnose_missingness) ---
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    axes[0].bar(["Informatives\n(count > 1)", "Pseudocomptées\n(count <= 1)"],
+                [100 - pct_pseudocount, pct_pseudocount],
+                color=["#5B8FF9", "#E8684A"], edgecolor="black", lw=0.5)
+    axes[0].set_ylabel("% des protéines")
+    axes[0].set_title(f"Comptage peptidique (n = {n_total:,} protéines)",
+                      fontweight="bold", fontsize=11)
+    axes[0].set_ylim(0, 105)
+
+    if n_informative >= 30:
+        axes[1].scatter(x, y, s=8, alpha=0.35, color="#5B8FF9")
+        order = np.argsort(x)
+        b = np.polyfit(x, y, 1)
+        axes[1].plot(np.sort(x), np.polyval(b, np.sort(x)), color="#E8684A", lw=2)
+        axes[1].set_title(f"Variance ~ comptage (R²={r2:.3f})",
+                          fontweight="bold", fontsize=11)
+    else:
+        axes[1].text(0.5, 0.5, "Trop peu de protéines\ninformatives",
+                    ha="center", va="center", transform=axes[1].transAxes)
+    axes[1].set_xlabel("log2(comptage peptidique)")
+    axes[1].set_ylabel("log(variance résiduelle)")
+    fig.suptitle("Diagnostic de fiabilité DEqMS", fontsize=13,
+                fontweight="bold", y=1.02)
+    fig.tight_layout()
+    f = os.path.join(out_dir, "diagnostic_deqms.png")
+    fig.savefig(f, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    metrics = {
+        "pct_pseudocount": round(pct_pseudocount, 1),
+        "n_informative": n_informative,
+        "r2": round(r2, 3) if r2 is not None else None,
+        "reliable": reliable,
+        "recommendation": reco,
+        "plot": f,
+    }
+    print(f"  [STATS] DEqMS diagnostic: {pct_pseudocount:.0f}% pseudocomptées, "
+          f"R²={r2 if r2 is not None else 'N/A'} sur {n_informative} "
+          "protéines informatives")
+    print(f"     -> {reco}")
+    return metrics
+
+
 def plot_imputation(mat_filt: pd.DataFrame, mat_imp: pd.DataFrame,
                     out_dir: str) -> str:
     """Superposition avant/après imputation."""
@@ -1037,16 +1404,35 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         if (n_cond_per_subj >= 2).any() and n_subj >= 2 and n_subj < len(subjects):
             paired = True
 
+    # --- Détection auto d'une condition "contrôle" -> dénominateur systématique
+    #     dans tous les contrastes ("exp_vs_ctl" plutôt que "ctl_vs_exp"),
+    #     par défaut. Surchargeable/désactivable via params (control_condition
+    #     explicite, ou control_condition=False pour désactiver totalement).
+    _cfg_ctl = params.get("control_condition", "__auto__")
+    if _cfg_ctl is False:
+        control_condition = None
+    elif _cfg_ctl and _cfg_ctl != "__auto__":
+        control_condition = detect_control_condition(
+            list(dict.fromkeys(conditions.tolist())), explicit=_cfg_ctl)
+    else:
+        control_condition = detect_control_condition(
+            list(dict.fromkeys(conditions.tolist())),
+            synonyms=params.get("control_synonyms"))
+    if control_condition:
+        print(f"[MODEL] Condition contrôle détectée : '{control_condition}' "
+              f"-> dénominateur systématique (ex: exp_vs_{control_condition}).")
+
     if paired:
         design_mat, group_names, all_cols = make_paired_design_matrix(
-            conditions.tolist(), subjects.tolist())
+            conditions.tolist(), subjects.tolist(), control_condition=control_condition)
         contrast_mat, contrast_names = make_all_contrasts(
             group_names, n_total_cols=len(all_cols))
         n_subj_terms = len(all_cols) - len(group_names)
         print(f"\n[MODEL] PAIRED design (~0 + condition + subject): "
               f"{n_subj} subjects, {n_subj_terms} subject terms absorbed.")
     else:
-        design_mat, group_names = make_design_matrix(conditions.tolist())
+        design_mat, group_names = make_design_matrix(
+            conditions.tolist(), control_condition=control_condition)
         contrast_mat, contrast_names = make_all_contrasts(group_names)
 
     print(f"[MODEL] {len(contrast_names)} contrasts generated: "
@@ -1059,6 +1445,24 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
     fit_e = ebayes(fit_c, fdr_global=fdr_global)
     print(f"  [OK] limma eBayes model computed "
           f"(FDR {'global' if fdr_global else 'per contrast'})")
+
+    # --- Diagnostic de fiabilité DEqMS (objective l'activation, comme le
+    #     diagnostic de missingness objective le choix d'imputation) ---
+    deqms_diag = None
+    if pep_count is not None:
+        names_order = meta["name"].values if "name" in meta.columns else None
+        pc_for_diag = (pep_count.reindex(names_order).values
+                       if names_order is not None else pep_count.values)
+        deqms_diag = diagnose_deqms_reliability(
+            fit["sigma"] ** 2, pc_for_diag, out_dir,
+            min_r2=params.get("deqms_min_r2", 0.10),
+            max_pseudocount_pct=params.get("deqms_max_pseudocount_pct", 50.0),
+        )
+        deqms_force = params.get("deqms_force", False)
+        if not deqms_diag["reliable"] and not deqms_force:
+            print("  [WARN] DEqMS diagnostic unfavorable — disabling DEqMS "
+                  "for this run (set deqms_force: true to override).")
+            pep_count = None
 
     # --- Modèle DEqMS (optionnel, en parallèle) ---
     fit_dq = None
@@ -2523,7 +2927,9 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
         df_comp_src["imputed"] = imputation_info["imputed"].values
         df_comp_src["num_NAs"] = imputation_info["num_NAs"].values
     cols_keep = ["name", "Protein.Group", "Genes",
-                 "First.Protein.Description", "N.Sequences"]
+                 "First.Protein.Description"]
+    if "N.Sequences" in df_comp_src.columns:
+        cols_keep.append("N.Sequences")
     for extra in ("imputed", "num_NAs"):
         if extra in df_comp_src.columns:
             cols_keep.append(extra)
@@ -3248,10 +3654,20 @@ def main():
     make_dash   = params["make_dashboard"]
     use_deqms   = params["use_deqms"]
 
-    # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None
-    _go_org   = params.get("go_organism")
-    go_params = ({"organism": _go_org, "run_gsea": params.get("run_gsea", False)}
-                 if (_GO_AVAILABLE and _go_org) else None)
+    # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None.
+    # Mode Perseverance (annotation par orthologie) : independant de gProfiler/go_organism,
+    # active des que perseverance_annotation_path est fourni.
+    _go_org = params.get("go_organism")
+    _perseverance_path = params.get("perseverance_annotation_path")
+    if _perseverance_path:
+        _perseverance_annot = pd.read_csv(_perseverance_path, sep="\t")
+        go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
+                    "custom_annotation": _perseverance_annot, "background": None}
+        print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "
+              f"({len(_perseverance_annot)} proteines annotees)")
+    else:
+        go_params = ({"organism": _go_org, "run_gsea": params.get("run_gsea", False)}
+                     if (_GO_AVAILABLE and _go_org) else None)
 
     _makedirs(out_dir)
 
@@ -3262,6 +3678,68 @@ def main():
     # --- 1. Chargement ---
     tsv, design = load_data(tsv_path, design_path)
 
+    # --- 1bis. Détection multi-organismes (host/pathogen ou plus) ---
+    # Générique : repose sur le suffixe '_TAG' de Protein.Names, pas sur une
+    # liste fixe (MAGGI/OSHVF ne sont pas codés en dur — n'importe quelle
+    # fusion de FASTA avec cette convention est détectée automatiquement).
+    species_tag = detect_species_tags(tsv)
+    tag_counts = species_tag.value_counts(dropna=True)
+
+    do_split = False
+    if len(tag_counts) > 1:
+        if go_params and go_params.get("custom_annotation") is not None:
+            print(f"  [WARN] perseverance_annotation_path est partagé entre les "
+                  f"{len(tag_counts)} organismes détectés (même limite que "
+                  f"go_organism actuellement) — l'annotation Perseverance ne "
+                  f"couvrira correctement que l'organisme dont elle provient. "
+                  f"Fournir une annotation par organisme nécessiterait de "
+                  f"reconstruire go_params à l'intérieur de la boucle.")
+        cfg_split = params.get("species_split")   # None si absent du YAML
+        if cfg_split is None:
+            do_split = ask_species_split(tag_counts)
+        else:
+            do_split = bool(cfg_split)
+            print(f"\n[CONFIG] species_split={do_split} (from config)")
+    elif len(tag_counts) == 1:
+        print(f"\n[INFO] Single organism detected (_{tag_counts.index[0]}) "
+              f"— no split needed.")
+    else:
+        print("\n[INFO] No recognizable '_TAG' suffix in Protein.Names "
+              "— running as a single combined dataset.")
+
+    if do_split:
+        subsets = [(tag, tsv[species_tag == tag].reset_index(drop=True))
+                   for tag in tag_counts.index]
+        n_unassigned = int(species_tag.isna().sum())
+        if n_unassigned:
+            print(f"  [WARN] {n_unassigned} protein group(s) without a recognizable "
+                  f"organism suffix — excluded from the split (check Protein.Names).")
+    else:
+        subsets = [(None, tsv)]
+
+    base_out_dir = out_dir
+    for tag, tsv_subset in subsets:
+        run_out_dir = os.path.join(base_out_dir, tag) if tag else base_out_dir
+        _makedirs(run_out_dir)
+        label = tag or "combined"
+        print(f"\n{'='*60}\n  RUN: {label}  ({len(tsv_subset)} protein groups)\n{'='*60}")
+        run_pipeline_core(
+            tsv=tsv_subset, design=design, out_dir=run_out_dir, pr_path=pr_path,
+            params=params, go_params=go_params, make_wgcna=make_wgcna,
+            make_dash=make_dash, use_deqms=use_deqms,
+        )
+
+
+def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
+                       pr_path: str, params: dict, go_params: "dict | None",
+                       make_wgcna: bool, make_dash: bool, use_deqms: bool):
+    """
+    Corps du pipeline DEP pour UN dataset déjà résolu (organisme unique, ou
+    dataset combiné si l'utilisateur a refusé la scission). Appelé une fois
+    (mono-organisme) ou en boucle, une fois par organisme détecté, avec un
+    out_dir dédié à chacun — jamais de FDR, imputation ou normalisation
+    partagés entre organismes.
+    """
     # --- 2. Matrice expression ---
     mat_log2, meta, design_filt, lfq_cols = build_expression_matrix(tsv, design)
 
@@ -3414,11 +3892,23 @@ def main():
     if wgcna_results is not None:
         export_wgcna_sheets(wb, wgcna_results, _write_df, _ins_img)
 
+    # --- 13bis. Perseverance (orthologues, optionnel) — APRÈS les stats, AVANT le GO ---
+    # Ne mute PAS le go_params partagé entre sous-espèces (boucle multi-especes) :
+    # on travaille sur une copie locale, propre à ce subset.
+    local_go_params = dict(go_params) if go_params else None
+    correspondence_df, persev_override = run_perseverance_step(df_results, params, out_dir)
+    if correspondence_df is not None:
+        export_perseverance_sheet(wb, correspondence_df, _write_df)
+        print(f"  [OK] Orthologues_Perseverance sheet added "
+              f"({len(correspondence_df)} correspondances).")
+    if persev_override is not None:
+        local_go_params = {**(local_go_params or {}), **persev_override}
+
     # --- 14. Enrichissement GO/gProfiler (optionnel, non bloquant) ---
-    if go_params is not None:
+    if local_go_params is not None:
         print("\n[STEP] GO enrichment...")
         go_results = run_go_enrichment(
-            df_results, contrast_names, params, go_params, out_dir)
+            df_results, contrast_names, params, local_go_params, out_dir)
         if go_results:
             export_go_sheets(wb, go_results, _write_df, _ins_img)
             print(f"  [OK] {len(go_results)} GO sheet(s) added.")
@@ -3449,7 +3939,7 @@ def main():
 
     print(f"\n[DONE] Full pipeline finished.")
     print(f"   -> {output_name}")
-    suffix_go = " + GO" if go_params is not None else ""
+    suffix_go = " + GO" if local_go_params is not None else ""
     print(f"   Sheets: DEP + UMAP + WGCNA{suffix_go} in a single file.")
 
     # --- 15. Dashboard HTML interactif (optionnel, non bloquant) ---
