@@ -40,10 +40,22 @@ _DEFAULTS = {
     "n_iter_robustness":   0,
     # Correction FDR
     "fdr_global":          False,
+    # Contrastes : "__auto__" = tous (question au-delà de 30) | "all" |
+    # liste de motifs "A_vs_B", {x} = même valeur des deux côtés, * = libre
+    # ex: ["Live_{s}_vs_Heat_killed_{s}"]
+    "contrasts":           "__auto__",
     # Imputation
-    "impute_method":       "qrilc",
+    "impute_method":       "auto",   # auto (diagnostic) | qrilc | mixed
+    "seed":                42,      # graine du tirage d'imputation (reproductibilité)
     # Modules optionnels
     "go_organism":         None,    # None = désactivé
+    "go_backend":          "gprofiler",  # "gprofiler" | "string" (bactéries, non-modèles)
+    "go_species_taxid":    None,    # si go_backend == "string" : "auto" (détection depuis les accessions) ou taxid de SOUCHE (ex: 511145)
+    "string_caller_identity": "Proteogen",  # identifiant appelant STRING (pas de donnée perso)
+    "string_background":   "genome",     # "genome" (défaut STRING) | "quantified" (protéines quantifiées)
+    "string_reference_taxid": None,  # mode orthologie : organisme STRING cible (défaut : espèce parente via UniProt)
+    "string_reference_fasta": None,  # protéome STRING local (sinon dossier des données, puis téléchargement)
+    "string_categories":   None,    # None = GO:BP/MF/CC + KEGG + Reactome ; ex: [Process, KEGG, Keyword, Pfam]
     "perseverance_annotation_path": None,  # TSV Perseverance (protein_id, GO, KEGG, Pfam) -> ORA local, independant de go_organism
     "control_condition":   "__auto__",  # "__auto__"=detection par synonymes, str=explicite, False=desactive
     "control_synonyms":    None,     # None = liste par defaut (ctl, ctrl, control, wt, mock...)
@@ -54,6 +66,7 @@ _DEFAULTS = {
     "perseverance_min_identity": 25.0,
     "perseverance_min_coverage": 50.0,
     "run_gsea":            False,    # GSEA rank-based (optionnel, complément ORA)
+    "qc_only":             False,   # True = données brutes + M&M + figures QC seulement (auto si aucun réplicat)
     "make_wgcna":          False,
     "make_dashboard":      True,
     "use_deqms":           False,
@@ -121,8 +134,31 @@ def _validate(params: dict) -> list[str]:
         errors.append(f"  n_heatmap_clusters doit être ≥ 2")
     if params.get("n_iter_robustness", 0) < 0:
         errors.append(f"  n_iter_robustness doit être ≥ 0 (0 = désactivé)")
-    if params.get("impute_method") not in ("qrilc", "mixed"):
-        errors.append(f"  impute_method doit être 'qrilc' ou 'mixed'")
+    try:
+        int(params.get("seed", 42))
+    except (TypeError, ValueError):
+        errors.append(f"  seed doit être un entier")
+    if params.get("impute_method") not in ("auto", "qrilc", "mixed"):
+        errors.append(f"  impute_method doit être 'auto', 'qrilc' ou 'mixed'")
+    backend = params.get("go_backend", "gprofiler")
+    if backend not in ("gprofiler", "string"):
+        errors.append(f"  go_backend doit être 'gprofiler' ou 'string' (valeur : {backend!r})")
+    _tx = params.get("go_species_taxid")
+    if backend == "string" and _tx is not None and str(_tx).lower() != "auto":
+        try:
+            int(_tx)
+        except (TypeError, ValueError):
+            errors.append(f"  go_species_taxid doit être un entier (NCBI taxid) "
+                          f"ou 'auto', valeur : {_tx!r}")
+    _ct = params.get("contrasts", "__auto__")
+    if _ct not in (None, "all", "__auto__"):
+        _items = [_ct] if isinstance(_ct, str) else _ct
+        if not isinstance(_items, list) or not all(
+                isinstance(x, str) and x.count("_vs_") == 1 for x in _items):
+            errors.append(f"  contrasts : liste de motifs 'A_vs_B' attendue "
+                          f"(ou 'all'), valeur : {_ct!r}")
+    if params.get("string_background", "genome") not in ("genome", "quantified"):
+        errors.append(f"  string_background doit être 'genome' ou 'quantified'")
     return errors
 
 
@@ -197,9 +233,16 @@ def print_config_summary(params: dict) -> None:
     fdr_txt = "global (whole study)" if params["fdr_global"] else "per contrast"
     rob_txt = ("disabled" if params["n_iter_robustness"] == 0
                else f"{params['n_iter_robustness']} iterations")
-    imp_txt = ("QRILC (pure MNAR)" if params["impute_method"] == "qrilc"
-               else "Mixed (QRILC + kNN)")
-    go_txt  = params.get("go_organism") or "no"
+    imp_txt = {"qrilc": "QRILC (pure MNAR)", "mixed": "Mixed (QRILC + kNN)",
+               "auto": "Auto (Mixed if >= 20% MAR, else QRILC)"}.get(
+               params.get("impute_method", "auto"), str(params.get("impute_method")))
+    if params.get("go_backend", "gprofiler") == "string":
+        go_txt = (f"STRING, taxid {params['go_species_taxid']} "
+                  f"(background: {params.get('string_background', 'genome')})"
+                  if params.get("go_species_taxid") else "no (STRING without taxid)")
+    else:
+        go_txt = (f"gProfiler, {params['go_organism']}"
+                  if params.get("go_organism") else "no")
     wgcna_txt = "yes" if params.get("make_wgcna") else "no"
     dash_txt  = "yes" if params.get("make_dashboard") else "no"
     deqms_txt = "yes" if params.get("use_deqms") else "no"
@@ -212,8 +255,15 @@ def print_config_summary(params: dict) -> None:
     print(f"     Heatmap clusters    -> {params['n_heatmap_clusters']}")
     print(f"     Robustness          -> {rob_txt}")
     print(f"     FDR correction      -> {fdr_txt}")
+    _ct = params.get("contrasts", "__auto__")
+    ct_txt = ("all pairs (question if > 30)" if _ct == "__auto__"
+              else "all pairs" if _ct in (None, "all")
+              else ", ".join([_ct] if isinstance(_ct, str) else _ct))
+    print(f"     Contrasts           -> {ct_txt}")
     print(f"     Imputation          -> {imp_txt}")
-    print(f"     GO (organism)       -> {go_txt}")
+    print(f"     GO enrichment       -> {go_txt}")
+    if params.get("qc_only"):
+        print(f"     Mode                -> QC ONLY (raw data + M&M + QC figures)")
     print(f"     WGCNA               -> {wgcna_txt}")
     print(f"     Dashboard           -> {dash_txt}")
     print(f"     DEqMS               -> {deqms_txt}")
@@ -263,6 +313,13 @@ def parse_cli_args() -> argparse.Namespace:
         metavar="proteomics_output",
         default=None,
         help="Dossier de sortie (surcharge la config).",
+    )
+    parser.add_argument(
+        "--qc-only",
+        action="store_true",
+        help=("Mode QC seul : Excel avec données brutes, M&M et figures QC, sans "
+              "statistiques (activé automatiquement si aucune condition n'a de "
+              "réplicat)."),
     )
     parser.add_argument(
         "--batch-column",
@@ -354,6 +411,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.design:  params["design_path"] = args.design
         if args.out_dir: params["out_dir"]     = args.out_dir
         if args.batch_column: params["batch_column"] = args.batch_column
+        if getattr(args, "qc_only", False): params["qc_only"] = True
 
         # Les flags optionnels liés à la présence de fichiers/modules
         # peuvent ne pas être dans la config — on les complète
@@ -382,6 +440,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.design:  reloaded["design_path"] = args.design
         if args.out_dir: reloaded["out_dir"]      = args.out_dir
         if args.batch_column: reloaded["batch_column"] = args.batch_column
+        if getattr(args, "qc_only", False): reloaded["qc_only"] = True
         return reloaded
 
     # ── C. Questions interactives ──────────────────────────────────────────────
@@ -395,17 +454,22 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
     if args.design:  params["design_path"] = args.design
     if args.out_dir: params["out_dir"]     = args.out_dir
     if args.batch_column: params["batch_column"] = args.batch_column
+    if getattr(args, "qc_only", False): params["qc_only"] = True
 
-    # GO
-    go_organism = None
-    run_gsea = False
+    # GO — toutes les clés renvoyées par ask_go_params() sont reportées dans
+    # params (sinon le choix STRING serait perdu et last_config.yaml aussi).
+    params["go_organism"] = None
+    params["run_gsea"] = False
     if go_available:
         go_result = ask_go_params_fn()
         if go_result:
-            go_organism = go_result.get("organism")
-            run_gsea = bool(go_result.get("run_gsea", False))
-    params["go_organism"] = go_organism
-    params["run_gsea"] = run_gsea
+            params["go_organism"] = go_result.get("organism")
+            params["run_gsea"] = bool(go_result.get("run_gsea", False))
+            params["go_backend"] = go_result.get("backend", "gprofiler")
+            params["go_species_taxid"] = go_result.get("species_taxid")
+            params["string_caller_identity"] = (go_result.get("caller_identity")
+                                                or _DEFAULTS["string_caller_identity"])
+            params["string_background"] = go_result.get("string_background", "genome")
 
     # WGCNA
     rep = input("\n  Run the WGCNA co-expression analysis? "
@@ -480,10 +544,17 @@ n_heatmap_clusters:  3
 # ── Options d'analyse ────────────────────────────────────────────────────────
 n_iter_robustness:   100          # 0 = désactivé
 fdr_global:          false        # true = correction BH sur toutes les p-values
-impute_method:       qrilc        # 'qrilc' ou 'mixed'
+contrasts:           __auto__     # 'all', ou liste de motifs, ex :
+                                  #   - "Live_{s}_vs_Heat_killed_{s}"   ({s} = même souche des deux côtés)
+                                  #   - "Live_*_vs_Live_*"              (* = libre)
+impute_method:       auto         # 'auto' (choix par le diagnostic), 'qrilc' ou 'mixed'
+seed:                42           # graine de l'imputation (résultats reproductibles)
 
 # ── Modules optionnels ───────────────────────────────────────────────────────
 go_organism:         null          # ex: 'bnapus', 'hsapiens', null = désactivé
+go_backend:          gprofiler     # 'gprofiler' ou 'string' (bactéries / non-modèles)
+go_species_taxid:    auto          # si go_backend = string : auto, ou taxid de SOUCHE (ex: 511145 = E. coli K-12 MG1655)
+string_background:   genome        # 'genome' ou 'quantified' (protéines quantifiées)
 make_wgcna:          false
 make_dashboard:      true
 use_deqms:           false

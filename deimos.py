@@ -54,7 +54,10 @@ try:
                                export_go_sheets,
                                run_go_enrichment_clusters,
                                export_go_cluster_sheets,
-                               diagnose_gprofiler_coverage)
+                               diagnose_gprofiler_coverage,
+                               plan_string_mapping,
+                               download_string_proteome,
+                               download_uniprot_fasta)
     _GO_AVAILABLE = True
 except ImportError:
     _GO_AVAILABLE = False
@@ -74,6 +77,10 @@ try:
     _PERSEVERANCE_AVAILABLE = True
 except ImportError:
     _PERSEVERANCE_AVAILABLE = False
+try:   # isolé : une ancienne copie sans ce helper ne doit pas désactiver Perseverance
+    from deimos_to_perseverance import _fasta_accessions
+except ImportError:
+    _fasta_accessions = None
 
 # Module config YAML réutilisable
 from config import resolve_config
@@ -184,16 +191,19 @@ def ask_params() -> dict:
     imp_method = None
     while imp_method is None:
         print("\n  Missing-value imputation:")
-        print("    [1] QRILC (pure MNAR — default, suited to DIA)")
-        print("    [2] Mixed (QRILC if fully absent in a condition, kNN otherwise)")
-        print("        [!] kNN may inflate power if MAR is dominant (see diagnostic)")
+        print("    [1] Auto (default) — chosen by the missingness diagnostic:")
+        print("        Mixed if >= 20% of missing values are MAR, QRILC otherwise")
+        print("    [2] QRILC (pure MNAR — every missing value imputed low)")
+        print("    [3] Mixed (QRILC if fully absent in a condition, kNN otherwise)")
         raw = input("  -> ").strip()
         if raw in ("", "1"):
-            imp_method = "qrilc"
+            imp_method = "auto"
         elif raw == "2":
+            imp_method = "qrilc"
+        elif raw == "3":
             imp_method = "mixed"
         else:
-            print("  Answer: 1 or 2.")
+            print("  Answer: 1, 2 or 3.")
 
     params = {
         "volcano_use_padj":  v_type == "2",
@@ -206,6 +216,7 @@ def ask_params() -> dict:
         "n_iter_robustness": n_iter_rob,
         "fdr_global": fdr_global,
         "impute_method": imp_method,
+        "seed": 42,
     }
 
     print("\n  [OK] Parameters saved:")
@@ -215,7 +226,7 @@ def ask_params() -> dict:
     print(f"     Robustness          -> {'disabled' if n_iter_rob == 0 else str(n_iter_rob) + ' iterations'}")
     _fdr_txt = "global (whole study)" if fdr_global else "per contrast"
     print(f"     FDR correction      -> {_fdr_txt}")
-    print(f"     Imputation          -> {'QRILC (MNAR)' if imp_method == 'qrilc' else 'Mixed (MNAR+MAR)'}")
+    print(f"     Imputation          -> {dict(auto='Auto (diagnostic-driven)', qrilc='QRILC (MNAR)', mixed='Mixed (MNAR+MAR)')[imp_method]}")
     print()
     return params
 
@@ -438,7 +449,16 @@ def detect_species_tags(tsv: pd.DataFrame, col: str = "Protein.Names") -> pd.Ser
     reconnu (protéine sans tag exploitable — ni perdue ni mal classée).
     """
     first_entry = tsv[col].astype(str).str.split(";").str[0]
-    return first_entry.str.extract(r"_([A-Za-z0-9]{3,10})$")[0]
+    tags = first_entry.str.extract(r"_([A-Za-z0-9]{3,10})$")[0]
+    # Contaminants (cRAP-, CON__, contam_...) : leurs suffixes _HUMAN/_BOVIN
+    # (kératines, trypsine...) ne sont pas des organismes de l'étude —
+    # sinon la question du split multi-espèces est posée à tort.
+    pg = (tsv["Protein.Group"].astype(str) if "Protein.Group" in tsv.columns
+          else first_entry)
+    contam = (pg.str.lower().str.startswith(("crap", "con_", "contam"))
+              | first_entry.str.lower().str.startswith(("crap", "con_", "contam")))
+    tags[contam] = np.nan
+    return tags
 
 
 def ask_species_split(tag_counts: pd.Series) -> bool:
@@ -621,7 +641,7 @@ def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
     try:
         rbh_df = compute_rbh(query_fasta, reference_fasta, persev_dir,
                              min_identity=min_identity, min_coverage=min_coverage)
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:   # OSError : DIAMOND introuvable (WinError 2)
         print(f"  [ERREUR] Perseverance/DIAMOND a échoué ({e}) — étape ignorée, "
               f"le pipeline continue sans orthologues.")
         return None, None
@@ -660,11 +680,119 @@ def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
     return correspondence_df, go_override
 
 
-def export_perseverance_sheet(wb, correspondence_df: pd.DataFrame, _write_df) -> None:
+def run_string_ortholog_step(df_results: pd.DataFrame, params: dict,
+                             go_params: dict, out_dir: str
+                             ) -> "tuple[pd.DataFrame | None, dict | None]":
+    """
+    Mode orthologie du backend STRING (décidé au pré-vol) : l'organisme est
+    dans STRING mais pas les accessions du run (STRING indexe une autre
+    souche). RBH DIAMOND entre les protéines quantifiées et le protéome
+    STRING, dont les en-têtes sont les identifiants STRING : l'enrichissement
+    STRING se fait directement dessus, puis les résultats sont retraduits
+    vers les accessions du run (go_enrichment.string_maps_from_orthologs).
+
+    Returns (correspondence_df, {"ortholog_map": ...}) ou (None, None).
+    """
+    if not _PERSEVERANCE_AVAILABLE:
+        print("  [WARN] Modules rbh/deimos_to_perseverance absents — "
+              "orthologie STRING impossible.")
+        return None, None
+    taxid = go_params.get("species_taxid")
+    caller = go_params.get("caller_identity") or "Proteogen"
+    print(f"\n[STEP] Orthologie vers STRING (RBH DIAMOND) — protéome {taxid}...")
+    work = os.path.join(out_dir, "string_orthologs")
+    _makedirs(work)
+    data_dir = os.path.dirname(os.path.abspath(params.get("tsv_path", ".")))
+    scan_dirs = list(dict.fromkeys([data_dir, os.getcwd()]))
+
+    # 1. Protéome de référence STRING : config > dossier des données > téléchargement
+    ref = params.get("string_reference_fasta")
+    if ref and not os.path.isfile(ref):
+        print(f"  [WARN] string_reference_fasta introuvable ({ref}).")
+        ref = None
+    if not ref:
+        for d in scan_dirs:
+            for f in _scan_fasta_files(d):
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    if fh.readline().startswith(f">{taxid}."):
+                        ref = f
+                        break
+            if ref:
+                print(f"  [AUTO] Protéome STRING trouvé : {ref}")
+                break
+    if not ref:
+        ref = download_string_proteome(taxid, work, caller)
+    if not ref:
+        return None, None
+
+    # 2. Séquences des protéines quantifiées : FASTA de recherche local si
+    #    trouvé (>= 50 % des protéines), sinon téléchargement UniProt
+    id_col = "name" if "name" in df_results.columns else df_results.columns[0]
+    protein_groups = df_results[id_col].astype(str).tolist()
+    wanted = {pg.split(";")[0].strip() for pg in protein_groups}
+    best, best_ov = None, 0.0
+    for d in (scan_dirs if _fasta_accessions is not None else []):
+        for f in _scan_fasta_files(d):
+            if os.path.abspath(f) == os.path.abspath(ref):
+                continue
+            try:
+                ov = len(wanted & _fasta_accessions(f)) / max(len(wanted), 1)
+            except Exception:
+                continue
+            if ov > best_ov:
+                best, best_ov = f, ov
+    if best and best_ov >= 0.5:
+        search = best
+        print(f"  [AUTO] FASTA de recherche : {os.path.basename(best)} "
+              f"({best_ov:.0%} des protéines du run)")
+    else:
+        search = os.path.join(work, "uniprot_sequences.fasta")
+        print("  [AUTO] FASTA de recherche non trouvé localement — séquences "
+              "téléchargées depuis UniProt...")
+        n = download_uniprot_fasta(sorted(wanted), search)
+        print(f"  [OK] {n} séquences UniProt.")
+        if n == 0:
+            return None, None
+
+    query_fasta = os.path.join(work, "query.fasta")
+    mapping_tsv = os.path.join(work, "mapping.tsv")
+    export_query_fasta(search, protein_groups, query_fasta, mapping_tsv)
+
+    # 3. RBH
+    try:
+        rbh = compute_rbh(query_fasta, ref, work,
+                          min_identity=params.get("perseverance_min_identity", 25.0),
+                          min_coverage=params.get("perseverance_min_coverage", 50.0))
+    except (RuntimeError, OSError) as e:
+        print(f"  [ERREUR] DIAMOND a échoué ({e}) — GO STRING ignoré.")
+        return None, None
+    if rbh.empty:
+        print("  [WARN] Aucun orthologue RBH trouvé.")
+        return None, None
+
+    ortholog_map = build_ortholog_map(rbh, mapping_tsv)
+    n_high = int((rbh["confidence"] == "high").sum())
+    print(f"  [OK] {len(ortholog_map)}/{len(protein_groups)} protéines avec un "
+          f"orthologue STRING (identité médiane {rbh['pident'].median():.0f} %, "
+          f"{n_high} paires de confiance haute).")
+
+    mapping = pd.read_csv(mapping_tsv, sep="\t")
+    corr = mapping.merge(rbh, left_on="accession", right_on="query_id", how="inner")
+    corr["protein_id"] = corr["protein_group"].astype(str).str.split(";").str[0]
+    corr = (corr.sort_values("bitscore", ascending=False)
+            .drop_duplicates("protein_id", keep="first"))
+    correspondence_df = corr[["protein_id", "reference_id", "pident", "coverage",
+                              "confidence"]].rename(
+        columns={"reference_id": "string_id"}).reset_index(drop=True)
+    return correspondence_df, {"ortholog_map": ortholog_map}
+
+
+def export_perseverance_sheet(wb, correspondence_df: pd.DataFrame, _write_df,
+                              sheet_name: str = "Orthologues_Perseverance") -> None:
     """Ajoute l'onglet de correspondance protéine/orthologue au classeur Excel."""
     if correspondence_df is None or correspondence_df.empty:
         return
-    ws = wb.create_sheet("Orthologues_Perseverance")
+    ws = wb.create_sheet(sheet_name)
     _write_df(ws, correspondence_df)
 
 
@@ -991,13 +1119,46 @@ def impute_minprob(mat: pd.DataFrame, q: float = 0.01, rng=None) -> pd.DataFrame
     return mat_imp
 
 
-def impute_qrilc(mat: pd.DataFrame, rng=None) -> pd.DataFrame:
+def _qrilc_fit(obs: np.ndarray, p_miss: float, upper_q: float = 0.99):
+    """
+    Estimation QRILC des paramètres (µ, σ) de la distribution log2 COMPLÈTE
+    (observées + manquantes) d'un échantillon, à partir des seules valeurs
+    observées — Lazar et al. 2016, algorithme de imputeLCMD::impute.QRILC.
+
+    Hypothèse : censure à gauche, i.e. les p_miss valeurs manquantes sont les
+    plus basses. Le quantile p des OBSERVÉES correspond alors au quantile
+    p_miss + p·(1 - p_miss) de la distribution complète. On régresse les
+    quantiles observés sur les quantiles N(0,1) correspondants :
+        q_obs(p) = µ + σ · Φ⁻¹(p_miss + p·(1 - p_miss))
+    -> intercept = µ, pente = σ (fit OLS sur une grille de 100 quantiles).
+    Contrairement à mean/sd des observées (µ biaisé vers le haut, σ vers le
+    bas par la troncature), l'estimation est non biaisée sous censure à gauche.
+    """
+    from scipy.stats import norm
+    probs_obs = np.linspace(0.001, upper_q, 100)
+    q_obs = np.quantile(obs, probs_obs)
+    z = norm.ppf(p_miss + probs_obs * (1.0 - p_miss))
+    sigma, mu = np.polyfit(z, q_obs, 1)
+    return float(mu), float(sigma)
+
+
+def impute_qrilc(mat: pd.DataFrame, rng=None, tune_sigma: float = 1.0,
+                 min_obs: int = 5) -> pd.DataFrame:
     """
     QRILC — Quantile Regression Imputation of Left-Censored data (Lazar 2016).
-    Imputation MNAR rigoureuse : modélise la queue gauche comme censurée et
-    tire dans une normale TRONQUÉE sous le seuil de détection estimé par
-    régression quantile. Contrairement à MinProb, les valeurs imputées sont
-    garanties basses (jamais au-dessus du seuil). Adapté au DIA (MNAR dominant).
+
+    Par échantillon :
+      1. µ, σ de la distribution complète estimés par régression quantile
+         (voir _qrilc_fit) ;
+      2. seuil de censure = Φ⁻¹(p_miss ; µ, σ) ;
+      3. tirage des manquantes dans N(µ, (tune_sigma·σ)²) TRONQUÉE à droite
+         au seuil -> valeurs imputées toujours sous la limite de détection
+         estimée, et d'autant plus basses que l'échantillon a peu de NA.
+
+    Écart assumé vs imputeLCMD : le code R passe l'écart-type comme argument
+    `sigma` de tmvtnorm::rtmvnorm, qui attend une VARIANCE ; ici on tire avec
+    l'écart-type estimé, conformément au modèle décrit dans l'article.
+    Repli : < min_obs valeurs observées ou fit dégénéré -> minimum observé.
     """
     from scipy.stats import norm, truncnorm
     if rng is None:
@@ -1005,24 +1166,25 @@ def impute_qrilc(mat: pd.DataFrame, rng=None) -> pd.DataFrame:
     mat_imp = mat.copy()
     for col in mat_imp.columns:
         s = mat_imp[col]
-        obs = s.dropna().values
-        n_miss = int(s.isna().sum())
-        if n_miss == 0 or len(obs) < 3:
-            if n_miss > 0 and len(obs) > 0:
-                mat_imp.loc[s.isna(), col] = obs.min()
+        na = s.isna().values
+        n_miss = int(na.sum())
+        if n_miss == 0:
             continue
-        mu, sigma = np.mean(obs), np.std(obs)
-        if sigma <= 0:
-            mat_imp.loc[s.isna(), col] = mu
+        obs = s.values[~na].astype(float)
+        if len(obs) < min_obs:
+            if len(obs) > 0:
+                mat_imp.loc[na, col] = obs.min()
             continue
-        # Proportion manquante → quantile de censure
         p_miss = n_miss / len(s)
-        q_censor = norm.ppf(max(p_miss, 1e-4), loc=mu, scale=sigma)
-        # Tirage dans la normale tronquée à droite par q_censor
-        a, b = -np.inf, (q_censor - mu) / sigma
-        draws = truncnorm.rvs(a, b, loc=mu, scale=sigma, size=n_miss,
-                              random_state=rng)
-        mat_imp.loc[s.isna(), col] = draws
+        mu, sigma = _qrilc_fit(obs, p_miss)
+        if not np.isfinite(sigma) or sigma <= 0:
+            mat_imp.loc[na, col] = obs.min()
+            continue
+        sd = sigma * tune_sigma
+        upper = norm.ppf(p_miss, loc=mu, scale=sigma)
+        draws = truncnorm.rvs(-np.inf, (upper - mu) / sd, loc=mu, scale=sd,
+                              size=n_miss, random_state=rng)
+        mat_imp.loc[na, col] = draws
     return mat_imp
 
 
@@ -1080,6 +1242,11 @@ def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None) -> pd.DataFr
                 # Partiellement présent → MAR → kNN
                 out[i, miss_here] = knn_full[i, miss_here]
     return pd.DataFrame(out, index=mat.index, columns=mat.columns)
+
+
+# Seuil du mode impute_method='auto' : part de NA « MAR » (protéine présente
+# dans >= 1 réplicat de la condition) au-delà de laquelle on passe en MIXED.
+AUTO_MIXED_MAR_PCT = 20.0
 
 
 def impute(mat: pd.DataFrame, method: str = "qrilc",
@@ -1330,7 +1497,7 @@ def plot_imputation(mat_filt: pd.DataFrame, mat_imp: pd.DataFrame,
     ax.hist(vals_after,  bins=80, alpha=0.6, color="#E74C3C", label="After imputation", density=True)
     ax.set_xlabel("log2 LFQ intensity")
     ax.set_ylabel("Density")
-    ax.set_title("Effect of MinProb imputation")
+    ax.set_title("Effect of imputation (reference draw)")
     ax.legend()
     fig.tight_layout()
     f = os.path.join(out_dir, "qc_imputation.png")
@@ -1342,6 +1509,129 @@ def plot_imputation(mat_filt: pd.DataFrame, mat_imp: pd.DataFrame,
 # ==============================================================================
 # 5. ANALYSE DIFFÉRENTIELLE — eBayes + Robustness
 # ==============================================================================
+
+def _contrast_regex(template: str) -> "re.Pattern":
+    """'Live_{s}' -> ^Live_(?P<s>.+?)$ ; '*' = n'importe quoi (non contraint)."""
+    out, pos = [], 0
+    for m in re.finditer(r"\{(\w+)\}|\*", template):
+        out.append(re.escape(template[pos:m.start()]))
+        out.append(f"(?P<{m.group(1)}>.+?)" if m.group(1) else ".+?")
+        pos = m.end()
+    out.append(re.escape(template[pos:]))
+    return re.compile("^" + "".join(out) + "$")
+
+
+def select_contrasts(contrast_mat: np.ndarray, contrast_names: list,
+                     group_names: list, spec) -> "tuple[np.ndarray, list]":
+    """
+    Restreint les contrastes à ceux demandés (clé YAML `contrasts`).
+
+    spec : liste de chaînes 'A_vs_B' (noms tels qu'ils apparaissent dans les
+           contrastes / l'Excel), avec en option :
+             {x} : même valeur des deux côtés  -> "Live_{s}_vs_Heat_killed_{s}"
+                   (= vivant vs tué, au sein de chaque souche)
+             *   : n'importe quelle valeur      -> "Live_*_vs_Live_*"
+           L'ORIENTATION demandée est respectée (numérateur_vs_dénominateur) :
+           une paire absente dans ce sens est obtenue en inversant le signe.
+           Une paire demandée deux fois (A_vs_B et B_vs_A) n'est gardée qu'une fois.
+    Returns (contrast_mat restreinte, noms). ValueError si rien ne correspond.
+    """
+    if isinstance(spec, str):
+        spec = [spec]
+    labels = [g.replace(".", "_") for g in group_names]
+    n = len(labels)
+    n_rows = contrast_mat.shape[0]
+    ordered = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    ordered += [(j, i) for (i, j) in ordered]      # sens par défaut d'abord
+    chosen, seen = [], set()
+    for item in spec:
+        parts = str(item).split("_vs_")
+        if len(parts) != 2:
+            raise ValueError(f"contraste '{item}' : format attendu 'A_vs_B'.")
+        rl, rr = _contrast_regex(parts[0]), _contrast_regex(parts[1])
+        n_hit = 0
+        for i, j in ordered:
+            ml, mr = rl.match(labels[i]), rr.match(labels[j])
+            if not (ml and mr):
+                continue
+            dl, dr = ml.groupdict(), mr.groupdict()
+            if any(dl[k] != dr[k] for k in dl.keys() & dr.keys()):
+                continue
+            n_hit += 1
+            key = frozenset((i, j))
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append((i, j))
+        if n_hit == 0:
+            print(f"  [WARN] contraste '{item}' : aucune paire de conditions ne correspond.")
+    if not chosen:
+        raise ValueError("aucun contraste retenu. Conditions disponibles : "
+                         + ", ".join(labels))
+    mat = np.zeros((n_rows, len(chosen)))
+    names = []
+    for k, (i, j) in enumerate(chosen):
+        mat[i, k], mat[j, k] = 1, -1
+        names.append(f"{labels[i]}_vs_{labels[j]}")
+    return mat, names
+
+
+def suggest_contrast_pattern(group_names: list) -> "str | None":
+    """Design factoriel 'ETAT_SOUCHE' complet (ex. Live/Heat_killed x 12
+    souches) -> propose la comparaison des états au sein de chaque souche :
+    'Live_{s}_vs_Heat_killed_{s}'. None si pas de structure factorielle."""
+    labels = [g.replace(".", "_") for g in group_names]
+    if not all("_" in l for l in labels):
+        return None
+    split = [l.rsplit("_", 1) for l in labels]
+    prefixes = list(dict.fromkeys(p for p, _ in split))
+    suffixes = list(dict.fromkeys(s for _, s in split))
+    if (2 <= len(prefixes) <= 4 and len(suffixes) >= 2
+            and len(labels) == len(prefixes) * len(suffixes)
+            and {(p, s) for p, s in split} == {(p, s) for p in prefixes for s in suffixes}):
+        return f"{prefixes[0]}_{{s}}_vs_{prefixes[1]}_{{s}}"
+    return None
+
+
+def resolve_contrasts(contrast_mat, contrast_names, group_names, params: dict):
+    """Applique params['contrasts'] :
+      - liste / chaîne : sélection (select_contrasts) ;
+      - 'all' ou None  : tous les contrastes ;
+      - '__auto__' (défaut) : tous, mais au-delà de 30 contrastes, question
+        avec une proposition déduite des noms de conditions. Le choix est
+        réécrit dans params (et last_config.yaml) pour les runs suivants."""
+    spec = params.get("contrasts", "__auto__")
+    if spec in (None, "all", "ALL", "", []):
+        return contrast_mat, contrast_names
+    if spec == "__auto__":
+        if len(contrast_names) <= 30:
+            return contrast_mat, contrast_names
+        sugg = suggest_contrast_pattern(group_names)
+        print(f"\n[MODEL] {len(contrast_names)} contrastes (toutes les paires de "
+              f"{len(group_names)} conditions).")
+        if sugg:
+            n_s = len(select_contrasts(contrast_mat, contrast_names, group_names,
+                                       [sugg])[1])
+            print(f"  Proposition : {sugg}  ({n_s} contrastes)")
+        print("  Entrée = " + ("proposition" if sugg else "tous") +
+              " | 'all' = tous | ou motif(s) séparés par des virgules "
+              "(ex: Live_{s}_vs_Heat_killed_{s}, Live_*_vs_Live_*)")
+        rep = input("  Contrastes -> ").strip()
+        if rep.lower() == "all" or (not rep and not sugg):
+            params["contrasts"] = "all"
+            return contrast_mat, contrast_names
+        spec = [x.strip() for x in (rep or sugg).split(",") if x.strip()]
+        params["contrasts"] = spec
+        try:
+            from config import _save_last_config
+            _save_last_config(params)
+        except Exception:
+            pass
+    mat, names = select_contrasts(contrast_mat, contrast_names, group_names, spec)
+    print(f"[MODEL] Contrastes retenus ({len(names)}/{len(contrast_names)}) : "
+          f"{names[:4]}{'...' if len(names) > 4 else ''}")
+    return mat, names
+
 
 def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
                                meta: pd.DataFrame, design: pd.DataFrame,
@@ -1434,6 +1724,16 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         design_mat, group_names = make_design_matrix(
             conditions.tolist(), control_condition=control_condition)
         contrast_mat, contrast_names = make_all_contrasts(group_names)
+
+    # --- Sélection des contrastes (clé YAML `contrasts`) : appliquée ICI,
+    #     avant le modèle, donc propagée à tout l'aval (FDR, robustesse,
+    #     volcanos, UpSet, GO, Excel, dashboard). ---
+    try:
+        contrast_mat, contrast_names = resolve_contrasts(
+            contrast_mat, contrast_names, group_names, params)
+    except ValueError as e:
+        print(f"\n  [ERROR] contrasts : {e}")
+        sys.exit(1)
 
     print(f"[MODEL] {len(contrast_names)} contrasts generated: "
           f"{contrast_names[:5]}{'...' if len(contrast_names)>5 else ''}")
@@ -1551,6 +1851,12 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         p_key   = "adj.P.Val" if params["volcano_use_padj"] else "P.Value"
         lfc_min = params["volcano_lfc_min"]
         p_thr   = params["volcano_p_thresh"]
+        imp_method = params.get("impute_method", "qrilc")
+        base_seed  = int(params.get("seed", 42))
+        # Graines des itérations dérivées de la graine de base (indépendantes du
+        # tirage de référence, reproductibles, sans collision).
+        iter_seeds = [int(x) for x in np.random.SeedSequence(base_seed)
+                      .generate_state(n_iter, dtype=np.uint32)]
 
         def _one_iteration(seed):
             """Une imputation + fit → matrice (n_prot × n_contr) de succès 0/1.
@@ -1562,7 +1868,11 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
             intensités : on le réutilise tel quel à chaque tirage.
             """
             rng = np.random.default_rng(seed)
-            mat_imp_tmp = impute_minprob(mat_filt, rng=rng)
+            # MÊME méthode que le tirage de référence (qrilc / mixed) : le score
+            # mesure la stabilité de la statistique affichée, pas celle d'une
+            # autre imputation.
+            mat_imp_tmp = impute(mat_filt, method=imp_method, design=design,
+                                 rng=rng)
             expr_tmp = mat_imp_tmp.values.astype(float)
             fit_tmp   = lm_fit(expr_tmp, design_mat)
             fit_tmp_c = contrasts_fit(fit_tmp, contrast_mat)
@@ -1595,7 +1905,7 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
             n_workers = min(8, (_os.cpu_count() or 2))
             done = 0
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                for res in ex.map(_one_iteration, range(n_iter)):
+                for res in ex.map(_one_iteration, iter_seeds):
                     success_total += res
                     done += 1
                     if done % 10 == 0 or done == n_iter:
@@ -1605,7 +1915,7 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
             # Repli séquentiel si la parallélisation échoue
             print(f"  (parallelization unavailable: {e} -> sequential)")
             for k in range(n_iter):
-                success_total += _one_iteration(k)
+                success_total += _one_iteration(iter_seeds[k])
                 if (k + 1) % 10 == 0:
                     print(f"    {k+1}/{n_iter}", end="\r")
             print()
@@ -1814,7 +2124,8 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
 # 7. PCA + ELLIPSES
 # ==============================================================================
 
-def plot_pca(mat_imp: pd.DataFrame, design: pd.DataFrame, out_dir: str) -> list[str]:
+def plot_pca(mat_imp: pd.DataFrame, design: pd.DataFrame, out_dir: str,
+             data_label: str = "imputed data") -> list[str]:
     """PCA sur les données imputées, avec et sans ellipses de confiance."""
     expr = mat_imp.T.values  # (n_samples × n_proteins)
     # Imputation des éventuels NaN résiduels pour la PCA
@@ -1850,7 +2161,7 @@ def plot_pca(mat_imp: pd.DataFrame, design: pd.DataFrame, out_dir: str) -> list[
 
         ax.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}%)")
         ax.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}%)")
-        ax.set_title("PCA — imputed data" + (" (95% ellipses)" if with_ellipse else ""))
+        ax.set_title(f"PCA — {data_label}" + (" (95% ellipses)" if with_ellipse else ""))
         ax.legend(fontsize=7, bbox_to_anchor=(1.01, 1), loc="upper left")
         ax.axhline(0, color="grey", lw=0.5)
         ax.axvline(0, color="grey", lw=0.5)
@@ -1934,10 +2245,20 @@ def plot_umap(mat_imp: pd.DataFrame, meta: pd.DataFrame,
     expr_imp = imp.fit_transform(expr)
 
     n_samples = expr_imp.shape[0]
+    # L'initialisation spectrale de UMAP exige plus de points que de
+    # dimensions (k >= N -> TypeError) : sous 5 échantillons, UMAP n'a de
+    # toute façon pas de sens -> étape sautée, sans interrompre le pipeline.
+    if n_samples < 5:
+        print(f"  [SKIP] UMAP : {n_samples} échantillons (minimum 5).")
+        return None, None
     n_neighbors = min(5, n_samples - 1)
 
     cfg = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, random_state=42)
-    emb = cfg.fit_transform(expr_imp)
+    try:
+        emb = cfg.fit_transform(expr_imp)
+    except Exception as e:
+        print(f"  [SKIP] UMAP ({type(e).__name__}: {str(e)[:70]}) — pipeline continue.")
+        return None, None
 
     conditions = design["condition"].values
     labels     = design["label"].values
@@ -2498,7 +2819,7 @@ def build_mm_sheet(ws):
     line("DIA scheme", "Variable windows", "Isolation windows from 350 to 1000 m/z")
 
     section("4. IDENTIFICATION & QUANTIFICATION (DIA-NN)")
-    line("Software", "DIA-NN v2.5.1", "Search + LFQ quantification (Demichev 2019)")
+    line("Software", "DIA-NN v2.7.0", "Search + LFQ quantification (Demichev 2019)")
     line("Database", "[!] TO BE FILLED IN (species)",
          "Protein database of the studied species — library-free / library generation")
     line("Mass / RT correction", "Automatic", "Automatic mass and retention-time correction")
@@ -2623,6 +2944,11 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
                "Quantile Regression Imputation of Left-Censored data (Lazar 2016): "
                "draw from a truncated normal below the estimated detection limit. "
                "Suited to DIA (predominantly MNAR missingness).")
+    put_kv("Imputation choice", params.get("impute_method", "qrilc").upper(),
+           params.get("impute_method_reason", "set explicitly in the configuration"))
+    put_kv("Random seed", str(params.get("seed", 42)),
+           "Seed of the reference imputation draw (p-values, volcanos). "
+           "Re-running with the same seed and inputs gives identical results.")
 
     # ===== DIFFERENTIAL ANALYSIS =====
     put_section("3. DIFFERENTIAL ANALYSIS (Volcanos)")
@@ -2678,7 +3004,8 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_section("4. ROBUSTNESS SCORE")
     put_header()
     put_kv("Principle", f"{n_iter} re-imputations",
-           "Repeated stochastic imputation (MinProb), model re-estimation "
+           f"Repeated stochastic imputation ({params.get('impute_method', 'qrilc').upper()}, "
+           f"same method as the reference draw; base seed={params.get('seed', 42)}), model re-estimation "
            "at each iteration to assess stability against missing-value "
            "imputation uncertainty")
     put_kv("Applied thresholds", p_volc + f" < {params['volcano_p_thresh']} "
@@ -2741,16 +3068,52 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     if go_enabled:
         put_section("8. FUNCTIONAL ENRICHMENT (GO)")
         put_header()
-        put_kv("Tool", "g:Profiler (gost)",
-               "Over-representation enrichment")
-        put_kv("Species", str(go_organism), "g:Profiler organism code")
-        put_kv("Sources", "GO:BP, GO:CC, GO:MF, REAC, KEGG",
-               "Gene Ontology + Reactome + KEGG")
-        put_kv("Input list", "DEP per contrast",
-               f"Proteins passing {p_volc} < {params['volcano_p_thresh']} "
-               f"& ratio >= {params['volcano_ratio_min']} (volcano thresholds)")
-        put_kv("Multiple correction", "FDR (g:SCS disabled in favor of FDR)",
-               "significance_threshold_method='fdr'")
+        if params.get("go_backend", "gprofiler") == "string":
+            _bg = params.get("string_background", "genome")
+            _cats = params.get("string_categories") or ["Process", "Function",
+                                                         "Component", "KEGG", "RCTM"]
+            put_kv("Tool", "STRING (API 'enrichment')",
+                   "Over-representation enrichment (Szklarczyk et al.)")
+            put_kv("Species", f"NCBI taxid {params.get('go_species_taxid')}",
+                   (f"{params['go_species_name']} — resolved automatically from "
+                    f"the accessions (UniProt taxonomy, checked in STRING)"
+                    if params.get("go_species_name")
+                    else "Organism identified by NCBI Taxonomy ID"))
+            put_kv("Sources", ", ".join(_cats),
+                   "STRING categories (Process/Function/Component/RCTM "
+                   "relabelled GO:BP/GO:MF/GO:CC/REAC)")
+            if params.get("go_string_mode") == "ortholog":
+                put_kv("ID mapping", "Orthology (reciprocal best hits, DIAMOND)",
+                       f"{params.get('go_string_strain') or 'Run proteins'} -> STRING "
+                       f"proteome taxid {params.get('go_species_taxid')} "
+                       f"(accessions not indexed in STRING); identity >= "
+                       f"{params.get('perseverance_min_identity', 25.0)}%, coverage >= "
+                       f"{params.get('perseverance_min_coverage', 50.0)}%; "
+                       f"pairs in sheet Orthologues_STRING")
+            else:
+                put_kv("ID mapping", "get_string_ids (1st accession of the group)",
+                       "Unresolved accessions excluded from the query")
+            put_kv("Input list", "DEP per contrast",
+                   f"Proteins passing {p_volc} < {params['volcano_p_thresh']} "
+                   f"& ratio >= {params['volcano_ratio_min']} (volcano thresholds)")
+            put_kv("Background", ("quantified proteins" if _bg == "quantified"
+                                  else "whole genome"),
+                   ("background_string_identifiers = all quantified proteins "
+                    "resolved by STRING" if _bg == "quantified"
+                    else "STRING default (whole annotated genome)"))
+            put_kv("Multiple correction", "FDR (Benjamini-Hochberg, STRING)",
+                   "STRING 'fdr' field, threshold 0.05")
+        else:
+            put_kv("Tool", "g:Profiler (gost)",
+                   "Over-representation enrichment")
+            put_kv("Species", str(go_organism), "g:Profiler organism code")
+            put_kv("Sources", "GO:BP, GO:CC, GO:MF, REAC, KEGG",
+                   "Gene Ontology + Reactome + KEGG")
+            put_kv("Input list", "DEP per contrast",
+                   f"Proteins passing {p_volc} < {params['volcano_p_thresh']} "
+                   f"& ratio >= {params['volcano_ratio_min']} (volcano thresholds)")
+            put_kv("Multiple correction", "FDR (g:SCS disabled in favor of FDR)",
+                   "significance_threshold_method='fdr'")
         put_kv("Term filters", "size 5-1000, roots excluded",
                "Exclusion of GO:0003674/0008150/0005575")
         put_kv("Z-score", "term mean log2FC",
@@ -2870,7 +3233,7 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
     write_df(ws, tsv)
 
     # --- Onglet Log2_Impute : matrice log2 imputée, TOUTES les protéines ---
-    # Valeurs log2 imputées (MinProb) pour chaque protéine × chaque échantillon.
+    # Valeurs log2 imputées (tirage de référence seedé) pour chaque protéine × échantillon.
     if mat_imp is not None:
         ws = wb.create_sheet("Log2_Impute")
         df_imp = mat_imp.copy()
@@ -3657,7 +4020,12 @@ def main():
     # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None.
     # Mode Perseverance (annotation par orthologie) : independant de gProfiler/go_organism,
     # active des que perseverance_annotation_path est fourni.
+    # Backend STRING (go_backend='string') : espèce = NCBI taxid (go_species_taxid)
+    # au lieu d'un code gProfiler — le GO est actif si la cible du backend choisi
+    # est renseignée.
     _go_org = params.get("go_organism")
+    _go_backend = params.get("go_backend", "gprofiler")
+    _go_target = params.get("go_species_taxid") if _go_backend == "string" else _go_org
     _perseverance_path = params.get("perseverance_annotation_path")
     if _perseverance_path:
         _perseverance_annot = pd.read_csv(_perseverance_path, sep="\t")
@@ -3665,9 +4033,17 @@ def main():
                     "custom_annotation": _perseverance_annot, "background": None}
         print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "
               f"({len(_perseverance_annot)} proteines annotees)")
+    elif _GO_AVAILABLE and _go_target:
+        go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
+                    "backend": _go_backend,
+                    "species_taxid": params.get("go_species_taxid"),
+                    "caller_identity": params.get("string_caller_identity"),
+                    "string_background": params.get("string_background", "genome"),
+                    "string_categories": params.get("string_categories")}
     else:
-        go_params = ({"organism": _go_org, "run_gsea": params.get("run_gsea", False)}
-                     if (_GO_AVAILABLE and _go_org) else None)
+        go_params = None
+        if _go_backend == "string" and not params.get("go_species_taxid"):
+            print("[WARN] go_backend='string' sans go_species_taxid — GO désactivé.")
 
     _makedirs(out_dir)
 
@@ -3677,6 +4053,46 @@ def main():
 
     # --- 1. Chargement ---
     tsv, design = load_data(tsv_path, design_path)
+
+    # --- 1ter. Pré-vol STRING : taxid validé/détecté AVANT les stats ---
+    # Échec rapide plutôt qu'au GO après tout le pipeline. Pour les bactéries,
+    # STRING indexe par SOUCHE : un taxid d'espèce (ex. 1304) renvoie 404.
+    # Le taxid retenu est réécrit dans params -> feuille Methods exacte.
+    # --- 1bis0. Design sans aucun réplicat -> mode QC seul (automatique) ---
+    if not params.get("qc_only") and no_replicate_design(design):
+        _nc = design["condition"].nunique()
+        params["qc_only"] = True
+        params["qc_only_reason"] = (
+            f"no replicate ({len(design)} samples for {_nc} conditions): residual "
+            f"variance cannot be estimated, differential statistics are impossible")
+        print(f"\n[QC-ONLY] Aucun réplicat ({len(design)} échantillons, {_nc} "
+              f"conditions) : statistiques impossibles -> mode QC seul "
+              f"(données brutes, M&M, figures QC).")
+    elif params.get("qc_only"):
+        print("\n[QC-ONLY] Mode QC seul demandé (qc_only) : données brutes, M&M, "
+              "figures QC.")
+
+    if (go_params and go_params.get("backend") == "string"
+            and not params.get("qc_only")):
+        print("\n[STEP] STRING — vérification de l'organisme...")
+        _plan = plan_string_mapping(
+            tsv["Protein.Group"].astype(str).tolist(),
+            go_params.get("species_taxid"),
+            go_params.get("caller_identity") or "Proteogen",
+            gene_names=(tsv["Genes"].astype(str).tolist()
+                        if "Genes" in tsv.columns else None),
+            reference_taxid=params.get("string_reference_taxid"))
+        if _plan["mode"] is None:
+            go_params = None
+        else:
+            go_params["species_taxid"] = _plan["taxid"]
+            go_params["string_mode"] = _plan["mode"]
+            params["go_species_taxid"] = _plan["taxid"]
+            params["go_species_name"] = _plan["name"]
+            params["go_string_mode"] = _plan["mode"]
+            params["go_string_strain"] = (
+                f"{_plan['strain_name']} (taxid {_plan['strain_taxid']})"
+                if _plan.get("strain_name") else None)
 
     # --- 1bis. Détection multi-organismes (host/pathogen ou plus) ---
     # Générique : repose sur le suffixe '_TAG' de Protein.Names, pas sur une
@@ -3730,6 +4146,167 @@ def main():
         )
 
 
+def no_replicate_design(design: pd.DataFrame) -> bool:
+    """Vrai si aucune condition n'a de réplicat : ddl résiduels = n - k = 0,
+    donc aucune variance estimable -> statistiques différentielles impossibles."""
+    if design is None or "condition" not in design.columns or design.empty:
+        return False
+    n_cond = design["condition"].nunique()
+    return len(design) - n_cond < 1
+
+
+def export_qc_excel(tsv: pd.DataFrame, mat_log2: pd.DataFrame, meta: pd.DataFrame,
+                    design: pd.DataFrame, params: dict, qc_files: list,
+                    pca_imgs: list, n_complete: int, reason: str, out_path: str):
+    """Classeur du mode QC seul : M&M amont, Methods (traitement QC), données
+    brutes, matrice log2 (non imputée), figures QC et PCA/corrélation."""
+    from openpyxl.utils import get_column_letter
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    hdr_fill, hdr_font = PatternFill("solid", fgColor="D9D9D9"), Font(bold=True)
+
+    def write_df(ws, df):
+        ws.append([str(c) for c in df.columns])
+        for cell in ws[1]:
+            cell.fill, cell.font = hdr_fill, hdr_font
+        for row in df.itertuples(index=False):
+            ws.append([None if (isinstance(v, float) and np.isnan(v)) else v
+                       for v in row])
+
+    def insert_img(ws, path, row, col, max_w=560, max_h=440):
+        if not path or not os.path.exists(str(path)):
+            return
+        p = str(path)
+        try:
+            from PIL import Image as _PIL
+            im = _PIL.open(p)
+            s = min(max_w / im.size[0], max_h / im.size[1], 1.0)
+            if s < 1.0:
+                base, ext = os.path.splitext(p)
+                p = f"{base}_xl{ext}"
+                im.resize((int(im.size[0] * s), int(im.size[1] * s)),
+                          _PIL.LANCZOS).save(p)
+        except Exception:
+            pass
+        ws.add_image(XLImage(p), f"{get_column_letter(col)}{row}")
+
+    # 1. M&M amont (préparation, LC-MS/MS, DIA-NN) — identique au mode complet
+    build_mm_sheet(wb.create_sheet("Methods_Upstream"))
+
+    # 2. Methods : traitement effectué en mode QC
+    ws = wb.create_sheet("Methods")
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 42
+    ws.column_dimensions["C"].width = 80
+    ws.append(["DATA PROCESSING — QC only (no differential statistics)"])
+    ws["A1"].font = Font(bold=True, size=13)
+    ws.append([])
+    ws.append(["Item", "Value", "Detail"])
+    for cell in ws[3]:
+        cell.fill, cell.font = hdr_fill, hdr_font
+    conds = design["condition"].astype(str)
+    rows = [
+        ("Mode", "QC only", reason),
+        ("Input", os.path.basename(str(params.get("tsv_path", "pg_matrix"))),
+         "DIA-NN protein group matrix (contaminants 'cRAP' removed)"),
+        ("Protein groups", str(len(mat_log2)), "all quantified protein groups"),
+        ("Samples", str(mat_log2.shape[1]),
+         f"{conds.nunique()} condition(s): " + ", ".join(dict.fromkeys(conds))),
+        ("Intensities", "log2(LFQ)", "Zero intensities treated as missing; "
+         "no filtering, no imputation, no normalisation beyond DIA-NN"),
+        ("QC figures", "sheet QC", "Detection frequency, proteins per sample, "
+         "intensity distributions, RLE, missing-value map"),
+        ("PCA / correlation", "sheet PCA_Correlation",
+         f"Computed on the {n_complete} protein groups quantified in all samples "
+         f"(complete cases, no imputation); PCA on standardised log2 values, "
+         f"Pearson correlation"),
+        ("Differential statistics", "not performed", reason),
+    ]
+    for r in rows:
+        ws.append(list(r))
+    for row in ws.iter_rows(min_row=4):
+        row[0].font = Font(bold=True)
+
+    # 3. Données brutes et matrice log2
+    write_df(wb.create_sheet("raw_data"), tsv)
+    log2 = mat_log2.copy()
+    log2.columns = [str(c) for c in design["label"].values]
+    for col in ("First.Protein.Description", "Genes", "Protein.Group"):
+        if col in meta.columns and len(meta) == len(log2):
+            log2.insert(0, col, meta[col].values)
+    write_df(wb.create_sheet("Log2"), log2.round(4))
+
+    # 4. Figures
+    ws = wb.create_sheet("QC")
+    for i, f in enumerate(qc_files):
+        insert_img(ws, f, row=(i // 3) * 24 + 1, col=(i % 3) * 10 + 1)
+    if pca_imgs:
+        ws = wb.create_sheet("PCA_Correlation")
+        for i, f in enumerate(pca_imgs):
+            insert_img(ws, f, row=(i // 2) * 24 + 1, col=(i % 2) * 10 + 1)
+
+    wb.save(out_path)
+
+
+def run_qc_only(tsv: pd.DataFrame, mat_log2: pd.DataFrame, meta: pd.DataFrame,
+                design: pd.DataFrame, params: dict, qc_files: list,
+                out_dir: str) -> str:
+    """Mode QC seul : figures QC + PCA/corrélation sur les cas complets, puis
+    Excel (M&M, Methods, données brutes, log2, figures). Aucune imputation,
+    statistique, WGCNA, GO ni dashboard."""
+    reason = params.get("qc_only_reason") or "requested in the configuration (qc_only)"
+    mat = mat_log2.copy()
+    mat.columns = design["label"].values
+    complete = mat.dropna()
+    pca_imgs = []
+    print(f"\n[QC-ONLY] PCA / corrélation sur les {len(complete)} protéines "
+          f"quantifiées dans tous les échantillons (sans imputation)...")
+    if len(complete) >= 10 and mat.shape[1] >= 3:
+        try:
+            _pca = plot_pca(complete, design, out_dir,
+                            data_label="complete cases, no imputation")
+            # Variante « ellipses 95 % » inutile si aucune condition n'a >= 3
+            # échantillons (aucune ellipse traçable) : on ne garde que la simple.
+            if design["condition"].value_counts().max() < 3:
+                for f in _pca:
+                    if "_ellipses" in os.path.basename(str(f)):
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                _pca = [f for f in _pca if "_ellipses" not in os.path.basename(str(f))]
+            pca_imgs += _pca
+        except Exception as e:
+            print(f"  [SKIP] PCA ({type(e).__name__}: {str(e)[:60]})")
+        try:
+            pca_imgs.append(plot_correlation_heatmap(complete, design, out_dir))
+        except Exception as e:
+            print(f"  [SKIP] Corrélation ({type(e).__name__}: {str(e)[:60]})")
+    else:
+        print("  [SKIP] PCA/corrélation : moins de 3 échantillons ou de 10 "
+              "protéines complètes.")
+    out_path = os.path.join(out_dir, "ProteomicAnalysis_QC.xlsx")
+    print("\n[EXCEL] Generating the QC Excel file...")
+    export_qc_excel(tsv, mat_log2, meta, design, params, qc_files, pca_imgs,
+                    len(complete), reason, out_path)
+    print(f"  [OK] Excel file saved: {out_path}")
+    # Figures déjà intégrées à l'Excel : on ne supprime QUE celles de ce run
+    # (et leurs copies redimensionnées), pas d'éventuels fichiers d'autres runs.
+    for f in list(qc_files) + list(pca_imgs):
+        if not f:
+            continue
+        base, ext = os.path.splitext(str(f))
+        for p in (str(f), f"{base}_xl{ext}"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    print(f"  Sheets: Methods_Upstream, Methods, raw_data, Log2, QC"
+          f"{', PCA_Correlation' if pca_imgs else ''}")
+    print("\n[DONE] QC-only pipeline finished (no statistics, WGCNA, GO or dashboard).")
+    return out_path
+
+
 def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                        pr_path: str, params: dict, go_params: "dict | None",
                        make_wgcna: bool, make_dash: bool, use_deqms: bool):
@@ -3758,6 +4335,11 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     print("\n[QC] Quality control...")
     qc_files = plot_qc(mat_log2, meta, design_filt, out_dir)
 
+    # --- Mode QC seul : données brutes + M&M + figures QC, rien d'autre ---
+    if params.get("qc_only"):
+        run_qc_only(tsv, mat_log2, meta, design_filt, params, qc_files, out_dir)
+        return
+
     # --- 4. Filtration + Imputation ---
     print("\n[STEP] Filtering and imputation...")
     mat_filt, keep_mask = filter_missval(mat_log2, design_filt, thr=1)
@@ -3768,9 +4350,32 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     if miss_diag.get("plot"):
         qc_files.append(miss_diag["plot"])
 
-    imp_method = params.get("impute_method", "qrilc")
-    mat_imp = impute(mat_filt, method=imp_method, design=design_filt)
-    print(f"  [OK] Imputation: {imp_method.upper()}")
+    # --- Choix de la méthode : 'auto' = décidé par le diagnostic ci-dessus ---
+    #   MAR >= 20 % des NA  -> MIXED (QRILC absences totales + kNN partielles)
+    #   sinon               -> QRILC
+    # Une valeur explicite ('qrilc' / 'mixed') dans le YAML reste prioritaire.
+    # Copie locale de params : en mode multi-organisme, chaque dataset refait
+    # son propre choix (le dict appelant garde 'auto').
+    imp_requested = params.get("impute_method", "auto")
+    if imp_requested in (None, "auto", "__auto__"):
+        pct_mar = float(miss_diag.get("pct_mar", 0.0) or 0.0)
+        imp_method = "mixed" if pct_mar >= AUTO_MIXED_MAR_PCT else "qrilc"
+        imp_reason = (f"auto: {miss_diag.get('pct_mnar', 0):.0f}% MNAR / "
+                      f"{pct_mar:.0f}% MAR of missing values "
+                      f"(MIXED if MAR >= {AUTO_MIXED_MAR_PCT:.0f}%)")
+        print(f"  [AUTO] Imputation method -> {imp_method.upper()} ({imp_reason})")
+    else:
+        imp_method = imp_requested
+        imp_reason = "set explicitly in the configuration"
+    params = {**params, "impute_method": imp_method,
+              "impute_method_requested": imp_requested,
+              "impute_method_reason": imp_reason}
+    seed = int(params.get("seed", 42))
+    # Tirage de référence seedé : les colonnes _p.val/_p.adj et les volcanos
+    # sont ainsi reproductibles à l'identique d'un run à l'autre.
+    mat_imp = impute(mat_filt, method=imp_method, design=design_filt,
+                     rng=np.random.default_rng(seed))
+    print(f"  [OK] Imputation: {imp_method.upper()} (seed={seed})")
     qc_imp  = plot_imputation(mat_filt, mat_imp, out_dir)
     qc_files.append(qc_imp)
 
@@ -3896,13 +4501,24 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     # Ne mute PAS le go_params partagé entre sous-espèces (boucle multi-especes) :
     # on travaille sur une copie locale, propre à ce subset.
     local_go_params = dict(go_params) if go_params else None
-    correspondence_df, persev_override = run_perseverance_step(df_results, params, out_dir)
+    _string_orth = bool(local_go_params and local_go_params.get("backend") == "string"
+                        and local_go_params.get("string_mode") == "ortholog")
+    if _string_orth:
+        correspondence_df, persev_override = run_string_ortholog_step(
+            df_results, params, local_go_params, out_dir)
+        _orth_sheet = "Orthologues_STRING"
+    else:
+        correspondence_df, persev_override = run_perseverance_step(df_results, params, out_dir)
+        _orth_sheet = "Orthologues_Perseverance"
     if correspondence_df is not None:
-        export_perseverance_sheet(wb, correspondence_df, _write_df)
-        print(f"  [OK] Orthologues_Perseverance sheet added "
+        export_perseverance_sheet(wb, correspondence_df, _write_df, sheet_name=_orth_sheet)
+        print(f"  [OK] {_orth_sheet} sheet added "
               f"({len(correspondence_df)} correspondances).")
     if persev_override is not None:
         local_go_params = {**(local_go_params or {}), **persev_override}
+    elif _string_orth:
+        print("  [WARN] Orthologie STRING indisponible — GO STRING ignoré pour ce run.")
+        local_go_params = None
 
     # --- 14. Enrichissement GO/gProfiler (optionnel, non bloquant) ---
     if local_go_params is not None:
@@ -3916,14 +4532,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         # GO par cluster de la heatmap ANOVA (réutilise cluster_mapping)
         if cluster_mapping:
             go_cluster_results = run_go_enrichment_clusters(
-                cluster_mapping, params, go_params, out_dir)
+                cluster_mapping, params, local_go_params, out_dir)
             if go_cluster_results:
                 export_go_cluster_sheets(
                     wb, go_cluster_results, _write_df, _ins_img)
                 print(f"  [OK] {len(go_cluster_results)} GO cluster sheet(s) added.")
 
         # GSEA rank-based (optionnel, complément de l'ORA)
-        if go_params.get("run_gsea"):
+        # (go_params peut être None ici si seul Perseverance a activé le GO)
+        if (go_params or {}).get("run_gsea"):
             try:
                 from gsea_enrichment import run_gsea, export_gsea_sheets
                 gsea_results = run_gsea(

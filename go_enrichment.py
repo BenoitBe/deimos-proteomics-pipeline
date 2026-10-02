@@ -12,6 +12,10 @@
 #
 # SEUILS : identiques à ceux des volcanos du pipeline principal (params).
 # ESPÈCE : demandée à l'utilisateur (ex: hsapiens, rnorvegicus, mmusculus...).
+# BACKEND : gProfiler (défaut) ou STRING (go_backend='string', espèce = NCBI
+#   taxid) — STRING couvre la quasi-totalité des bactéries séquencées. Les
+#   catégories STRING sont renommées en labels gProfiler (GO:BP, GO:MF, GO:CC,
+#   REAC, KEGG) : plots, export et dashboard fonctionnent à l'identique.
 #
 # ENTIÈREMENT NON BLOQUANT : toute erreur (réseau, espèce inconnue, pas assez
 # de protéines, API indisponible) est capturée et n'interrompt jamais le
@@ -28,6 +32,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
+
+# Backend STRING (alternative à gProfiler) — utile pour les organismes mal
+# couverts par Ensembl/gProfiler, en particulier les bactéries : STRING
+# identifie l'espèce par NCBI Taxonomy ID (pas de convention de nommage
+# fragile) et couvre >12000 organismes, procaryotes inclus.
+STRING_API_URL = "https://string-db.org/api"
+DEFAULT_STRING_CALLER = "Proteogen"
 
 
 def _strip_common_affix(conditions):
@@ -105,25 +116,55 @@ def ask_go_params() -> dict | None:
     Retourne None si refusé → le pipeline saute proprement cette étape.
     """
     print("\n" + "="*60)
-    print("  GO ENRICHMENT / gProfiler (optional)")
+    print("  GO ENRICHMENT (optional)")
     print("="*60)
-    print("  [!] Requires internet access to g:Profiler (biit.cs.ut.ee).")
     print("      The thresholds used are those defined for the volcanos.")
-    print("\n  Example gProfiler species codes:")
-    print("     hsapiens (human)     | mmusculus (mouse)   | rnorvegicus (rat)")
-    print("     drerio (zebrafish)   | scerevisiae (yeast) | ecoli / efaecalis")
 
     rep = input("\n  Run GO enrichment? (y/N) -> ").strip().lower()
     if rep not in ("o", "oui", "y", "yes"):
         print("  [SKIP] GO enrichment skipped.\n")
         return None
 
-    organism = input("  gProfiler species code (e.g. rnorvegicus) -> ").strip()
-    if not organism:
-        print("  [WARN] No species provided — step skipped.\n")
-        return None
+    print("\n  Backend:")
+    print("     [1] gProfiler (default) — good coverage for eukaryotes/models,")
+    print("         patchy for bacteria. Species = gProfiler code.")
+    print("     [2] STRING — species identified by NCBI Taxonomy ID, covers")
+    print("         >12000 organisms incl. virtually all sequenced bacteria.")
+    backend_choice = input("  Backend [1/2] (default 1) -> ").strip()
 
-    params = {"organism": organism, "run_gsea": False}
+    if backend_choice == "2":
+        print("\n  [!] Requires internet access to string-db.org.")
+        print("      STRING indexes bacteria per STRAIN: use the strain taxid")
+        print("      (E. coli K-12 MG1655 = 511145, not the species 562).")
+        print("      Leave empty = auto-detect from your accessions (recommended).")
+        taxid_raw = input("  NCBI Taxonomy ID [auto] -> ").strip().lower() or "auto"
+        if taxid_raw != "auto" and not taxid_raw.isdigit():
+            print("  [WARN] Invalid taxid — step skipped.\n")
+            return None
+        caller = input(
+            f"  Caller identity for STRING (project/lab name, not personal "
+            f"data) [{DEFAULT_STRING_CALLER}] -> ").strip() or DEFAULT_STRING_CALLER
+        print("\n  Statistical background (universe):")
+        print("     [1] whole genome (default — same as gProfiler 'known')")
+        print("     [2] quantified proteins only (corrects the detectability")
+        print("         bias of proteomics: abundant categories such as")
+        print("         ribosome/translation are no longer over-called)")
+        bg = "quantified" if input("  Background [1/2] (default 1) -> ").strip() == "2" \
+            else "genome"
+        params = {"backend": "string",
+                  "species_taxid": "auto" if taxid_raw == "auto" else int(taxid_raw),
+                  "caller_identity": caller, "string_background": bg,
+                  "organism": None, "run_gsea": False}
+    else:
+        print("\n  [!] Requires internet access to g:Profiler (biit.cs.ut.ee).")
+        print("  Example gProfiler species codes:")
+        print("     hsapiens (human)     | mmusculus (mouse)   | rnorvegicus (rat)")
+        print("     drerio (zebrafish)   | scerevisiae (yeast) | ecoli / efaecalis")
+        organism = input("  gProfiler species code (e.g. rnorvegicus) -> ").strip()
+        if not organism:
+            print("  [WARN] No species provided — step skipped.\n")
+            return None
+        params = {"backend": "gprofiler", "organism": organism, "run_gsea": False}
 
     # GSEA rank-based (optionnel, complément de l'ORA)
     print("\n  --- GSEA (rank-based, optional) ---")
@@ -132,6 +173,9 @@ def ask_go_params() -> dict | None:
     print("  [!] Requires 'gseapy' installed and internet access to Enrichr.")
     print("  [!] Gene sets are human-centric (Enrichr): most informative for")
     print("      human/mouse data mapped by gene symbol.")
+    if params.get("backend") == "string":
+        print("  [!] Independent of the STRING backend: for bacteria or other")
+        print("      non-model species, Enrichr libraries do not apply — answer N.")
     rep_gsea = input("  Also run GSEA? (y/N) -> ").strip().lower()
     if rep_gsea in ("o", "oui", "y", "yes"):
         params["run_gsea"] = True
@@ -321,6 +365,849 @@ def diagnose_gprofiler_coverage(protein_ids: list, organism: str,
     return {"available": True, "organism_valid": True, "n_sampled": n_total,
            "n_converted": n_converted, "coverage": round(coverage, 3),
            "reliable": reliable, "recommendation": reco}
+
+
+# Catégories STRING -> labels gProfiler. Le dashboard (build_dashboardv7.py),
+# les plots (SOURCE_COLORS, chord) et Pathfinder filtrent/colorent sur
+# 'GO:BP','GO:MF','GO:CC','REAC','KEGG' : sans harmonisation, les résultats
+# STRING seraient absents des onglets GO du dashboard.
+STRING_CATEGORY_MAP = {"Process": "GO:BP", "Function": "GO:MF",
+                       "Component": "GO:CC", "RCTM": "REAC", "KEGG": "KEGG"}
+# Par défaut : mêmes sources que gProfiler (GO_SOURCES). Autres catégories
+# STRING ajoutables via go_params['string_categories'] (conservent leur nom
+# STRING) — utiles pour les bactéries : 'Keyword' (UniProt), 'Pfam',
+# 'InterPro', 'SMART', 'WikiPathways'.
+DEFAULT_STRING_CATEGORIES = ["Process", "Function", "Component", "KEGG", "RCTM"]
+
+_STRING_CHUNK = 2000          # identifiants par requête get_string_ids
+_STRING_NOSPECIES_MAX = 100   # l'API accepte get_string_ids sans espèce jusqu'à 100 IDs
+_STRING_LAST_CALL = [0.0]     # horodatage du dernier appel (politesse API)
+
+
+class StringNoMatch(Exception):
+    """HTTP 404 de l'API STRING : aucun identifiant reconnu pour cette
+    requête — typiquement un taxid absent de STRING (ex. taxid d'ESPÈCE
+    bactérienne alors que STRING indexe les bactéries par SOUCHE), ou un
+    format d'accession non indexé."""
+
+
+_CONTAMINANT_PREFIXES = ("crap", "con_", "con__", "contam", "rev_", "decoy")
+
+
+def _clean_ids_for_string(protein_ids: list) -> list:
+    """1re accession du Protein.Group, dédupliquée, sans contaminants
+    (cRAP-, CON__, REV_...) : inutile de les soumettre à STRING, et ils
+    diluent la détection d'organisme."""
+    out = []
+    for p in protein_ids:
+        acc = str(p).split(";")[0].strip()
+        if not acc or acc.lower() == "nan":
+            continue
+        if acc.lower().startswith(_CONTAMINANT_PREFIXES):
+            continue
+        out.append(acc)
+    return list(dict.fromkeys(out))
+
+
+class StringUnreachable(Exception):
+    """STRING n'a pas répondu (timeout, connexion) — à ne pas confondre avec
+    « aucune correspondance »."""
+
+
+def _string_post(method: str, data: dict, timeout: int = 120):
+    """POST vers l'API STRING, avec au moins 1 s entre deux appels (politique
+    d'usage STRING) et remontée explicite des messages d'erreur de l'API.
+      - {"Error": ..., "ErrorMessage": ...}  -> ValueError (message STRING)
+      - HTTP 404 / 400 sans corps json      -> StringNoMatch (aucune
+        correspondance, ou taxid inconnu de STRING)
+      - timeout / connexion                 -> StringUnreachable
+    """
+    import time
+    import requests
+    wait = 1.0 - (time.time() - _STRING_LAST_CALL[0])
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        r = requests.post(f"{STRING_API_URL}/json/{method}", data=data,
+                          timeout=timeout)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        raise StringUnreachable(f"{type(e).__name__} after {timeout}s") from e
+    finally:
+        _STRING_LAST_CALL[0] = time.time()
+    try:
+        payload = r.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        raise ValueError(payload.get("ErrorMessage") or payload.get("Error")
+                         or str(payload)[:120])
+    if getattr(r, "status_code", 200) in (400, 404):
+        raise StringNoMatch(f"HTTP {r.status_code} on '{method}' "
+                            f"(no identifier matched / unknown taxid)")
+    r.raise_for_status()
+    return payload or []
+
+
+def _as_list(x) -> list:
+    """Champs multi-valués STRING : liste en json, chaîne 'a,b,c' en tsv
+    (et selon les versions d'API). Gère les deux."""
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return [str(v).strip() for v in x if str(v).strip()]
+    if isinstance(x, str):
+        return [v.strip() for v in x.split(",") if v.strip()]
+    return []
+
+
+def _string_id_map(identifiers: list, species_taxid,
+                   caller_identity: str = DEFAULT_STRING_CALLER,
+                   timeout: int = 120, raise_errors: bool = False
+                   ) -> pd.DataFrame | None:
+    """
+    get_string_ids : résout des accessions vers les identifiants STRING
+    (stringId, preferredName), avec écho de l'ID soumis (queryItem).
+    Requêtes découpées par blocs de _STRING_CHUNK identifiants.
+
+    species_taxid : taxid STRING (= NCBI taxid ; pour les bactéries, celui de
+                    la SOUCHE, ex: 511145 = E. coli K-12 MG1655, pas 562).
+                    None = recherche tous organismes (LENT côté STRING :
+                    réservé au repli de detect_string_taxid, peu d'IDs).
+    raise_errors  : True -> StringUnreachable / autres erreurs remontées à
+                    l'appelant (pour distinguer « pas de réponse » de « rien
+                    trouvé ») ; False -> None + avertissement.
+    Retourne None si aucune correspondance.
+    """
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        return None
+    ids = [str(i) for i in identifiers]
+    step = _STRING_CHUNK if species_taxid is not None else _STRING_NOSPECIES_MAX
+    frames = []
+    try:
+        for k in range(0, len(ids), step):
+            payload = {"identifiers": "\r".join(ids[k:k + step]),
+                       "limit": 1, "echo_query": 1,
+                       "caller_identity": caller_identity}
+            if species_taxid is not None:
+                payload["species"] = species_taxid
+            try:
+                data = _string_post("get_string_ids", payload, timeout=timeout)
+            except StringNoMatch:
+                continue          # aucun ID de ce bloc reconnu : bloc suivant
+            if data:
+                frames.append(pd.DataFrame(data))
+    except Exception as e:
+        if raise_errors:
+            raise
+        print(f"    [WARN] STRING get_string_ids failed "
+              f"({type(e).__name__}: {str(e)[:100]})")
+        return None
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+_UNIPROT_ACC = re.compile(r"^([OPQ][0-9][A-Z0-9]{3}[0-9]|"
+                          r"[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})(-\d+)?$")
+
+
+def _uniprot_organisms(accessions: list, timeout: int = 30) -> pd.DataFrame | None:
+    """Organisme (taxid NCBI de la souche + nom) d'accessions UniProt, via
+    l'API REST UniProt — une requête, ~1 s. None si échec ou rien trouvé."""
+    try:
+        import requests
+    except ImportError:
+        return None
+    accs = [a.split("-")[0] for a in accessions]
+    query = " OR ".join(f"accession:{a}" for a in accs)
+    try:
+        r = requests.get("https://rest.uniprot.org/uniprotkb/search",
+                         params={"query": query, "size": len(accs),
+                                 "fields": "accession,organism_id,organism_name",
+                                 "format": "json"}, timeout=timeout)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+    except Exception as e:
+        print(f"    [INFO] UniProt injoignable ({type(e).__name__}) — "
+              f"repli sur la recherche STRING tous organismes.")
+        return None
+    rows = [{"acc": x.get("primaryAccession"),
+             "taxid": (x.get("organism") or {}).get("taxonId"),
+             "name": (x.get("organism") or {}).get("scientificName")}
+            for x in results]
+    df = pd.DataFrame(rows).dropna(subset=["taxid"]) if rows else None
+    return df if df is not None and not df.empty else None
+
+
+def detect_string_taxid(protein_ids: list,
+                        caller_identity: str = DEFAULT_STRING_CALLER,
+                        min_share: float = 0.5) -> dict:
+    """
+    Identifie l'organisme STRING des accessions du run.
+
+    1. Accessions UniProt (cas DIA-NN sur un protéome UniProt) : UniProt donne
+       le taxid de SOUCHE de chaque accession (1 requête, ~1 s) ; ce taxid est
+       ensuite vérifié dans STRING (get_string_ids avec espèce, rapide).
+       Si STRING ne le connaît pas -> la souche est absente de STRING (message
+       explicite, avec le nom de la souche).
+    2. Repli (accessions non-UniProt, ou UniProt injoignable) : get_string_ids
+       SANS espèce sur 10 accessions — recherche tous organismes, lente côté
+       STRING (d'où l'échantillon réduit et le timeout de 90 s).
+
+    Returns
+    -------
+    dict : taxid (int ou None), name, method, share, others, reliable,
+           unreachable (bool), recommendation.
+    """
+    ids_clean = _clean_ids_for_string(protein_ids)
+    base = {"taxid": None, "name": None, "method": None, "share": 0.0,
+            "others": {}, "reliable": False, "unreachable": False}
+    if not ids_clean:
+        return {**base, "recommendation": "Aucune accession exploitable."}
+    rng = np.random.RandomState(0)
+
+    # --- 1. Voie UniProt ---
+    uni = [a for a in ids_clean if _UNIPROT_ACC.match(a)]
+    if len(uni) >= 5:
+        sample = list(rng.choice(uni, min(25, len(uni)), replace=False))
+        org = _uniprot_organisms(sample)
+        if org is not None:
+            counts = org["taxid"].astype(int).value_counts()
+            tx = int(counts.index[0])
+            name = str(org.loc[org["taxid"].astype(int) == tx, "name"].iloc[0])
+            share_u = float(counts.iloc[0]) / len(sample)
+            others = {int(k): int(v) for k, v in counts.iloc[1:4].items()}
+            print(f"  [DIAG] UniProt : {int(counts.iloc[0])}/{len(sample)} accessions "
+                  f"-> {name} (taxid {tx}). Vérification dans STRING...")
+            check = list(rng.choice(uni, min(50, len(uni)), replace=False))
+            try:
+                mapped = _string_id_map(check, tx, caller_identity, timeout=60,
+                                        raise_errors=True)
+            except StringUnreachable:
+                return {**base, "taxid": tx, "name": name, "method": "uniprot",
+                        "strain_taxid": tx, "unreachable": True, "recommendation": (
+                            f"Souche identifiée par UniProt : {name} (taxid {tx}), "
+                            f"mais STRING n'a pas répondu — présence dans STRING "
+                            f"non vérifiée. Réessayer plus tard ou forcer "
+                            f"go_species_taxid: {tx}.")}
+            except Exception as e:
+                mapped = None
+                print(f"    [WARN] STRING : {type(e).__name__} ({str(e)[:80]})")
+            n_ok = (mapped["queryItem"].nunique()
+                    if mapped is not None and "queryItem" in mapped.columns else 0)
+            share = n_ok / len(check)
+            if share >= 0.30:
+                return {**base, "taxid": tx, "name": name, "method": "uniprot",
+                        "strain_taxid": tx,
+                        "share": round(share, 3), "others": others,
+                        "reliable": share_u >= min_share,
+                        "recommendation": (f"{name} (taxid {tx}) : {n_ok}/{len(check)} "
+                                           f"accessions reconnues par STRING.")}
+            return {**base, "name": name, "method": "uniprot", "others": others,
+                    "strain_taxid": tx, "recommendation": (
+                        f"Vos accessions appartiennent à {name} (taxid {tx}, "
+                        f"UniProt), mais STRING n'en reconnaît que {n_ok}/"
+                        f"{len(check)} pour ce taxid : souche absente de STRING "
+                        f"(ou accessions non indexées). Il faut passer par une "
+                        f"souche présente dans STRING (orthologie).")}
+
+    # --- 2. Repli : STRING tous organismes, petit échantillon ---
+    sample = list(rng.choice(ids_clean, min(10, len(ids_clean)), replace=False))
+    print(f"  [DIAG] Recherche STRING tous organismes sur {len(sample)} accessions "
+          f"(lent côté STRING, jusqu'à ~1-2 min)...")
+    try:
+        mapped = _string_id_map(sample, None, caller_identity, timeout=90,
+                                raise_errors=True)
+    except StringUnreachable as e:
+        return {**base, "unreachable": True, "recommendation": (
+            f"STRING n'a pas répondu ({e}). Organisme non déterminé : renseigner "
+            f"go_species_taxid (taxid de SOUCHE, cf. la fiche UniProt/NCBI d'une "
+            f"de vos protéines).")}
+    except Exception as e:
+        return {**base, "recommendation": f"Erreur STRING ({type(e).__name__}: {str(e)[:80]})."}
+    if mapped is None or "stringId" not in mapped.columns:
+        return {**base, "method": "string", "recommendation": (
+            "Aucune accession reconnue par STRING, tous organismes confondus : "
+            "format d'accession non indexé (ex. identifiants custom/Prokka) ou "
+            "souche absente de STRING.")}
+    key = "queryItem" if "queryItem" in mapped.columns else "stringId"
+    hits = mapped.drop_duplicates(key).copy()
+    hits["_taxid"] = hits["stringId"].astype(str).str.split(".").str[0]
+    counts = hits["_taxid"].value_counts()
+    best = counts.index[0]
+    name = None
+    if "taxonName" in hits.columns:
+        nm = hits.loc[hits["_taxid"] == best, "taxonName"].dropna()
+        name = str(nm.iloc[0]) if len(nm) else None
+    share = float(counts.iloc[0]) / len(sample)
+    label = f"{best}" + (f" ({name})" if name else "")
+    reco = (f"{int(counts.iloc[0])}/{len(sample)} accessions échantillonnées "
+            f"appartiennent au taxid STRING {label}.")
+    if share < min_share:
+        reco += (" Part trop faible pour conclure (accessions de type nom de "
+                 "gène, ou organisme absent de STRING).")
+    return {**base, "taxid": int(best), "name": name, "method": "string",
+            "share": round(share, 3),
+            "others": {int(k): int(v) for k, v in counts.iloc[1:4].items()},
+            "reliable": share >= min_share, "recommendation": reco}
+
+
+def resolve_string_taxid(protein_ids: list, species_taxid,
+                         caller_identity: str = DEFAULT_STRING_CALLER,
+                         interactive: bool = True, min_coverage: float = 0.30
+                         ) -> "tuple[int | None, str | None]":
+    """
+    Pré-vol STRING, à lancer AVANT les statistiques (échec rapide) :
+      - species_taxid 'auto'/None : détection depuis les accessions ;
+      - taxid explicite : couverture mesurée ; si elle est nulle ou faible,
+        détection et proposition du taxid détecté (question, défaut Y).
+    Returns (taxid retenu ou None si GO STRING impossible, nom du taxon).
+    """
+    auto = species_taxid in (None, "", "auto", "AUTO", "Auto")
+    if not auto:
+        diag = diagnose_string_coverage(protein_ids, int(species_taxid), caller_identity,
+                                        min_coverage=min_coverage)
+        print(f"  [DIAG] {diag['recommendation']}")
+        if diag.get("reliable"):
+            return int(species_taxid), None
+        if diag.get("unreachable"):
+            print("  [WARN] STRING injoignable — taxid conservé tel quel, "
+                  "le GO réessaiera en fin de pipeline.")
+            return int(species_taxid), None
+
+    print("  [DIAG] Détection de l'organisme depuis les accessions...")
+    det = detect_string_taxid(protein_ids, caller_identity)
+    print(f"  [DIAG] {det['recommendation']}")
+    if det["others"]:
+        print(f"         Autres taxids trouvés : {det['others']}")
+
+    if auto:
+        if det["reliable"]:
+            print(f"  [AUTO] go_species_taxid = {det['taxid']}"
+                  + (f" ({det['name']})" if det["name"] else ""))
+            return det["taxid"], det["name"]
+        if det.get("unreachable") and det.get("taxid"):
+            print(f"  [AUTO] go_species_taxid = {det['taxid']} (non vérifié dans "
+                  f"STRING) — le GO réessaiera en fin de pipeline.")
+            return det["taxid"], det["name"]
+        print("  [WARN] Organisme STRING non déterminé — GO STRING désactivé "
+              "pour ce run (le reste du pipeline continue).")
+        return None, None
+
+    # Taxid explicite défaillant
+    if det["reliable"] and det["taxid"] != int(species_taxid):
+        print(f"  [!] Le taxid {species_taxid} ne correspond pas à vos accessions "
+              f"(pour une bactérie, STRING attend le taxid de SOUCHE).")
+        if interactive:
+            rep = input(f"  Utiliser le taxid détecté {det['taxid']} à la place ? "
+                        f"[Y/n] -> ").strip().lower()
+            if rep in ("", "y", "yes", "o", "oui"):
+                return det["taxid"], det["name"]
+        else:
+            print(f"  -> Relancer avec go_species_taxid: {det['taxid']} "
+                  f"(ou go_species_taxid: auto).")
+    return int(species_taxid), None
+
+
+# ------------------------------------------------------------------------------
+# Mode orthologie STRING : l'organisme existe dans STRING mais pas vos
+# accessions (autre souche indexée) -> RBH DIAMOND vers le protéome STRING.
+# ------------------------------------------------------------------------------
+
+_GENE_SYMBOL = re.compile(r"^[a-z]{3}[A-Z]?[0-9]?$")   # dnaK, gyrB, prs, rpsP, groL...
+
+
+def _uniprot_taxon(taxid, timeout: int = 20) -> dict | None:
+    """Fiche taxonomie UniProt (rank, scientificName, parent)."""
+    try:
+        import requests
+        r = requests.get(f"https://rest.uniprot.org/taxonomy/{int(taxid)}",
+                         params={"format": "json"}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"    [INFO] Taxonomie UniProt injoignable pour {taxid} ({type(e).__name__}).")
+        return None
+
+
+def _uniprot_parent_species(taxid):
+    """Remonte la taxonomie UniProt jusqu'au rang 'species' (souche -> espèce).
+    Returns (taxid, nom) ou (None, None)."""
+    tx = taxid
+    for _ in range(5):
+        js = _uniprot_taxon(tx)
+        if not js:
+            return None, None
+        if js.get("rank") == "species":
+            return int(js["taxonId"]), js.get("scientificName")
+        parent = js.get("parent") or {}
+        if not parent.get("taxonId"):
+            return None, None
+        tx = parent["taxonId"]
+    return None, None
+
+
+def probe_string_organism(gene_names, taxid,
+                          caller_identity: str = DEFAULT_STRING_CALLER,
+                          n_probe: int = 30):
+    """
+    Vérifie qu'un organisme existe dans STRING à partir de noms de gènes
+    (dnaK, gyrB...) — utile quand les accessions du run n'y sont pas indexées
+    (autre souche). Returns (n_reconnus, n_testés) ; n_reconnus None si STRING
+    ne répond pas, n_testés 0 si aucun nom de gène exploitable.
+    """
+    names = list(dict.fromkeys(str(g).split(";")[0].strip() for g in gene_names))
+    names = [g for g in names if _GENE_SYMBOL.match(g)]
+    if not names:
+        return 0, 0
+    if len(names) > n_probe:
+        names = list(np.random.RandomState(0).choice(names, n_probe, replace=False))
+    try:
+        mapped = _string_id_map(names, int(taxid), caller_identity, timeout=60,
+                                raise_errors=True)
+    except StringUnreachable:
+        return None, len(names)
+    except Exception:
+        return 0, len(names)
+    n = (mapped["queryItem"].nunique()
+         if mapped is not None and "queryItem" in mapped.columns else 0)
+    return int(n), len(names)
+
+
+def _diamond_available() -> bool:
+    import shutil
+    return (shutil.which("diamond") is not None
+            or os.path.exists("diamond.exe") or os.path.exists("diamond"))
+
+
+def plan_string_mapping(protein_ids: list, species_taxid,
+                        caller_identity: str = DEFAULT_STRING_CALLER,
+                        gene_names=None, reference_taxid=None,
+                        _from_explicit: bool = False) -> dict:
+    """
+    Pré-vol complet du backend STRING (AVANT les statistiques). Décide
+    comment relier les accessions du run à STRING :
+      - 'direct'   : accessions indexées dans STRING pour le taxid retenu ;
+      - 'ortholog' : l'organisme est dans STRING mais pas vos accessions (STRING
+                     indexe une autre souche) -> RBH DIAMOND vers le protéome
+                     STRING après les statistiques ;
+      - None       : GO STRING impossible (message explicite).
+
+    reference_taxid : organisme STRING à utiliser en mode orthologie (config
+                      string_reference_taxid). Par défaut : l'espèce parente
+                      (taxonomie UniProt) de la souche de vos accessions.
+    Returns dict : mode, taxid, name, strain_taxid, strain_name.
+    """
+    out = {"mode": None, "taxid": None, "name": None,
+           "strain_taxid": None, "strain_name": None}
+    genes = [g for g in (gene_names if gene_names is not None else [])]
+    auto = species_taxid in (None, "", "auto", "AUTO", "Auto")
+
+    if not auto:
+        T = int(species_taxid)
+        diag = diagnose_string_coverage(protein_ids, T, caller_identity)
+        print(f"  [DIAG] {diag['recommendation']}")
+        if diag.get("reliable"):
+            return {**out, "mode": "direct", "taxid": T}
+        if diag.get("unreachable"):
+            print("  [WARN] STRING injoignable — taxid conservé, non vérifié.")
+            return {**out, "mode": "direct", "taxid": T}
+        cand, cand_name = (int(reference_taxid) if reference_taxid else T), None
+    else:
+        print("  [DIAG] Détection de l'organisme depuis les accessions...")
+        det = detect_string_taxid(protein_ids, caller_identity)
+        print(f"  [DIAG] {det['recommendation']}")
+        if det["reliable"]:
+            print(f"  [AUTO] go_species_taxid = {det['taxid']}"
+                  + (f" ({det['name']})" if det["name"] else ""))
+            return {**out, "mode": "direct", "taxid": det["taxid"], "name": det["name"],
+                    "strain_taxid": det.get("strain_taxid"), "strain_name": det["name"]}
+        if det.get("unreachable") and det.get("taxid"):
+            print(f"  [AUTO] go_species_taxid = {det['taxid']} (non vérifié dans STRING).")
+            return {**out, "mode": "direct", "taxid": det["taxid"], "name": det["name"]}
+        out.update(strain_taxid=det.get("strain_taxid"), strain_name=det.get("name"))
+        if reference_taxid:
+            cand, cand_name = int(reference_taxid), None
+        elif det.get("strain_taxid"):
+            cand, cand_name = _uniprot_parent_species(det["strain_taxid"])
+            if cand:
+                print(f"  [DIAG] Espèce parente (taxonomie UniProt) : {cand_name} "
+                      f"(taxid {cand}) — recherche dans STRING...")
+        else:
+            cand, cand_name = None, None
+        if cand is None:
+            print("  [WARN] Organisme STRING non déterminé — GO STRING désactivé "
+                  "(renseigner string_reference_taxid).")
+            return out
+
+    # --- L'organisme de référence existe-t-il dans STRING ? ---
+    n, m = probe_string_organism(genes, cand, caller_identity)
+    if n is None:
+        print(f"  [WARN] STRING n'a pas répondu — présence du taxid {cand} non vérifiée.")
+    elif m == 0:
+        print(f"  [INFO] Pas de noms de gènes exploitables pour vérifier le taxid "
+              f"{cand} ; le téléchargement du protéome STRING tranchera.")
+    elif n == 0:
+        if not auto and not _from_explicit:
+            print(f"  [DIAG] Le taxid {cand} ne correspond à aucun organisme STRING "
+                  f"(0/{m} gènes reconnus) — détection automatique...")
+            return plan_string_mapping(protein_ids, "auto", caller_identity,
+                                       gene_names, reference_taxid, _from_explicit=True)
+        print(f"  [WARN] Taxid {cand} absent de STRING (0/{m} gènes reconnus). "
+              f"GO STRING désactivé : renseigner string_reference_taxid (une "
+              f"souche proche présente dans STRING).")
+        return out
+    else:
+        print(f"  [DIAG] Organisme STRING {cand}"
+              + (f" ({cand_name})" if cand_name else "")
+              + f" présent : {n}/{m} noms de gènes reconnus.")
+
+    if not _diamond_available():
+        print("  [WARN] Mode orthologie requis, mais DIAMOND est introuvable "
+              "(ni dans le PATH ni dans le dossier courant). GO STRING désactivé "
+              "pour ce run. Installation : github.com/bbuchfink/diamond/releases "
+              "(Windows : diamond.exe à côté de deimos.py, ou dans le PATH).")
+        return out
+
+    src = out.get("strain_name") or "vos accessions"
+    print(f"  [PLAN] Accessions non indexées dans STRING -> orthologie (RBH DIAMOND) "
+          f"{src} -> protéome STRING {cand}, après les statistiques.")
+    return {**out, "mode": "ortholog", "taxid": cand, "name": cand_name}
+
+
+def _string_version(caller_identity: str = DEFAULT_STRING_CALLER) -> str:
+    """Version courante de STRING (endpoint 'version'), pour télécharger le
+    protéome de la MÊME version que l'API d'enrichissement."""
+    try:
+        data = _string_post("version", {"caller_identity": caller_identity}, timeout=30)
+        if data and data[0].get("string_version"):
+            return str(data[0]["string_version"])
+    except Exception:
+        pass
+    return "12.0"
+
+
+def download_string_proteome(taxid, out_dir: str,
+                             caller_identity: str = DEFAULT_STRING_CALLER) -> str | None:
+    """Télécharge (une fois, puis cache) le protéome STRING d'un organisme :
+    <out_dir>/<taxid>.protein.sequences.v<version>.fa. Les en-têtes sont les
+    identifiants STRING ('<taxid>.<protéine>'), donc directement utilisables
+    comme IDs de référence du RBH. None si échec (message avec la marche à
+    suivre manuelle)."""
+    import gzip
+    version = _string_version(caller_identity)
+    fname = f"{taxid}.protein.sequences.v{version}.fa"
+    out = os.path.join(out_dir, fname)
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        print(f"  [OK] Protéome STRING déjà présent : {out}")
+        return out
+    try:
+        import requests
+    except ImportError:
+        return None
+    for base in ("https://stringdb-downloads.org/download",
+                 "https://stringdb-static.org/download"):
+        url = f"{base}/protein.sequences.v{version}/{fname}.gz"
+        try:
+            r = requests.get(url, timeout=300)
+            if r.status_code != 200:
+                continue
+            text = gzip.decompress(r.content).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        if not text.startswith(f">{taxid}."):
+            continue
+        os.makedirs(out_dir, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        n = text.count("\n>") + 1
+        print(f"  [OK] Protéome STRING {taxid} (v{version}) téléchargé : {n} séquences.")
+        return out
+    print(f"  [WARN] Téléchargement du protéome STRING {taxid} impossible. "
+          f"Manuellement : string-db.org > Download > choisir l'organisme > "
+          f"'{fname}.gz', décompresser dans le dossier des données (ou "
+          f"string_reference_fasta: chemin).")
+    return None
+
+
+def download_uniprot_fasta(accessions: list, out_path: str, batch: int = 100) -> int:
+    """Séquences UniProt des accessions (repli quand le FASTA de recherche
+    DIA-NN n'est pas trouvé localement). Returns le nombre de séquences."""
+    try:
+        import requests
+    except ImportError:
+        return 0
+    accs = [a for a in dict.fromkeys(accessions) if _UNIPROT_ACC.match(str(a))]
+    n = 0
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for k in range(0, len(accs), batch):
+            q = " OR ".join(f"accession:{a}" for a in accs[k:k + batch])
+            try:
+                r = requests.get("https://rest.uniprot.org/uniprotkb/stream",
+                                 params={"query": q, "format": "fasta"}, timeout=120)
+                r.raise_for_status()
+            except Exception as e:
+                print(f"  [WARN] UniProt : lot {k // batch + 1} non téléchargé "
+                      f"({type(e).__name__}).")
+                continue
+            fh.write(r.text if r.text.endswith("\n") else r.text + "\n")
+            n += r.text.count(">")
+    return n
+
+
+def string_maps_from_orthologs(ortholog_map: dict):
+    """Adapte un ortholog_map {accession: stringId} (RBH) au format de
+    build_string_maps, pour réutiliser _string_enrich_query."""
+    acc2string, string2acc = dict(ortholog_map), {}
+    for acc, sid in ortholog_map.items():
+        for key in (str(sid), str(sid).split(".", 1)[-1]):
+            string2acc.setdefault(key, []).append(acc)
+    return acc2string, string2acc, len(ortholog_map)
+
+
+def build_string_maps(protein_ids: list, species_taxid: int,
+                      caller_identity: str = DEFAULT_STRING_CALLER):
+    """
+    Résout UNE FOIS toutes les accessions du run (convention Deimos : 1re
+    accession du Protein.Group) vers STRING.
+
+    Returns
+    -------
+    (acc2string, string2acc, n_total) ou None si échec.
+      acc2string : {accession: stringId}
+      string2acc : {clé STRING: [accessions]} — clés = stringId, stringId
+                   sans préfixe taxon, et preferredName (repli), pour
+                   retraduire les intersections quel que soit le format
+                   renvoyé par l'endpoint enrichment.
+    """
+    ids_clean = _clean_ids_for_string(protein_ids)
+    if not ids_clean:
+        return None
+    mapped = _string_id_map(ids_clean, species_taxid, caller_identity)
+    if mapped is None or not {"queryItem", "stringId"} <= set(mapped.columns):
+        return None
+
+    acc2string, string2acc = {}, {}
+    # pandas >= 3 : astype(str) conserve les NaN (float) -> tests explicites
+    names = (mapped["preferredName"] if "preferredName" in mapped.columns
+             else pd.Series([None] * len(mapped)))
+    for q, s, nm in zip(mapped["queryItem"], mapped["stringId"], names):
+        if not isinstance(q, str) or not isinstance(s, str) or not s:
+            continue
+        if q in acc2string:
+            continue
+        acc2string[q] = s
+        for key in (s, s.split(".", 1)[-1]):
+            string2acc.setdefault(key, []).append(q)
+        if isinstance(nm, str) and nm:
+            string2acc.setdefault(nm, [])
+            if q not in string2acc[nm]:
+                string2acc[nm].append(q)
+    return acc2string, string2acc, len(ids_clean)
+
+
+def diagnose_string_coverage(protein_ids: list, species_taxid: int,
+                             caller_identity: str = DEFAULT_STRING_CALLER,
+                             sample_size: int = 200, min_coverage: float = 0.30
+                             ) -> dict:
+    """
+    Équivalent diagnose_gprofiler_coverage() pour le backend STRING — même
+    philosophie (informer avant l'enrichissement complet, ne pas décider à
+    la place de l'utilisateur), via get_string_ids plutôt que g:Convert.
+    """
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        return {"available": False, "reliable": None, "coverage": None,
+                "recommendation": "Package 'requests' non installé — "
+                                   "diagnostic STRING impossible."}
+
+    ids_clean = _clean_ids_for_string(protein_ids)
+    if len(ids_clean) > sample_size:
+        rng = np.random.RandomState(0)
+        sample = list(rng.choice(ids_clean, sample_size, replace=False))
+    else:
+        sample = ids_clean
+
+    try:
+        mapped = _string_id_map(sample, species_taxid, caller_identity,
+                                timeout=60, raise_errors=True)
+    except StringUnreachable as e:
+        return {"available": False, "reliable": False, "coverage": None,
+                "unreachable": True,
+                "recommendation": f"STRING n'a pas répondu ({e}) — couverture "
+                                  f"du taxid {species_taxid} non vérifiée."}
+    except Exception as e:
+        mapped = None
+        print(f"    [WARN] STRING : {type(e).__name__} ({str(e)[:80]})")
+    if mapped is None:
+        return {"available": False, "reliable": False, "coverage": 0.0,
+                "recommendation": (f"Aucune accession reconnue par STRING pour le "
+                                   f"taxid {species_taxid} — taxid absent de STRING "
+                                   f"(bactéries : STRING attend le taxid de SOUCHE, "
+                                   f"pas d'espèce), ou pas de réseau vers "
+                                   f"string-db.org.")}
+
+    n_total = len(sample)
+    n_mapped = (int(mapped.loc[mapped["stringId"].notna(), "queryItem"].nunique())
+                if {"stringId", "queryItem"} <= set(mapped.columns) else 0)
+    coverage = n_mapped / n_total if n_total else 0.0
+    reliable = coverage >= min_coverage
+    reco = (f"{coverage:.0%} des accessions résolues par STRING pour le "
+           f"taxid {species_taxid} (échantillon n={n_total}). ")
+    reco += ("Couverture suffisante pour un enrichissement direct." if reliable
+            else "Couverture faible — vérifier le taxid (souche exacte ?) ou "
+                 "le type d'accession fourni (UniProt vs locus tag).")
+    return {"available": True, "n_sampled": n_total, "n_mapped": n_mapped,
+           "coverage": round(coverage, 3), "reliable": reliable,
+           "recommendation": reco}
+
+
+def run_string_enrichment(query: list[str], species_taxid: int,
+                          caller_identity: str = DEFAULT_STRING_CALLER,
+                          categories: "list[str] | None" = None,
+                          background: "list[str] | None" = None
+                          ) -> pd.DataFrame | None:
+    """
+    Équivalent run_gost(), backend STRING (endpoint 'enrichment').
+
+    query      : identifiants STRING de préférence (résolus via
+                 build_string_maps) — recommandé par STRING, sans ambiguïté.
+    categories : catégories STRING à garder (défaut DEFAULT_STRING_CATEGORIES).
+    background : identifiants STRING formant l'univers statistique (ex. les
+                 protéines quantifiées). None = génome complet de l'espèce
+                 (défaut STRING, équivalent domain_scope='known' de gProfiler).
+
+    Retourne un DataFrame au contrat run_gost() (native/name/p_value/
+    term_size/query_size/intersection_size/source/intersections) + gene_names.
+    'source' est harmonisé sur les labels gProfiler (STRING_CATEGORY_MAP).
+    'intersections' contient les identifiants STRING : la retraduction vers
+    les accessions d'origine est faite par l'appelant (_string_enrich_query).
+    """
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        print("    [WARN] Package 'requests' not installed. STRING GO step skipped.")
+        return None
+
+    payload = {"identifiers": "\r".join(str(q) for q in query),
+               "species": species_taxid,
+               "caller_identity": caller_identity}
+    if background:
+        payload["background_string_identifiers"] = "\r".join(background)
+    try:
+        data = _string_post("enrichment", payload, timeout=180)
+    except Exception as e:
+        print(f"    [WARN] STRING failed ({type(e).__name__}: {str(e)[:100]})")
+        return None
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    if "category" not in df.columns:
+        return None
+
+    cats = categories or DEFAULT_STRING_CATEGORIES
+    df = df[df["category"].isin(cats)].copy()
+    if df.empty:
+        return None
+
+    # STRING renvoie 'p_value' (brut) ET 'fdr' (BH) : on garde le fdr comme
+    # 'p_value' du contrat (process_enrichment attend un p déjà corrigé,
+    # comme gProfiler en mode 'fdr' et run_local_ora) — et on retire le brut
+    # AVANT le renommage, sinon deux colonnes 'p_value' coexistent.
+    df = df.drop(columns=["p_value"], errors="ignore")
+    inter_col = "inputGenes" if "inputGenes" in df.columns else "preferredNames"
+    df["intersections"] = df[inter_col].apply(_as_list)
+    df["gene_names"] = (df["preferredNames"].apply(lambda x: ",".join(_as_list(x)))
+                        if "preferredNames" in df.columns else "")
+    df["category"] = df["category"].map(lambda c: STRING_CATEGORY_MAP.get(c, c))
+    df = df.rename(columns={
+        "term": "native", "description": "name", "fdr": "p_value",
+        "number_of_genes": "intersection_size",
+        "number_of_genes_in_background": "term_size", "category": "source",
+    })
+    df["p_value"] = pd.to_numeric(df["p_value"], errors="coerce")
+    df = df[df["p_value"] < 0.05]
+    if df.empty:
+        return None
+    df["query_size"] = len(query)
+    keep = ["native", "name", "p_value", "term_size", "query_size",
+           "intersection_size", "source", "intersections", "gene_names"]
+    return df[[c for c in keep if c in df.columns]].reset_index(drop=True)
+
+
+def _string_enrich_query(prots: list, string_maps, species_taxid: int,
+                         caller_identity: str, categories=None,
+                         background=None, label: str = "") -> pd.DataFrame | None:
+    """Traduit accessions -> stringId, lance l'enrichissement STRING, puis
+    retraduit les intersections vers les accessions d'origine (restreintes
+    à la requête), pour que le z-score de process_enrichment() retrouve les
+    LFC. Même logique que la branche ortholog_map (Perseverance)."""
+    acc2string, string2acc, _ = string_maps
+    translated = list(dict.fromkeys(acc2string[p] for p in prots if p in acc2string))
+    n_dropped = sum(1 for p in prots if p not in acc2string)
+    if n_dropped:
+        print(f"  [GO] {label}: {n_dropped}/{len(prots)} protéine(s) non "
+              f"résolue(s) par STRING -> exclue(s) de la requête.")
+    if len(translated) <= 5:
+        print(f"  [SKIP] {label}: too few STRING-resolved proteins "
+              f"({len(translated)}), skipped.")
+        return None
+    print(f"  [GO] {label}: {len(translated)} proteins -> STRING "
+          f"(taxid {species_taxid})...")
+    gost_df = run_string_enrichment(translated, species_taxid, caller_identity,
+                                    categories=categories, background=background)
+    if gost_df is None or gost_df.empty:
+        return gost_df
+
+    qset = set(prots)
+
+    def _back(inter):
+        out = []
+        for x in _as_list(inter):
+            accs = [a for a in string2acc.get(x, []) if a in qset]
+            out.extend(accs if accs else [x])
+        return list(dict.fromkeys(out))
+
+    gost_df = gost_df.copy()
+    gost_df["intersections"] = gost_df["intersections"].apply(_back)
+    return gost_df
+
+
+def _prepare_string(protein_ids: list, species_taxid, caller_identity: str,
+                    background_mode: str = "genome"):
+    """Résolution unique des IDs + background, avec log de couverture.
+    Retourne (string_maps, background) ou (None, None) si inutilisable."""
+    if species_taxid in (None, "", "None", "auto", "AUTO", "Auto"):
+        # Normalement déjà résolu par le pré-vol de deimos.main() ; filet de
+        # sécurité si run_go_enrichment est appelé directement.
+        species_taxid, _ = resolve_string_taxid(protein_ids, "auto", caller_identity,
+                                                interactive=False)
+        if species_taxid is None:
+            return None, None
+    maps = build_string_maps(protein_ids, int(species_taxid), caller_identity)
+    if maps is None:
+        print(f"  [WARN] STRING : aucune accession reconnue pour le taxid "
+              f"{species_taxid} (taxid absent de STRING — pour une bactérie, "
+              f"utiliser le taxid de SOUCHE ou go_species_taxid: auto — ou pas "
+              f"de réseau vers string-db.org) — GO ignoré.")
+        return None, None
+    acc2string, _, n_total = maps
+    cov = len(acc2string) / n_total if n_total else 0.0
+    print(f"   STRING : {len(acc2string)}/{n_total} accessions résolues "
+          f"({cov:.0%}) pour le taxid {species_taxid}.")
+    if cov < 0.30:
+        print("   [WARN] Couverture faible — vérifier le taxid (souche exacte) "
+              "ou le type d'accession (UniProt vs locus tag).")
+    background = None
+    if background_mode == "quantified":
+        background = sorted(set(acc2string.values()))
+        print(f"   Background : {len(background)} protéines quantifiées "
+              f"(résolues STRING).")
+    else:
+        print("   Background : génome complet (défaut STRING, équivalent "
+              "domain_scope='known' de gProfiler).")
+    return maps, background
 
 
 def run_gost(query: list[str], organism: str) -> pd.DataFrame | None:
@@ -824,6 +1711,11 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
         organism = go_params.get("organism")
         custom_annotation = go_params.get("custom_annotation")   # DataFrame Perseverance (annotation transferee), ou None
         ortholog_map = go_params.get("ortholog_map")              # dict protein_id -> ortholog_id (RBH), ou None
+        backend = go_params.get("backend", "gprofiler")
+        species_taxid = go_params.get("species_taxid")
+        string_caller = go_params.get("caller_identity") or DEFAULT_STRING_CALLER
+        string_categories = go_params.get("string_categories")
+        string_bg_mode = go_params.get("string_background", "genome")
         background = go_params.get("background")
         if background is None and custom_annotation is not None:
             id_col = "name" if "name" in df_comparaison.columns else df_comparaison.columns[0]
@@ -832,12 +1724,19 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
 
         use_local = custom_annotation is not None
         use_ortholog = (ortholog_map is not None) and not use_local
+        use_string = (backend == "string") and not use_local and not use_ortholog
+        use_string_orth = use_ortholog and backend == "string"
         if use_local:
             print(f"\n[GO] Enrichissement LOCAL (annotation custom — Perseverance/orthologue), "
                   f"pas d'appel gProfiler.")
+        elif use_string_orth:
+            print(f"\n[GO] STRING via orthologues (RBH DIAMOND) — protéome STRING "
+                  f"taxid {species_taxid}")
         elif use_ortholog:
             print(f"\n[GO] gProfiler via orthologues (Perseverance RBH) — "
                   f"espèce de référence '{organism}'")
+        elif use_string:
+            print(f"\n[GO] STRING enrichment — NCBI taxid {species_taxid}")
         else:
             print(f"\n[GO] GO/gProfiler enrichment — species '{organism}'")
         print(f"   Seuils (volcanos) : "
@@ -846,6 +1745,27 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
 
         reverse_ortholog_map = ({v: k for k, v in ortholog_map.items()}
                                 if use_ortholog else None)
+
+        # STRING : résolution UNIQUE de toutes les accessions du run (et du
+        # background éventuel), réutilisée pour tous les contrastes.
+        string_maps, string_bg = None, None
+        if use_string_orth:
+            string_maps = string_maps_from_orthologs(ortholog_map)
+            n_q = df_comparaison.shape[0]
+            print(f"   {len(ortholog_map)}/{n_q} protéines avec un orthologue STRING.")
+            if string_bg_mode == "quantified":
+                string_bg = sorted(set(ortholog_map.values()))
+                print(f"   Background : {len(string_bg)} orthologues STRING des "
+                      f"protéines quantifiées.")
+            else:
+                print("   Background : génome complet (défaut STRING).")
+        elif use_string:
+            id_col = "name" if "name" in df_comparaison.columns else df_comparaison.columns[0]
+            string_maps, string_bg = _prepare_string(
+                df_comparaison[id_col].astype(str).tolist(), species_taxid,
+                string_caller, string_bg_mode)
+            if string_maps is None:
+                return None
 
         results = {}
         for contrast in contrast_names:
@@ -859,6 +1779,11 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                 if use_local:
                     print(f"  [GO] {contrast}: {len(prots)} proteins -> ORA local (Perseverance)...")
                     gost_df = run_local_ora(prots, background, custom_annotation)
+                elif use_string_orth:
+                    gost_df = _string_enrich_query(
+                        prots, string_maps, int(species_taxid), string_caller,
+                        categories=string_categories, background=string_bg,
+                        label=contrast)
                 elif use_ortholog:
                     translated = [ortholog_map[p] for p in prots if p in ortholog_map]
                     n_dropped = len(prots) - len(translated)
@@ -881,6 +1806,11 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                         gost_df["intersections"] = gost_df["intersections"].apply(
                             lambda inter: [reverse_ortholog_map.get(x, x) for x in inter]
                             if isinstance(inter, (list, tuple, np.ndarray)) else inter)
+                elif use_string:
+                    gost_df = _string_enrich_query(
+                        prots, string_maps, int(species_taxid), string_caller,
+                        categories=string_categories, background=string_bg,
+                        label=contrast)
                 else:
                     print(f"  [GO] {contrast}: {len(prots)} proteins -> gProfiler...")
                     gost_df = run_gost(prots, organism)
@@ -924,11 +1854,15 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                     "table": tab_export,
                     "lollipop": f_lol, "dotplot": f_dot,
                 }
-                n_bp = (tab["source"] == "GO:BP").sum()
+                n_bp = (tab["source"] == "GO:BP").sum()   # STRING 'Process' déjà harmonisé en 'GO:BP'
                 if use_local:
                     lbl = "Perseverance/orthologue (ORA local)"
+                elif use_string_orth:
+                    lbl = f"{n_bp} GO:BP (STRING {species_taxid}, via orthologues)"
                 elif use_ortholog:
                     lbl = f"{n_bp} GO:BP, via orthologues {organism}"
+                elif use_string:
+                    lbl = f"{n_bp} GO:BP (STRING, taxid {species_taxid})"
                 else:
                     lbl = f"{n_bp} GO:BP"
                 print(f"     [OK] {len(tab)} enriched terms ({lbl}).")
@@ -985,7 +1919,11 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
         return None
 
     try:
-        organism = go_params["organism"]
+        organism = go_params.get("organism")
+        use_string = go_params.get("backend", "gprofiler") == "string"
+        species_taxid = go_params.get("species_taxid")
+        string_caller = go_params.get("caller_identity") or DEFAULT_STRING_CALLER
+        ortholog_map = go_params.get("ortholog_map")   # RBH (Perseverance ou STRING)
         # Regrouper les protéines par cluster
         from collections import defaultdict
         clusters = defaultdict(list)
@@ -996,8 +1934,25 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
         if not clusters:
             return None
 
-        print(f"\n[GO] Cluster GO enrichment — species '{organism}' "
-              f"({len(clusters)} clusters)")
+        if use_string:
+            print(f"\n[GO] Cluster GO enrichment — STRING taxid {species_taxid} "
+                  f"({len(clusters)} clusters)")
+            if ortholog_map:
+                string_maps = string_maps_from_orthologs(ortholog_map)
+                string_bg = (sorted(set(ortholog_map.values()))
+                             if go_params.get("string_background") == "quantified" else None)
+            else:
+                all_prots = [p for plist in clusters.values() for p in plist]
+                string_maps, string_bg = _prepare_string(
+                    all_prots, species_taxid, string_caller,
+                    go_params.get("string_background", "genome"))
+            if string_maps is None:
+                return None
+        else:
+            if not organism:
+                return None
+            print(f"\n[GO] Cluster GO enrichment — species '{organism}' "
+                  f"({len(clusters)} clusters)")
 
         results = {}
         for cid in sorted(clusters.keys()):
@@ -1007,8 +1962,29 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
                     print(f"  [SKIP] {cid}: too few proteins ({len(prots)}), skipped.")
                     continue
 
-                print(f"  [GO] {cid}: {len(prots)} proteins -> gProfiler...")
-                gost_df = run_gost(prots, organism)
+                if use_string:
+                    gost_df = _string_enrich_query(
+                        prots, string_maps, int(species_taxid), string_caller,
+                        categories=go_params.get("string_categories"),
+                        background=string_bg, label=cid)
+                elif ortholog_map:
+                    # Perseverance -> gProfiler : même traduction/retraduction
+                    # que run_go_enrichment (avant : IDs non traduits).
+                    rev = {v: k for k, v in ortholog_map.items()}
+                    tr = [ortholog_map[p] for p in prots if p in ortholog_map]
+                    if len(tr) <= 5:
+                        print(f"  [SKIP] {cid}: too few orthologs ({len(tr)}), skipped.")
+                        continue
+                    print(f"  [GO] {cid}: {len(tr)} orthologue(s) -> gProfiler ({organism})...")
+                    gost_df = run_gost(tr, organism)
+                    if gost_df is not None and not gost_df.empty and "intersections" in gost_df.columns:
+                        gost_df = gost_df.copy()
+                        gost_df["intersections"] = gost_df["intersections"].apply(
+                            lambda inter: [rev.get(x, x) for x in inter]
+                            if isinstance(inter, (list, tuple, np.ndarray)) else inter)
+                else:
+                    print(f"  [GO] {cid}: {len(prots)} proteins -> gProfiler...")
+                    gost_df = run_gost(prots, organism)
                 if gost_df is None or gost_df.empty:
                     print(f"     No significant enrichment.")
                     continue
