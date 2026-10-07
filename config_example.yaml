@@ -7,7 +7,14 @@
 #   python deimos.py --config config_example.yaml
 #   python deimos.py --config config_example.yaml --out-dir /data/project2
 #
-# CLI arguments (--tsv, --design, --out-dir) always override the YAML.
+# CLI arguments (--tsv, --design, --out-dir, --batch-column, --qc-only)
+# always override the YAML.
+#
+# Unattended runs (no terminal): keep run_perseverance as true/false and set
+# contrasts explicitly when there are more than 30 pairs — "__auto__" asks a
+# question at runtime and the run stops with EOFError if nobody answers.
+#
+# Unknown keys are passed through without error: check the spelling.
 # ==============================================================================
 
 
@@ -31,6 +38,7 @@ n_heatmap_clusters:  3            # Number of k-means clusters (≥ 2)
 
 
 # ── Robustness score ──────────────────────────────────────────────────────────
+# Repeated stochastic imputation with the same method as the reference run.
 # 0 = disabled (significant time saving on large datasets)
 # Recommended: 100 for production analysis, 20 for a quick test
 n_iter_robustness:   100
@@ -43,49 +51,122 @@ n_iter_robustness:   100
 fdr_global:          false
 
 
-# ── Missing-value imputation method ──────────────────────────────────────────
-# 'qrilc'  : pure MNAR — left-censored truncated normal (Lazar 2016)
-#            Recommended for DIA (MNAR expected to dominate)
+# ── Contrasts ─────────────────────────────────────────────────────────────────
+# "__auto__" : all pairs; above 30 pairs, asks with a pattern suggested from
+#              the condition names (the answer is saved in last_config.yaml)
+# "all"      : all pairs, never asks
+# list       : patterns "A_vs_B"
+#              {x} = same value on both sides, * = any value, or explicit names.
+#              The requested orientation is kept (sign flipped if needed).
+contrasts:           "__auto__"
+# contrasts:
+#   - "Live_{s}_vs_Heat_killed_{s}"     # 12 strains -> 12 intra-strain contrasts
+#   - "KO_vs_WT"
+
+# Control condition, always placed as the denominator (treated_vs_control)
+# "__auto__" = detected from synonyms (ctl, ctrl, control, wt, mock...)
+# an explicit name, or false to disable
+control_condition:   "__auto__"
+control_synonyms:    null         # null = default list; or a custom list
+
+
+# ── Missing-value imputation ──────────────────────────────────────────────────
+# 'auto'   : missingness diagnostic -> MIXED if ≥ 20 % of NAs are MAR, QRILC
+#            otherwise. The choice and its reason are written to Methods.
+# 'qrilc'  : pure MNAR — left-censored normal, mean/SD estimated by quantile
+#            regression (Lazar et al. 2016)
 # 'mixed'  : QRILC if fully absent in a condition (MNAR), kNN if partial (MAR)
 #            ⚠️ kNN can artificially inflate statistical power if MAR > 50%
-impute_method:       qrilc
+# Multi-run studies (e.g. one run per temperature in TPP): set the same
+# explicit method for every run instead of 'auto'.
+impute_method:       auto
+
+# Seed of the imputation draw and of the robustness iterations.
+# Same input + same seed = same p-values. Recorded in Methods.
+seed:                42
+
+
+# ── Design ────────────────────────────────────────────────────────────────────
+# Paired design: automatic when ExperimentalDesign.csv has a 'subject' column
+# (aliases: pair, patient, individual) and a subject spans ≥ 2 conditions.
+# A subject with several samples in the SAME condition triggers a
+# pseudo-replication warning (console + Methods); the model is not changed.
+
+# Batch covariate — column of ExperimentalDesign.csv modelled as a nuisance
+# covariate in the design (NOT a correction applied to the matrix before the
+# tests; see diagnostic_batch_correction.png for the before/after check).
+# CLI equivalent: --batch-column batch
+batch_column:        null         # e.g. "batch" or "plate"; null = disabled
+
+
+# ── QC-only mode ──────────────────────────────────────────────────────────────
+# true = raw data + Methods + QC figures only, no statistics
+# (ProteomicAnalysis_QC.xlsx). Enabled automatically when no condition has a
+# replicate. CLI equivalent: --qc-only
+qc_only:             false
+
+
+# ── DEqMS ─────────────────────────────────────────────────────────────────────
+# Peptide-count weighting (requires report.pr_matrix.tsv). An automatic
+# diagnostic (diagnostic_deqms.png) disables DEqMS when the variance~count
+# relationship does not hold on this run, even if use_deqms is true.
+use_deqms:                 false
+deqms_min_r2:              0.10   # min R² (log-variance ~ log2-count), proteins with count > 1
+deqms_max_pseudocount_pct: 50.0   # max % of proteins with count ≤ 1
+deqms_force:               false  # true = ignore the diagnostic and force DEqMS
+
+
+# ── Functional enrichment (GO / KEGG / Reactome) ──────────────────────────────
+# Backend: 'gprofiler' (model organisms) | 'string' (bacteria, non-model species)
+go_backend:          gprofiler
+
+# gProfiler organism code — null = GO enrichment disabled (gprofiler backend)
+# Examples: hsapiens, mmusculus, bnapus, athaliana, efa (E. faecalis), rnorvegicus
+go_organism:         null
+
+# STRING backend (go_backend: string)
+# "auto" = species detected from UniProt accessions (strain taxid, then parent
+# species if the strain is not indexed in STRING -> orthology mode, needs DIAMOND).
+# Non-UniProt identifiers (in-house FASTA): give the taxid and put the search
+# FASTA in the data folder.
+go_species_taxid:    null         # "auto" or an NCBI taxid, e.g. 511145
+string_background:   genome       # genome | quantified (quantified proteins only;
+                                  # recommended when a small fraction of the proteome is quantified)
+string_categories:   null         # null = GO:BP/MF/CC + KEGG + Reactome
+                                  # e.g. [Process, Function, Component, KEGG, Keyword, Pfam]
+string_reference_taxid: null      # orthology mode: STRING organism to map to
+                                  # (default: parent species found via UniProt)
+string_reference_fasta: null      # local STRING proteome (otherwise data folder, then download)
+string_caller_identity: Proteogen # caller identity sent to the STRING API
+
+# Rank-based GSEA (requires gseapy; Enrichr gene-set libraries)
+run_gsea:            false
+
+
+# ── Perseverance — orthology for species poorly covered by gProfiler ─────────
+# "__auto__" asks at EVERY run (even with --config): keep true/false for
+# unattended runs.
+run_perseverance:    false
+perseverance_reference_organism: null  # gProfiler code of the reference species, e.g. "athaliana"
+perseverance_fasta_a: null        # search FASTA and reference proteome, in any order
+perseverance_fasta_b: null        # (null = auto-scan of the folder of tsv_path)
+perseverance_min_identity: 25.0   # % identity for a Reciprocal Best Hit
+perseverance_min_coverage: 50.0   # % coverage for a Reciprocal Best Hit
+
+# Precomputed Perseverance annotation (protein_id, GO, KEGG, Pfam), remapped to
+# protein groups with deimos_to_perseverance.remap_annotation_to_protein_groups().
+# If set, replaces the gProfiler call by a LOCAL enrichment test
+# (hypergeometric + BH, no network), independently of go_organism.
+perseverance_annotation_path: null  # e.g. "perseverance_annotation_protein_group.tsv"
 
 
 # ── Optional modules ──────────────────────────────────────────────────────────
-
-# gProfiler organism for GO/KEGG enrichment
-# Examples: hsapiens, mmusculus, bnapus, athaliana, efa (E. faecalis), rnorvegicus
-# null (or absent) = GO enrichment disabled
-go_organism:         null
-# Annotation par orthologie (Beagle) — organisme non-modele mal couvert par gProfiler.
-# Independant de go_organism : si renseigne, remplace l'appel gProfiler par un test
-# d'enrichissement LOCAL (hypergeometrique+BH, sans reseau) sur cette annotation.
-# Genere par : python beagle.py --query ... --reference ... --out beagle_annot.tsv
-#              puis deimos_to_beagle.remap_annotation_to_protein_groups(...)
-beagle_annotation_path: null       # ex: "beagle_annotation_protein_group.tsv"
-
 # WGCNA — Co-expression module analysis (longest step)
 # Set to false for exploratory analyses
 make_wgcna:          false
 
 # Interactive HTML dashboard (requires build_dashboardv7.py)
 make_dashboard:      true
-
-# DEqMS — Peptide-count weighting (requires report.pr_matrix.tsv)
-use_deqms:           false
-# Diagnostic automatique avant activation reelle de DEqMS (diagnostic_deqms.png) :
-# desactive DEqMS si la relation variance~comptage n'est pas exploitable sur ce run,
-# meme si use_deqms=true ci-dessus.
-deqms_min_r2:              0.10   # R2 min (log-variance ~ log2-comptage), proteines count>1
-deqms_max_pseudocount_pct: 50.0   # % max de proteines a comptage <=1 tolere
-deqms_force:               false  # true = ignore le diagnostic et force DEqMS
-
-# Correction de batch (optionnelle) — nom de colonne dans ExperimentalDesign.csv
-# a controler comme covariable nuisance dans le design (PAS une correction
-# appliquee a la matrice avant les tests : voir diagnostic_batch_correction.png
-# pour la justification AVANT/APRES et la mise en garde methodologique).
-# Equivalent CLI : --batch-column batch
-batch_column:              null    # ex: "batch", ou "plaque" ; null = desactive
 
 
 # ── Input file paths ──────────────────────────────────────────────────────────
