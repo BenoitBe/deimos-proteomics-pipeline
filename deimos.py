@@ -1633,6 +1633,70 @@ def resolve_contrasts(contrast_mat, contrast_names, group_names, params: dict):
     return mat, names
 
 
+_SUBJECT_COLS = ("subject", "pair", "patient", "individual")
+_SUBJECT_LIKE = ("animal", "donor", "mouse", "rat", "sujet", "individu",
+                 "subject_id", "patient_id", "donor_id", "animal_id")
+
+
+def pseudoreplication_check(design: pd.DataFrame) -> "dict | None":
+    """
+    Avertissement (n'altère pas le modèle) : un même sujet a-t-il plusieurs
+    échantillons dans la MÊME condition ? Si oui, ces échantillons ne sont pas
+    des réplicats indépendants (pseudo-réplication) : limma les traite comme
+    tels -> variance résiduelle sous-estimée, p-values trop optimistes.
+    'nested' = chaque sujet n'est que dans une condition -> la comparaison
+    porte ENTRE sujets : l'unité statistique est le sujet.
+    """
+    if design is None or "condition" not in design.columns:
+        return None
+    subj_col = next((c for c in _SUBJECT_COLS if c in design.columns), None)
+    if subj_col is None:
+        return None
+    ok = design[subj_col].notna()
+    subj = (design.loc[ok, subj_col].astype(str).str.strip()
+            .str.replace(r"\.0$", "", regex=True))
+    df = pd.DataFrame({"s": subj.values,
+                       "c": design.loc[ok, "condition"].astype(str).values})
+    counts = df.groupby(["s", "c"]).size()
+    rep = counts[counts >= 2]
+    if rep.empty:
+        return None
+    ex_s, ex_c = rep.index[0]
+    return {"subj_col": subj_col, "n_cells": int(len(rep)),
+            "n_subjects": int(rep.index.get_level_values(0).nunique()),
+            "n_samples": int(rep.sum()),
+            "example": (ex_s, ex_c, int(rep.iloc[0])),
+            "nested": bool((df.groupby("s")["c"].nunique() == 1).all())}
+
+
+def warn_design(design: pd.DataFrame) -> "dict | None":
+    """Affiche les avertissements de design (pseudo-réplication, colonne
+    'sujet' non reconnue). Retourne le résultat de pseudoreplication_check."""
+    pr = pseudoreplication_check(design)
+    if pr:
+        s, c, n = pr["example"]
+        print(f"  [WARN] PSEUDO-REPLICATION : {pr['n_subjects']} sujet(s) ont "
+              f"plusieurs échantillons dans la même condition "
+              f"(ex. {pr['subj_col']} '{s}' x '{c}' : {n} échantillons).")
+        print("         Deimos les traite comme des réplicats indépendants : "
+              "variance sous-estimée, p-values trop optimistes.")
+        if pr["nested"]:
+            print("         Chaque sujet n'est que dans une condition : la "
+                  "comparaison porte ENTRE sujets, l'unité statistique est le sujet.")
+        print("         Pistes : moyenner les répétitions par sujet x condition "
+              "avant Deimos, ou un modèle à effet aléatoire sujet "
+              "(dream / duplicateCorrelation).")
+    elif (design is not None
+          and not any(c in design.columns for c in _SUBJECT_COLS)):
+        like = [c for c in design.columns if c.lower() in _SUBJECT_LIKE]
+        if like:
+            print(f"  [WARN] Colonne {like} présente mais non utilisée comme sujet "
+                  f"(noms reconnus : {', '.join(_SUBJECT_COLS)}). Si elle identifie "
+                  f"l'individu, renommez-la 'subject' pour l'appariement et le "
+                  f"contrôle de pseudo-réplication.")
+    return pr
+
+
 def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
                                meta: pd.DataFrame, design: pd.DataFrame,
                                params: dict, out_dir: str, n_iter: int = 100,
@@ -1693,6 +1757,9 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
                   f"condition: {list(lonely.index)} — they are not paired.")
         if (n_cond_per_subj >= 2).any() and n_subj >= 2 and n_subj < len(subjects):
             paired = True
+
+    # --- Contrôle de design (avertissement seulement, modèle inchangé) ---
+    warn_design(design)
 
     # --- Détection auto d'une condition "contrôle" -> dénominateur systématique
     #     dans tous les contrastes ("exp_vs_ctl" plutôt que "ctl_vs_exp"),
@@ -2978,6 +3045,15 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
         _pp = design.groupby(_sc)["condition"].nunique()
         _paired = (_pp >= 2).any() and design[_sc].nunique() >= 2 \
                   and design[_sc].nunique() < len(design)
+    _pr = pseudoreplication_check(design)
+    if _pr:
+        put_kv("Design check", "WARNING: pseudo-replication",
+               f"{_pr['n_subjects']} subject(s) ('{_pr['subj_col']}') with several "
+               f"samples in the same condition ({_pr['n_samples']} samples); "
+               f"treated as independent replicates, so variance may be "
+               f"underestimated and p-values optimistic"
+               + ("; subjects nested in conditions (between-subject comparison)"
+                  if _pr["nested"] else ""))
     if _paired:
         put_kv("Design matrix", "~0 + condition + subject",
                "Paired design: subject added as fixed effect to absorb "
