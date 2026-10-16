@@ -35,6 +35,9 @@ _DEFAULTS = {
     # porte sur la p.adj, la ligne est placée à la p brute équivalente) | "padj" =
     # -log10 de la statistique du seuil (comportement antérieur)
     "volcano_y_axis":      "pvalue",
+    # Loading plot de la PCA : nombre de protéines motrices annotées, réparties entre
+    # PC1+, PC1-, PC2+, PC2- (0 = aucune annotation)
+    "pca_n_drivers":       20,
     # ANOVA / Heatmap
     "anova_use_padj":      False,
     "anova_p_thresh":      0.05,
@@ -153,6 +156,12 @@ def _validate(params: dict) -> list[str]:
     if str(params.get("volcano_y_axis", "pvalue")).lower() not in ("pvalue", "padj"):
         errors.append(f"  volcano_y_axis doit être 'pvalue' ou 'padj' "
                       f"(valeur : {params.get('volcano_y_axis')!r})")
+    try:
+        if int(params.get("pca_n_drivers", 20)) < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append(f"  pca_n_drivers doit être un entier >= 0 "
+                      f"(valeur : {params.get('pca_n_drivers')!r})")
     if params.get("n_heatmap_clusters", 0) < 2:
         errors.append(f"  n_heatmap_clusters doit être ≥ 2")
     if params.get("n_iter_robustness", 0) < 0:
@@ -611,6 +620,7 @@ volcano_use_padj:    false        # true = FDR (p.adj), false = p-value brute
 volcano_p_thresh:    0.05
 volcano_ratio_min:   1.5          # ratio linéaire (ex: 1.5 = 50% de changement)
 volcano_y_axis:      pvalue       # axe Y : pvalue (p brute, défaut) | padj (statistique du seuil)
+pca_n_drivers:       20           # protéines motrices annotées sur le loading plot (PC1±, PC2±)
 
 anova_use_padj:      false
 anova_p_thresh:      0.05

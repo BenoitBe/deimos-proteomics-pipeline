@@ -102,6 +102,27 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **PCA loading plot.** Score plot (samples) and loading plot (proteins) side by side, from
+  the same PCA as `plot_pca` (same axes, same signs): a protein on the right of B is more
+  abundant in the samples on the right of A. ANOVA-significant proteins are coloured by
+  the condition where they are most abundant, with the score-plot colours (a single
+  contrast: volcano rule, higher in A / higher in B); the coloured proteins farthest
+  from the origin are labelled. Figure `plot_pca_loadings.png` (sheet PCA_UMAP) and
+  sheet `PCA_Loadings` (PC1-PC3 loadings, group, ANOVA cluster, sorted by distance to
+  the origin). Methods row added.
+  - **Driving proteins**: the `pca_n_drivers` (default 20) most extreme loadings, split
+    between PC1+, PC1-, PC2+ and PC2-, are circled and labelled, and listed under the
+    figure with their description and the conditions lying on that side of the score
+    plot (column `driver` in PCA_Loadings). Sample scores in sheet `PCA_Scores`.
+  - **Dashboard** (QC / PCA tab): the same score plot + loading plot, read from
+    PCA_Scores / PCA_Loadings (same PCA, axes and signs as the Excel figure), with the
+    driver table; hover for gene, description, group and loadings, click a protein (in
+    the plot or the table) to find it in the volcano. Non-significant proteins are
+    subsampled to 3,000 points (drivers always kept). Hidden for older workbooks.
+- **Dashboard condition palette** had 6 colours and cycled: beyond 6 conditions two
+  conditions shared a colour (8-condition run: embAviso0 = embMajor24). 12 colours now,
+  the first 6 unchanged.
+
 - `tests/test_limma_reference.py` and `tests/fixtures/limma_r/` (R reference outputs on
   simulated data, with the scripts that made them): limma and DEqMS against R, InMoose
   when installed, BH with missing values, DEqMS grid, rank-deficient design.
@@ -200,6 +221,20 @@ and dashboard improvements accumulated since the previous public version.
   the HTML dashboard from an existing Excel workbook without rerunning analysis).
 
 ### Fixed
+
+- **Methods sheet.** The GO section reported the measured species (`bnapus`) when the
+  enrichment ran on the reference species through Perseverance orthologues; the row now
+  names the reference organism and the translation (RBH, number of orthologues). Selected
+  contrasts are no longer described as "all condition pairs"; the ANOVA correction is
+  described as across proteins; the WGCNA network is described as unsigned
+  (|cor|^beta, as computed).
+- **ANOVA p-values** computed with the survival function (`1 - cdf` underflowed to 0 for
+  very strong effects).
+- **Volcanos.** Legend placed automatically again (it hid labels in the upper right
+  corner); dashboard volcanos no longer floor p at 1e-10 (points piled up at
+  -log10 p = 10) and their Y-axis ticks follow the range.
+- **Orthologue coverage** capped at 100 % (alignment length with gaps could exceed the
+  shorter sequence).
 
 - **Perseverance with a UniProt reference FASTA.** DIAMOND reports the first word of the
   FASTA header, i.e. `sp|Q9C5R8|NAME_ARATH`, and these strings were sent as such to

@@ -2270,7 +2270,7 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
         ax.set_title(f"{cname.replace('_vs_', ' vs ')}\n"
                      f"Up {int(up.sum())} | Down {int(down.sum())}  ({rule_txt})",
                      fontsize=10)
-        ax.legend(fontsize=7, loc="upper right")
+        ax.legend(fontsize=7, loc="best", framealpha=0.85)
         fig.tight_layout()
         f = os.path.join(out_dir, f"volc_{cname}.png")
         fig.savefig(f, dpi=150)
@@ -2333,20 +2333,30 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
 # 7. PCA + ELLIPSES
 # ==============================================================================
 
+def _pca_fit(mat_imp: pd.DataFrame) -> dict:
+    """PCA des échantillons (protéines centrées-réduites), partagée par le score plot
+    et le loading plot : mêmes axes, mêmes signes.
+    coords : échantillons × PC ; loadings : protéines × PC (vecteurs propres)."""
+    expr = mat_imp.T.values  # (n_samples × n_proteins)
+    # Imputation des éventuels NaN résiduels pour la PCA
+    expr_imp = np.array(expr, dtype=float)
+    if np.isnan(expr_imp).any():                    # moyenne par protéine (0 si vide)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mu = np.nan_to_num(np.nanmean(expr_imp, axis=0))
+        expr_imp = np.where(np.isnan(expr_imp), mu, expr_imp)
+    expr_scaled = StandardScaler().fit_transform(expr_imp)
+    pca = PCA(n_components=min(10, expr_scaled.shape[1], expr_scaled.shape[0]))
+    coords = pca.fit_transform(expr_scaled)
+    return {"coords": coords, "var_exp": pca.explained_variance_ratio_,
+            "loadings": pca.components_.T}
+
+
 def plot_pca(mat_imp: pd.DataFrame, design: pd.DataFrame, out_dir: str,
              data_label: str = "imputed data") -> list[str]:
     """PCA sur les données imputées, avec et sans ellipses de confiance."""
-    expr = mat_imp.T.values  # (n_samples × n_proteins)
-    # Imputation des éventuels NaN résiduels pour la PCA
-    imp = SimpleImputer(strategy="mean")
-    expr_imp = imp.fit_transform(expr)
-
-    scaler = StandardScaler()
-    expr_scaled = scaler.fit_transform(expr_imp)
-
-    pca = PCA(n_components=min(10, expr_scaled.shape[1], expr_scaled.shape[0]))
-    coords = pca.fit_transform(expr_scaled)
-    var_exp = pca.explained_variance_ratio_
+    fit = _pca_fit(mat_imp)
+    coords, var_exp = fit["coords"], fit["var_exp"]
 
     conditions = design["condition"].values
     labels     = design["label"].values
@@ -2382,6 +2392,204 @@ def plot_pca(mat_imp: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         files.append(f)
 
     return files
+
+
+def pca_drivers(L: np.ndarray, coords: np.ndarray, conditions, n_total: int) -> dict:
+    """Protéines qui tirent la PCA dans chaque direction : les loadings les plus
+    positifs / négatifs sur PC1 et PC2 (n_total réparti entre les 4 directions).
+    Pour chaque direction, les conditions dont les échantillons sont le plus de ce côté
+    du score plot (moyenne de score la plus élevée dans ce sens, 2 au plus).
+    Retourne {'PC1+': {'idx': [...], 'conditions': [...]}, ...} ({} si n_total = 0)."""
+    if n_total <= 0 or L.shape[1] < 2:
+        return {}
+    n_per = max(1, int(round(n_total / 4)))
+    conditions = np.asarray(conditions)
+    conds = list(dict.fromkeys(conditions))
+    out = {}
+    for k, pc in ((0, "PC1"), (1, "PC2")):
+        order = np.argsort(L[:, k])
+        mean_sc = np.array([coords[conditions == c, k].mean() for c in conds])
+        for sign, idx in (("+", order[::-1][:n_per]), ("-", order[:n_per])):
+            sgn = 1 if sign == "+" else -1
+            side = [conds[i] for i in np.argsort(-sgn * mean_sc)[:2] if sgn * mean_sc[i] > 0]
+            out[f"{pc}{sign}"] = {"idx": [int(i) for i in idx], "conditions": side}
+    return out
+
+
+def plot_pca_loadings(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.DataFrame,
+                      df_results: pd.DataFrame, contrast_names: list,
+                      cluster_mapping: list, params: dict, out_dir: str,
+                      n_drivers: "int | None" = None):
+    """Score plot (échantillons) et loading plot (protéines) côte à côte, sur la même
+    PCA que plot_pca : une protéine à droite en B est plus abondante dans les
+    échantillons à droite en A.
+
+    Couleur des protéines :
+      - un seul contraste (2 conditions) : règle des volcanos (plus abondante dans
+        A / dans B / non significative) ;
+      - sinon : protéines significatives à l'ANOVA colorées par la condition où
+        elles sont le plus abondantes (couleurs du score plot) ; gris = non
+        significatives. Le cluster de la heatmap ANOVA est donné dans la table.
+    Protéines motrices : les n_drivers (clé pca_n_drivers, défaut 20) aux loadings les
+    plus extrêmes, répartis entre les quatre directions PC1+, PC1-, PC2+, PC2- ; elles
+    sont cerclées et étiquetées, et listées sous la figure avec leur description et
+    les conditions situées de ce côté du score plot.
+    Retourne (figure, loadings PC1-PC3 par protéine, scores PC1-PC3 par échantillon) ;
+    (None, None, None) en cas d'échec. Les deux tables sont écrites dans l'Excel
+    (PCA_Loadings, PCA_Scores) et relues par le dashboard (même PCA, mêmes axes)."""
+    try:
+        fit = _pca_fit(mat_imp)
+    except Exception as e:                                            # noqa: BLE001
+        print(f"  [WARN] PCA loadings skipped ({type(e).__name__}: {e})")
+        return None, None, None
+    coords, var_exp, L = fit["coords"], fit["var_exp"], fit["loadings"]
+    if L.shape[1] < 2:
+        return None, None, None
+    names = (meta["name"].astype(str).values if "name" in meta.columns
+             else np.asarray(mat_imp.index).astype(str))
+    genes = (meta["Genes"].astype(str).str.split(";").str[0].values
+             if "Genes" in meta.columns else names)
+    genes = np.where(pd.Series(genes).isin(["", "nan", "None"]).values, names, genes)
+    desc_col = next((c for c in ("First.Protein.Description", "Protein.Names")
+                     if c in meta.columns), None)
+    descs = (meta[desc_col].astype(str).replace({"nan": ""}).values if desc_col
+             else np.full(len(names), "", dtype=object))
+    if n_drivers is None:
+        n_drivers = int(params.get("pca_n_drivers", 20) or 0)
+
+    # --- groupes de protéines ---
+    group = np.full(len(names), "", dtype=object)
+    two_cols = {}
+    if len(contrast_names) == 1 and f"{contrast_names[0]}_diff" in df_results.columns:
+        c = contrast_names[0]
+        a_cond, b_cond = c.split("_vs_")
+        _, _, _, up, down = volcano_status(df_results, c, params)
+        res_names = df_results["name"].astype(str).values
+        status = dict(zip(res_names, np.where(up, f"Higher in {a_cond}",
+                                              np.where(down, f"Higher in {b_cond}", ""))))
+        group = np.array([status.get(n, "") for n in names], dtype=object)
+        palette = {f"Higher in {a_cond}": "#E74C3C", f"Higher in {b_cond}": "#3498DB"}
+        two_cols = {a_cond: "#E74C3C", b_cond: "#3498DB"}     # mêmes couleurs en A et B
+        grey_label = "No change (volcano rule)"
+        rule = (f"{'p.adj' if params['volcano_use_padj'] else 'p.value'} < "
+                f"{params['volcano_p_thresh']} & ratio >= {params['volcano_ratio_min']}")
+    else:
+        # protéines significatives à l'ANOVA, colorées par la condition où leur
+        # abondance moyenne est maximale (mêmes couleurs que le score plot A)
+        cm = dict(cluster_mapping or [])
+        sig = np.array([n in cm for n in names])
+        conds_u = list(dict.fromkeys(design["condition"].values))
+        X = mat_imp.values
+        means = np.column_stack([np.nanmean(X[:, design["condition"].values == c], axis=1)
+                                 for c in conds_u])
+        peak = np.array(conds_u, dtype=object)[np.nanargmax(np.nan_to_num(means, nan=-np.inf),
+                                                            axis=1)]
+        group = np.where(sig, peak, "").astype(object)
+        cmap_c = _condition_colors(design["condition"].values)
+        palette = {f"{c}": cmap_c[c] for c in conds_u}
+        grey_label = "Not significant (ANOVA)"
+        rule = "colour = condition of highest abundance"
+
+    drivers = pca_drivers(L, coords, design["condition"].values, n_drivers)
+    drv_tag = np.full(len(names), "", dtype=object)
+    for d, info in drivers.items():
+        for r, i in enumerate(info["idx"], 1):
+            drv_tag[i] = (drv_tag[i] + "; " if drv_tag[i] else "") + f"{d} #{r}"
+    loadings = pd.DataFrame({"name": names, "Genes": genes, "Description": descs,
+                             **{f"PC{k + 1}_loading": L[:, k] for k in range(min(3, L.shape[1]))},
+                             "group": np.where(group == "", grey_label, group),
+                             "driver": drv_tag})
+    if cluster_mapping:
+        loadings["ANOVA_cluster"] = pd.Series(names).map(dict(cluster_mapping)).fillna("").values
+    loadings["PC1_PC2_norm"] = np.hypot(L[:, 0], L[:, 1])
+
+    conditions = design["condition"].values
+    labels = design["label"].values
+    cmap = _condition_colors(conditions)
+    if len(contrast_names) == 1 and set(two_cols) >= set(conditions):
+        cmap = dict(two_cols)
+    n_per = max((len(v["idx"]) for v in drivers.values()), default=0)
+    h_tab = (0.3 + 0.15 * n_per) if n_per else 0
+    fig = plt.figure(figsize=(16.5, 6.5 + h_tab))
+    gs = fig.add_gridspec(2 if n_per else 1, 2, width_ratios=[1, 1.25],
+                          height_ratios=[6.5, h_tab] if n_per else [1], hspace=0.28)
+    axA, axB = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    # A — échantillons
+    for cond in dict.fromkeys(conditions):
+        m = conditions == cond
+        axA.scatter(coords[m, 0], coords[m, 1], color=cmap[cond], label=cond, s=55,
+                    alpha=0.9, zorder=3)
+        for xi, yi, li in zip(coords[m, 0], coords[m, 1], labels[m]):
+            axA.annotate(li, (xi, yi), fontsize=6, alpha=0.7, xytext=(3, 3),
+                         textcoords="offset points")
+    axA.axhline(0, color="grey", lw=0.5); axA.axvline(0, color="grey", lw=0.5)
+    axA.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}% of variance)")
+    axA.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}%)")
+    axA.set_title("A. Score plot — samples", loc="left", fontweight="bold")
+    axA.legend(fontsize=7, loc="best", framealpha=0.85,
+               ncol=1 if len(set(conditions)) <= 8 else 2)
+
+    # B — protéines
+    grey = group == ""
+    axB.scatter(L[grey, 0], L[grey, 1], s=4, color="#C8C8C8", alpha=0.5, lw=0,
+                label=f"{grey_label} ({int(grey.sum())})", rasterized=True, zorder=1)
+    for g, col in palette.items():
+        m = group == g
+        if m.any():
+            axB.scatter(L[m, 0], L[m, 1], s=9, color=col, alpha=0.8, lw=0,
+                        label=f"{g} ({int(m.sum())})", rasterized=True, zorder=2)
+    def _dark(c):              # couleurs claires de tab20 illisibles en texte : assombries
+        r, g, b_ = matplotlib.colors.to_rgb(c)
+        return (r * 0.6, g * 0.6, b_ * 0.6)
+    top = sorted({int(i) for v in drivers.values() for i in v["idx"]})
+    if top:
+        axB.scatter(L[top, 0], L[top, 1], s=34, facecolors="none", edgecolors="black",
+                    linewidths=0.8, zorder=4, label=f"Driving proteins ({len(top)})")
+        texts = [axB.text(L[i, 0], L[i, 1], genes[i], fontsize=6.5, fontweight="bold",
+                          color=_dark(palette.get(group[i], "#555555")), zorder=5)
+                 for i in top]
+        try:
+            from adjustText import adjust_text
+            adjust_text(texts, ax=axB, arrowprops=dict(arrowstyle="-", color="grey", lw=0.4))
+        except ImportError:
+            pass
+    axB.axhline(0, color="grey", lw=0.5); axB.axvline(0, color="grey", lw=0.5)
+    axB.set_xlabel("Loading on PC1"); axB.set_ylabel("Loading on PC2")
+    axB.set_title(f"B. Loading plot — proteins ({rule})", loc="left", fontweight="bold")
+    axB.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1), framealpha=0.85,
+               markerscale=2, borderaxespad=0)
+    if n_per:
+        axT = fig.add_subplot(gs[1, :]); axT.axis("off")
+        for j, (d, info) in enumerate(drivers.items()):
+            x0 = j / 4
+            side = ", ".join(info["conditions"])
+            axT.text(x0, 1.0, f"{d}  (→ {side})" if side else d, transform=axT.transAxes,
+                     fontsize=7.5, fontweight="bold", va="top")
+            for r, i in enumerate(info["idx"], 1):
+                d_txt = descs[i] if len(descs[i]) <= 34 else descs[i][:33] + "…"
+                axT.text(x0, 1.0 - r / (n_per + 0.6),
+                         f"{r}. {genes[i]}  {d_txt}", transform=axT.transAxes, fontsize=6.5,
+                         va="top", color=_dark(palette.get(group[i], "#555555")))
+    fig.text(0.5, 0.0, "Same PCA, same axes: a protein on the right in B is more abundant in "
+             "the samples on the right in A (and likewise for the other directions). Circled: "
+             "the proteins with the most extreme loadings in each direction (listed below, "
+             "with the conditions lying on that side of the score plot).",
+             ha="center", va="top", fontsize=8, color="#555555")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            fig.tight_layout(rect=[0, 0.02, 1, 1])
+    except Exception:                                                 # noqa: BLE001
+        pass
+    f = os.path.join(out_dir, "plot_pca_loadings.png")
+    fig.savefig(f, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    loadings = loadings.sort_values("PC1_PC2_norm", ascending=False).reset_index(drop=True)
+    npc = min(3, coords.shape[1])
+    scores = pd.DataFrame({"label": labels, "condition": conditions,
+                           **{f"PC{k + 1}": coords[:, k] for k in range(npc)},
+                           **{f"PC{k + 1}_var_pct": float(var_exp[k] * 100) for k in range(npc)}})
+    return f, loadings, scores
 
 
 def _draw_ellipse(ax, x, y, color, alpha=0.2, level=0.95):
@@ -2540,7 +2748,7 @@ def run_anova_heatmaps(mat_imp: pd.DataFrame, meta: pd.DataFrame,
     ms_between = ss_between / df_between
     ms_within  = np.maximum(ss_within / df_within, 1e-12)
     f_stat = ms_between / ms_within
-    p_vals = 1 - fdist.cdf(f_stat, df_between, df_within)
+    p_vals = fdist.sf(f_stat, df_between, df_within)     # exact in the tail (1 - cdf underflows)
 
     # BH correction
     from limma_ebayes import _bh_correction
@@ -3047,6 +3255,32 @@ def build_mm_sheet(ws):
     nc.font = Font(italic=True, size=9, color=C_HDRTXT); nc.alignment = wrap
 
 
+def _methods_go_species_orthologs(wb, organism, n_orth: int, n_prot: int,
+                                  params: dict) -> None:
+    """Onglet Methods écrit avant Perseverance : la ligne 'Species' de la section GO
+    indique alors l'organisme mesuré. Avec les orthologues, le GO porte sur l'espèce
+    de référence : la ligne est réécrite (organisme + mode de traduction)."""
+    if "Methods" not in wb.sheetnames or not organism:
+        return
+    ws = wb["Methods"]
+    in_go = False
+    for row in ws.iter_rows():
+        key = str(row[0].value or "")
+        if "FUNCTIONAL ENRICHMENT" in key:
+            in_go = True
+        elif in_go and key == "Species" and len(row) >= 3:
+            measured = params.get("go_organism") or "measured species"
+            row[1].value = f"{organism} (reference species, via orthologues)"
+            row[2].value = (f"g:Profiler organism code of the reference species. Proteins of "
+                            f"{measured} translated by reciprocal best hits (DIAMOND, "
+                            f"Perseverance): {n_orth}/{n_prot} proteins with an orthologue, "
+                            f"identity >= {params.get('perseverance_min_identity', 25.0)}%, "
+                            f"coverage >= {params.get('perseverance_min_coverage', 50.0)}%; "
+                            f"proteins without orthologue are excluded from the query and "
+                            f"the background; pairs in sheet Orthologues_Perseverance")
+            return
+
+
 def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
                         df_results: pd.DataFrame, sig_names, contrast_names: list,
                         design: pd.DataFrame, n_proteins_filt: int,
@@ -3128,8 +3362,11 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_kv("Samples", str(n_samples), "LFQ columns from the DIA-NN report")
     put_kv("Conditions", str(n_cond), ", ".join(map(str, design["condition"].unique())))
     put_kv("Replicates / condition", rep_range, "Biological replicates")
+    _n_pairs = n_cond * (n_cond - 1) // 2
     put_kv("Comparisons", str(len(contrast_names)),
-           "All condition pairs (pairwise combinations)")
+           "All condition pairs (pairwise combinations)" if len(contrast_names) >= _n_pairs
+           else f"Selected among the {_n_pairs} condition pairs (configuration key "
+                f"'contrasts'): " + ", ".join(map(str, contrast_names)))
 
     # ===== PREPROCESSING =====
     put_section("2. DATA PREPROCESSING")
@@ -3266,7 +3503,8 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     else:
         put_kv("Design matrix", "~0 + condition",
                "One-hot encoding of conditions")
-    put_kv("Contrasts", "All pairs", "makeContrasts equivalent")
+    put_kv("Contrasts", "All pairs" if len(contrast_names) >= _n_pairs
+           else f"{len(contrast_names)} selected pairs", "makeContrasts equivalent")
     put_kv("Multiple correction", "Benjamini-Hochberg",
            "Global FDR (all comparisons, one test family)"
            if params.get("fdr_global") else
@@ -3330,9 +3568,7 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_kv("Test", "One-way ANOVA (F-test)",
            "Per protein, on the condition factor")
     put_kv("Multiple correction", "Benjamini-Hochberg",
-           "Global FDR (all comparisons, one test family)"
-           if params.get("fdr_global") else
-           "Per-contrast FDR (one test family per comparison)")
+           "Across proteins (one F-test per protein)")
     put_kv("Significance threshold", p_anova,
            f"Threshold = {params['anova_p_thresh']} (independent of the volcanos)")
     put_kv("Significant proteins", str(n_sig_anova),
@@ -3347,6 +3583,13 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_header()
     put_kv("PCA", "PCA on imputed data",
            "Standardized, 95% confidence ellipses (normal distribution)")
+    put_kv("PCA loadings", "Score plot + loading plot (same PCA)",
+           "Protein loadings = eigenvector components on PC1/PC2 (sheet PCA_Loadings, PC1-PC3): "
+           "a protein on the right of the loading plot is more abundant in the samples on the "
+           "right of the score plot. Colours: ANOVA-significant proteins by the condition "
+           "where they are most abundant, as in the score plot (one contrast: volcano rule). "
+           f"Driving proteins: the {int(params.get('pca_n_drivers', 20) or 0)} most extreme "
+           "loadings, split between PC1+, PC1-, PC2+ and PC2- (column 'driver')")
     put_kv("UMAP", "n_neighbors=5, min_dist=0.1",
            "Non-linear projection, seed=42 (reproducible)")
     put_kv("Correlation", "Pearson between samples",
@@ -3358,8 +3601,9 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     # ===== WGCNA =====
     put_section("7. WGCNA (Co-expression)")
     put_header()
-    put_kv("Network", "Signed hybrid",
-           "Adjacency = |Pearson correlation|^beta")
+    put_kv("Network", "Unsigned",
+           "Adjacency = |Pearson correlation|^beta: positively and negatively "
+           "correlated proteins can belong to the same module")
     put_kv("Soft power (beta)", "Auto (R2 >= 0.80)",
            "Selected by scale-free topology fit")
     put_kv("Similarity", "TOM",
@@ -3534,7 +3778,7 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
                  go_enabled: bool = False, go_organism: str = None,
                  n_iter: int = 100, use_deqms: bool = False,
                  mat_imp: pd.DataFrame = None, umap_coords: pd.DataFrame = None,
-                 imputation_info: pd.DataFrame = None):
+                 imputation_info: pd.DataFrame = None, pca_loadings_file: str = None):
     """Assemble le classeur Excel multionglets."""
     print("\n[EXCEL] Generating the Excel file...")
     wb = openpyxl.Workbook()
@@ -3665,6 +3909,10 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
         r = (i // 2) * IMG_ROW_STEP + 1
         c = (i % 2) * IMG_COL_STEP + 1
         insert_img(ws, f, row=r, col=c)
+    if pca_loadings_file:
+        # figure double (échantillons | protéines) : une ligne entière, plus large
+        r = ((len(pca_imgs) + 1) // 2) * IMG_ROW_STEP + 1
+        insert_img(ws, pca_loadings_file, row=r, col=1, max_w_px=1150, max_h_px=500)
 
     # --- Feuille UMAP : coordonnées par échantillon (pour le dashboard) ---
     if umap_coords is not None and len(umap_coords) > 0:
@@ -5231,6 +5479,14 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         mat_imp, meta_filt, design_filt, params, out_dir
     )
 
+    # --- 10bis. PCA : score plot + loading plot (après l'ANOVA : couleurs = clusters) ---
+    print("\n[STEP] PCA loading plot...")
+    pca_load_file, pca_loadings, pca_scores = plot_pca_loadings(
+        mat_imp, meta_filt, design_filt, df_results, contrast_names,
+        cluster_mapping, params, out_dir)
+    if pca_load_file:
+        print("  [OK] Score + loading plot saved (sheets PCA_UMAP, PCA_Loadings, PCA_Scores)")
+
     # --- 11. UpSet ---
     print("\n[STEP] UpSet plot...")
     upset_file, df_intersections = plot_upset(df_results, contrast_names, params, out_dir)
@@ -5289,11 +5545,18 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         go_organism=(go_params["organism"] if go_params else None),
         n_iter=N_ITER, use_deqms=(pep_count is not None),
         mat_imp=mat_imp, umap_coords=umap_coords,
-        imputation_info=imputation_info
+        imputation_info=imputation_info, pca_loadings_file=pca_load_file
     )
 
     # Ré-ouvrir le classeur pour ajouter les onglets WGCNA
     wb = load_workbook(output_name)
+    if pca_loadings is not None and len(pca_loadings):
+        _pos = (wb.sheetnames.index("PCA_UMAP") + 1) if "PCA_UMAP" in wb.sheetnames else None
+        ws = wb.create_sheet("PCA_Loadings", _pos)
+        _write_df(ws, pca_loadings.round(5))
+        if pca_scores is not None:
+            ws = wb.create_sheet("PCA_Scores", (_pos + 1) if _pos is not None else None)
+            _write_df(ws, pca_scores.round(4))
     if wgcna_results is not None:
         export_wgcna_sheets(wb, wgcna_results, _write_df, _ins_img)
 
@@ -5333,6 +5596,11 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     # Perseverance) : l'organisme mesuré n'est pas celui du GO.
     _persev_go = bool((go_params or {}).get("custom_annotation") is not None
                       or (persev_override is not None and not _string_orth))
+
+    if persev_override is not None and not _string_orth:
+        _methods_go_species_orthologs(wb, persev_override.get("organism"),
+                                      len(persev_override.get("ortholog_map") or {}),
+                                      len(df_results), params)
 
     # --- 14. Enrichissement GO/gProfiler (optionnel, non bloquant) ---
     go_sheet_map = {}

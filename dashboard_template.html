@@ -746,7 +746,7 @@ function drawVolcano(){
   ctx.font='10px sans-serif';
   [-3,-2,-1,0,1,2,3].filter(v=>v>=xmin&&v<=xmax).forEach(v=>{ctx.textAlign='center';ctx.fillText(v,sx(v),H-28);});
   ctx.textAlign='right';
-  [0,1,2,3,4,5].filter(v=>v<=ymax).forEach(v=>ctx.fillText(v,pad.l-5,sy(v)+4));
+  {const st=ymax>40?10:ymax>16?5:ymax>8?2:1;for(let v=0;v<=ymax;v+=st)ctx.fillText(v,pad.l-5,sy(v)+4);}
   ctx.font='bold 12px sans-serif';ctx.textAlign='left';
   ctx.fillStyle='rgba(63,185,80,.9)';ctx.fillText('↑ '+su,pad.l+pw-52,pad.t+16);
   ctx.fillStyle='rgba(248,81,73,.9)';ctx.fillText('↓ '+sd,pad.l+pw-52,pad.t+32);

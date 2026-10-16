@@ -412,7 +412,7 @@ def build_proteome_data(df_comp, contrasts, cond_map):
                 'padj': round(padj, 6) if padj is not None else None,
                 'r':    r,
                 'pi':   round(pi, 4) if pi is not None else None,
-                'lp':   round(float(-np.log10(max(pv, 1e-10))), 4),
+                'lp':   round(float(-np.log10(max(pv, 1e-300))), 4),
                 's':    s,
                 'x':    xa,
                 'y':    xb,
@@ -429,6 +429,69 @@ def build_proteome_data(df_comp, contrasts, cond_map):
         result[c] = sig + ns_sampled
 
     return result
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PCA — score plot + loading plot (PCA de Deimos : onglets PCA_Scores / PCA_Loadings)
+# ──────────────────────────────────────────────────────────────────────────────
+PCA_LOAD_GREY_MAX = 3000      # protéines grises (non significatives) dessinées, au plus
+
+def build_pca_loadings(stats_path, max_grey=PCA_LOAD_GREY_MAX):
+    """Données du loading plot interactif : la PCA calculée par Deimos (mêmes axes et
+    mêmes signes que la figure plot_pca_loadings de l'Excel), relue dans les onglets
+    PCA_Scores et PCA_Loadings. None si l'un manque (classeur antérieur)."""
+    try:
+        xl = pd.ExcelFile(stats_path)
+        if "PCA_Scores" not in xl.sheet_names or "PCA_Loadings" not in xl.sheet_names:
+            return None
+        sc = pd.read_excel(xl, "PCA_Scores")
+        ld = pd.read_excel(xl, "PCA_Loadings")
+    except Exception:
+        return None
+    if not {"PC1", "PC2", "condition"} <= set(sc.columns) or \
+            not {"PC1_loading", "PC2_loading"} <= set(ld.columns):
+        return None
+    var = [round(float(sc[f"PC{k}_var_pct"].iloc[0]), 1) if f"PC{k}_var_pct" in sc.columns
+           else None for k in (1, 2)]
+    scores = [{"s": safe_str(r["label"]) if "label" in sc.columns else "", "c": safe_str(r["condition"]),
+               "x": round(float(r["PC1"]), 3), "y": round(float(r["PC2"]), 3)}
+              for _, r in sc.iterrows()]
+    grey_labels = {"Not significant (ANOVA)", "No change (volcano rule)"}
+    grp = ld["group"].astype(str) if "group" in ld.columns else pd.Series("", index=ld.index)
+    grey = grp.isin(grey_labels)
+    drv = ld["driver"].fillna("").astype(str) if "driver" in ld.columns else pd.Series("", index=ld.index)
+    gidx = ld.index[grey & (drv == "")]
+    step = max(1, int(np.ceil(len(gidx) / max_grey))) if max_grey else 1
+    keep = (~grey) | (drv != "") | ld.index.isin(gidx[::step])
+    gene = ld["Genes"] if "Genes" in ld.columns else ld["name"]
+    desc = ld["Description"] if "Description" in ld.columns else pd.Series("", index=ld.index)
+    prots = []
+    for i in ld.index[keep]:
+        prots.append({"n": safe_str(ld.at[i, "name"]), "g": safe_str(gene.at[i]),
+                      "d": safe_str(desc.at[i], 80),
+                      "x": round(float(ld.at[i, "PC1_loading"]), 5),
+                      "y": round(float(ld.at[i, "PC2_loading"]), 5),
+                      "grp": "" if grey.at[i] else safe_str(grp.at[i]), "drv": safe_str(drv.at[i])})
+    drivers = {}
+    for i in ld.index[drv != ""]:
+        for tag in str(drv.at[i]).split(";"):
+            tag = tag.strip()
+            if "#" not in tag:
+                continue
+            d, r = tag.split("#", 1)
+            drivers.setdefault(d.strip(), []).append((int(r), safe_str(ld.at[i, "name"])))
+    sides = {}
+    conds = list(dict.fromkeys(sc["condition"].astype(str)))
+    for k, pc in ((1, "PC1"), (2, "PC2")):
+        m = sc.groupby(sc["condition"].astype(str))[f"PC{k}"].mean().reindex(conds)
+        for sign, sgn in (("+", 1), ("-", -1)):
+            sides[f"{pc}{sign}"] = [c for c in (m * sgn).sort_values(ascending=False).index[:2]
+                                    if sgn * m[c] > 0]
+    return {"var": var, "scores": scores, "proteins": prots,
+            "drivers": {d: [n for _, n in sorted(v)] for d, v in drivers.items()},
+            "sides": sides,
+            "grey_label": next((g for g in grey_labels if (grp == g).any()), "Not significant"),
+            "n_grey": int(grey.sum()), "n_grey_shown": int((grey & keep).sum())}
+
 
 def build_volcano_bh(df_comp, contrasts):
     """Ligne de seuil du volcano en mode p.adj, sur l'axe -log10(p brute) : pour chaque
@@ -474,7 +537,7 @@ def build_volcano(df_comp, contrasts):
         for need, default in (('padj', np.nan), ('r', 0), ('pi', np.nan), ('desc', '')):
             if need not in sub.columns:
                 sub[need] = default
-        sub['lp'] = np.round(-np.log10(sub['p'].clip(lower=1e-10)), 4)
+        sub['lp'] = np.round(-np.log10(sub['p'].clip(lower=1e-300)), 4)
         sub['d'] = sub['d'].round(4)
         sub['p'] = sub['p'].round(6)
         sub['padj'] = sub['padj'].round(6)
@@ -2056,13 +2119,13 @@ window.drawVolcanoComp = function(){
     ctx.fillStyle=THEME.tx2; ctx.font='8px sans-serif'; ctx.textAlign='center';
     ctx.fillText(v, x, tH+PH+14);
   });
-  [1,2,3,4,5,6,7].forEach(function(v){
-    if(v>lpMax) return;
+  var _yst = lpMax > 40 ? 10 : lpMax > 16 ? 5 : lpMax > 8 ? 2 : 1;
+  for(var _yv=_yst; _yv<=lpMax; _yv+=_yst) (function(v){
     var y=toY(v);
     ctx.beginPath(); ctx.moveTo(lW,y); ctx.lineTo(lW+PW,y); ctx.stroke();
     ctx.fillStyle=THEME.tx2; ctx.font='8px sans-serif'; ctx.textAlign='right';
     ctx.fillText(v, lW-4, y+3);
-  });
+  })(_yv);
 
   // Ligne LFC=0 + seuil p
   ctx.strokeStyle=THEME.tx2; ctx.lineWidth=1.5;
@@ -2930,6 +2993,219 @@ def patch_wgcna_hub_volcano_js(html):
 
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch — PCA : score plot + loading plot interactif (onglet QC / PCA)
+# ──────────────────────────────────────────────────────────────────────────────
+PCA_LOAD_HTML = """
+  <div class="panel" id="pcaLoadPanel" style="margin-top:14px;">
+    <div class="ph">
+      <h2>PCA — samples and the proteins that drive them</h2>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:10px;color:var(--tx2);" id="pcaLoadInfo"></span>
+        <button class="exp-btn" onclick="exportCanvas('pcaLoadCanvas','proteogen_PCA_loadings')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--tx2);margin:2px 0 8px;">
+      Same PCA as the Excel figure (Deimos, standardised imputed data): a protein on the right of
+      the loading plot is more abundant in the samples on the right of the score plot. Circled =
+      driving proteins (most extreme loadings per direction). Hover for details, click a protein to
+      find it in the volcano.
+    </div>
+    <div id="pcaLoadLegend" style="display:flex;flex-wrap:wrap;gap:10px;font-size:11px;margin-bottom:6px;"></div>
+    <div class="row2">
+      <div style="position:relative;width:100%;height:420px;"><canvas id="pcaLoadScores"></canvas></div>
+      <div style="position:relative;width:100%;height:420px;"><canvas id="pcaLoadCanvas"></canvas></div>
+    </div>
+    <div id="pcaDrivers" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:10px;font-size:11px;"></div>
+    <div class="tip" id="pcaLoadTip"></div>
+  </div>
+"""
+
+PCA_LOAD_JS = r"""
+/* ── PCA loading plot (PCA de Deimos : PCA_LOAD) ── */
+function _plColor(grp){
+  if(!grp) return null;
+  if(window.COND_COLORS && COND_COLORS[grp]) return COND_COLORS[grp];
+  var m=/^Higher in (.+)$/.exec(grp);
+  if(m && window.COND_COLORS && COND_COLORS[m[1]]) return COND_COLORS[m[1]];
+  return m ? (grp.indexOf(m[1])>=0 ? '#e74c3c' : '#3498db') : (THEME.tx2||'#888');
+}
+function _plDark(c){            // couleurs pastel illisibles en texte : assombries
+  var m=/^#?([0-9a-f]{6})$/i.exec(String(c||'')); if(!m) return c;
+  var n=parseInt(m[1],16), r=(n>>16)&255, g=(n>>8)&255, b=n&255, k=0.62;
+  return 'rgb('+Math.round(r*k)+','+Math.round(g*k)+','+Math.round(b*k)+')';
+}
+function _plSetup(id){
+  var c=document.getElementById(id); if(!c) return null;
+  var W=c.parentElement.offsetWidth||560, H=c.parentElement.offsetHeight||420, dpr=devicePixelRatio||1;
+  c.width=W*dpr; c.height=H*dpr; c.style.width=W+'px'; c.style.height=H+'px';
+  var ctx=c.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {c:c, ctx:ctx, W:W, H:H};
+}
+function _plScale(vals, lo, hi){
+  var mn=Math.min.apply(null,vals), mx=Math.max.apply(null,vals);
+  var pad=(mx-mn)*0.07||1; mn-=pad; mx+=pad;
+  return function(v){ return lo+(v-mn)/(mx-mn)*(hi-lo); };
+}
+function _plFrame(o, pad, sx, sy, xl, yl, title){
+  var ctx=o.ctx;
+  ctx.fillStyle=THEME.bg2; ctx.fillRect(0,0,o.W,o.H);
+  ctx.strokeStyle=THEME.bd2; ctx.lineWidth=0.8; ctx.setLineDash([3,3]);
+  ctx.beginPath(); ctx.moveTo(sx(0),pad.t); ctx.lineTo(sx(0),o.H-pad.b); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(pad.l,sy(0)); ctx.lineTo(o.W-pad.r,sy(0)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle=THEME.tx2; ctx.font='11px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(xl, (pad.l+o.W-pad.r)/2, o.H-8);
+  ctx.save(); ctx.translate(13,(pad.t+o.H-pad.b)/2); ctx.rotate(-Math.PI/2); ctx.fillText(yl,0,0); ctx.restore();
+  ctx.fillStyle=THEME.tx; ctx.font='bold 12px sans-serif'; ctx.textAlign='left';
+  ctx.fillText(title, pad.l, 13);
+}
+function _plFind(name){
+  var s=document.getElementById('volcSearch');
+  if(s){ s.value=name; }
+  if(typeof showPage==='function') showPage('volcano');
+  if(typeof drawVolcano==='function') drawVolcano();
+}
+window.drawPCALoad=function(){
+  if(typeof PCA_LOAD==='undefined' || !PCA_LOAD || !PCA_LOAD.proteins){
+    var pn=document.getElementById('pcaLoadPanel'); if(pn) pn.style.display='none'; return;
+  }
+  var D=PCA_LOAD, pad={l:52,r:14,t:22,b:40};
+  var vx=D.var[0]!=null?' ('+D.var[0]+'%)':'', vy=D.var[1]!=null?' ('+D.var[1]+'%)':'';
+  // A. scores
+  var A=_plSetup('pcaLoadScores'); if(!A) return;
+  var sxa=_plScale(D.scores.map(function(p){return p.x;}), pad.l, A.W-pad.r);
+  var sya=_plScale(D.scores.map(function(p){return p.y;}), A.H-pad.b, pad.t);
+  _plFrame(A, pad, sxa, sya, 'PC1'+vx, 'PC2'+vy, 'A. Score plot — samples');
+  D.scores.forEach(function(p){
+    var col=(window.COND_COLORS&&COND_COLORS[p.c])||THEME.tx3;
+    A.ctx.beginPath(); A.ctx.arc(sxa(p.x),sya(p.y),6,0,Math.PI*2);
+    A.ctx.fillStyle=col; A.ctx.fill(); A.ctx.strokeStyle=THEME.bg2; A.ctx.lineWidth=1.5; A.ctx.stroke();
+    A.ctx.fillStyle=THEME.tx3; A.ctx.font='8px sans-serif'; A.ctx.textAlign='left';
+    A.ctx.fillText(p.s, sxa(p.x)+7, sya(p.y)-5);
+  });
+  A.c._pts=D.scores; A.c._sx=sxa; A.c._sy=sya;
+  // B. loadings
+  var B=_plSetup('pcaLoadCanvas'); if(!B) return;
+  var sx=_plScale(D.proteins.map(function(p){return p.x;}), pad.l, B.W-pad.r);
+  var sy=_plScale(D.proteins.map(function(p){return p.y;}), B.H-pad.b, pad.t);
+  _plFrame(B, pad, sx, sy, 'Loading on PC1', 'Loading on PC2', 'B. Loading plot — proteins');
+  var ctx=B.ctx;
+  D.proteins.forEach(function(p){ if(p.grp) return;
+    ctx.fillStyle=THEME.bg4||'#bbb'; ctx.fillRect(sx(p.x)-1, sy(p.y)-1, 2.2, 2.2); });
+  D.proteins.forEach(function(p){ if(!p.grp) return;
+    ctx.beginPath(); ctx.arc(sx(p.x),sy(p.y),2.4,0,Math.PI*2); ctx.fillStyle=_plColor(p.grp); ctx.fill(); });
+  ctx.font='bold 9px sans-serif';
+  var placed=[], cx0=sx(0), cy0=sy(0);
+  D.proteins.filter(function(p){ return p.drv; }).forEach(function(p){
+    var x=sx(p.x), y=sy(p.y);
+    ctx.beginPath(); ctx.arc(x,y,5,0,Math.PI*2); ctx.strokeStyle=THEME.tx; ctx.lineWidth=1.1; ctx.stroke();
+    // étiquette vers l'intérieur du nuage (jamais coupée par le bord), décalée si elle
+    // chevauche une étiquette déjà posée
+    var right = x > cx0, w = ctx.measureText(p.g).width, h = 10;
+    var lx = right ? x - 8 - w : x + 8, ly = y + 3, tries = 0;
+    function hit(){ return placed.some(function(b){ return lx < b.x+b.w && lx+w > b.x && ly-h < b.y && ly > b.y-h; }); }
+    while(hit() && tries < 12){ ly += (y > cy0 ? -1 : 1) * (h + 1); tries++; }
+    placed.push({x:lx, y:ly, w:w});
+    ctx.strokeStyle=THEME.bd; ctx.lineWidth=0.5;
+    if(Math.abs(ly-3-y) > 2){ ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(right?lx+w:lx, ly-3); ctx.stroke(); }
+    ctx.fillStyle=_plDark(_plColor(p.grp)||THEME.tx2); ctx.textAlign='left';
+    ctx.fillText(p.g, lx, ly);
+  });
+  B.c._pts=D.proteins; B.c._sx=sx; B.c._sy=sy;
+  var lg=document.getElementById('pcaLoadLegend');
+  if(lg){
+    var seen={}, h='';
+    D.scores.forEach(function(p){ if(seen[p.c]) return; seen[p.c]=1;
+      h+='<span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:'+
+         ((window.COND_COLORS&&COND_COLORS[p.c])||'#999')+';margin-right:4px;vertical-align:-1px;"></span>'+p.c+'</span>'; });
+    h+='<span style="color:var(--tx2);"><span style="display:inline-block;width:8px;height:8px;background:'+(THEME.bg4||'#bbb')+
+       ';margin-right:4px;"></span>'+D.grey_label+'</span>';
+    h+='<span style="color:var(--tx2);">proteins coloured by the condition where they are most abundant'+
+       (D.proteins.some(function(p){return /^Higher in /.test(p.grp);})?' (volcano rule)':'')+'</span>';
+    lg.innerHTML=h;
+  }
+  var info=document.getElementById('pcaLoadInfo');
+  if(info) info.textContent=D.proteins.length+' proteins drawn ('+D.n_grey_shown+'/'+D.n_grey+' '+D.grey_label.toLowerCase()+')';
+  // tooltips + clic
+  var tt=document.getElementById('pcaLoadTip');
+  function nearest(c, e){
+    var r=c.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top, best=null, bd=1e9;
+    c._pts.forEach(function(p){ var dx=c._sx(p.x)-mx, dy=c._sy(p.y)-my, d=dx*dx+dy*dy; if(d<bd){bd=d;best=p;} });
+    return bd<64 ? best : null;
+  }
+  B.c.onmousemove=function(e){
+    var p=nearest(B.c,e);
+    if(!p){ tt.style.display='none'; B.c.style.cursor='default'; return; }
+    B.c.style.cursor='pointer';
+    tt.innerHTML='<div class="tg">'+p.g+'</div><div class="tl">'+p.n+'</div>'+
+      (p.d?'<div class="tl">'+p.d+'</div>':'')+
+      '<div class="tl">'+(p.grp||D.grey_label)+'</div>'+
+      '<div class="tl">PC1 '+p.x+' · PC2 '+p.y+'</div>'+
+      (p.drv?'<div class="tl"><b>driver</b> '+p.drv+'</div>':'');
+    tt.style.display='block'; tt.style.left=(e.clientX+14)+'px'; tt.style.top=(e.clientY-10)+'px';
+  };
+  B.c.onmouseleave=function(){ tt.style.display='none'; };
+  B.c.onclick=function(e){ var p=nearest(B.c,e); if(p) _plFind(p.n); };
+  A.c.onmousemove=function(e){
+    var r=A.c.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top, best=null, bd=1e9;
+    A.c._pts.forEach(function(p){ var dx=A.c._sx(p.x)-mx, dy=A.c._sy(p.y)-my, d=dx*dx+dy*dy; if(d<bd){bd=d;best=p;} });
+    if(best && bd<100){ tt.innerHTML='<div class="tg">'+best.s+'</div><div class="tl">'+best.c+'</div>';
+      tt.style.display='block'; tt.style.left=(e.clientX+14)+'px'; tt.style.top=(e.clientY-10)+'px'; }
+    else tt.style.display='none';
+  };
+  A.c.onmouseleave=function(){ tt.style.display='none'; };
+  // tableau des protéines motrices
+  var box=document.getElementById('pcaDrivers');
+  if(box){
+    var byName={}; D.proteins.forEach(function(p){ byName[p.n]=p; });
+    var html='';
+    ['PC1+','PC1-','PC2+','PC2-'].forEach(function(d){
+      var lst=(D.drivers||{})[d]||[]; if(!lst.length) return;
+      var side=(D.sides||{})[d]||[];
+      html+='<div><div style="font-weight:700;margin-bottom:3px;">'+d+(side.length?' <span style="color:var(--tx2);font-weight:400;">→ '+side.join(', ')+'</span>':'')+'</div>';
+      lst.forEach(function(n,i){ var p=byName[n]||{g:n,d:''};
+        html+='<div class="pl-drv" data-n="'+n+'" style="cursor:pointer;color:'+(p.grp?_plDark(_plColor(p.grp)):'var(--tx2)')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="'+(p.d||'').replace(/"/g,'&quot;')+'">'+
+          (i+1)+'. <b>'+p.g+'</b> <span style="color:var(--tx2);">'+(p.d||'')+'</span></div>'; });
+      html+='</div>';
+    });
+    box.innerHTML=html;
+    box.querySelectorAll('.pl-drv').forEach(function(el){ el.onclick=function(){ _plFind(el.getAttribute('data-n')); }; });
+  }
+};
+"""
+
+
+def patch_pca_loadings(html):
+    """Ajoute le score plot + loading plot interactif sous la PCA de l'onglet QC et le
+    redessine à chaque ouverture de l'onglet. Idempotent."""
+    import re as _re
+    if 'id="pcaLoadPanel"' in html:
+        return html
+    i = html.find('id="scatterTip"')
+    # fermeture du row2 PCA/scatter : '</div>' à 2 espaces (le panel scatter ferme à 4)
+    j = html.find('\n  </div>', i) if i > 0 else -1
+    if j > 0:
+        html = html[:j + len('\n  </div>')] + '\n' + PCA_LOAD_HTML + html[j + len('\n  </div>'):]
+    else:
+        print("  [warn] patch_pca_loadings : emplacement introuvable, panneau non injecté.")
+        return html
+    pos = html.rfind('</script>')
+    if pos == -1:
+        print("  [warn] patch_pca_loadings : </script> introuvable.")
+        return html
+    html = html[:pos] + "\n\n" + PCA_LOAD_JS + "\n" + html[pos:]
+    html, n = _re.subn(
+        r"(if\(id === 'gopage' && typeof initGOBubble === 'function'\) initGOBubble\(\);)",
+        r"\1\n    if(id === 'qcpage' && typeof drawPCALoad === 'function') setTimeout(drawPCALoad, 60);",
+        html, count=1)
+    if not n:
+        html = html.replace("if(id==='qcpage')initQC();",
+                            "if(id==='qcpage'){initQC();setTimeout(drawPCALoad,60);}", 1)
+    print("  patch_pca_loadings : score plot + loading plot injectés dans #qcpage.")
+    return html
+
+
 def patch_volcano_comp_js(html):
     """Injecte le volcano comparatif et branche initVolcanoComp dans showPage."""
     pos = html.rfind('</script>')
@@ -3591,7 +3867,10 @@ COND_COLORS_JS = """\
 // COND_COLORS déclaré sur window pour portée globale garantie
 // (remplace const qui serait limité au script en cas de crash partiel)
 window.COND_COLORS = window.COND_COLORS || {};
-var _COND_PALETTE=['#f5e99a','#e8928a','#c3b8e8','#8ecfc9','#f0b87a','#a8d8a8'];
+// 12 teintes distinctes (les 6 premières inchangées) : au-delà de 6 conditions, la
+// palette bouclait et deux conditions partageaient la même couleur.
+var _COND_PALETTE=['#f5e99a','#e8928a','#c3b8e8','#8ecfc9','#f0b87a','#a8d8a8',
+                   '#7fb3d5','#d4a5c9','#b5cf6b','#f4a6c6','#c49c94','#9c9ede'];
 (CONDITIONS||[]).forEach((c,i)=>{
   if(c.match(/Monoculture/i))            window.COND_COLORS[c]='#8ecfc9';
   else if(c.match(/Polyculture[._]?1/i)) window.COND_COLORS[c]='#f5e99a';
@@ -5949,6 +6228,7 @@ def inject(template_html, data):
         "const CV_DATA="          + json.dumps(data['cv_plot'], ensure_ascii=False)       + ";\n"
         "const ABOUT_DATA="       + json.dumps(data['about'], ensure_ascii=False)         + ";\n"
         "const VOLCANO_BH="       + json.dumps({'grid': BH_GRID, 'cuts': data.get('volcano_bh', {})}, ensure_ascii=False) + ";\n"
+        "const PCA_LOAD="         + json.dumps(data.get('pca_load'), ensure_ascii=False) + ";\n"
         "const QC_REPORT="        + json.dumps(data['qc_report'], ensure_ascii=False)     + ";\n"
         # PROTEOME_DATA contient lp précalculé — VOLCANO et SCATTER_DATA sont des vues dérivées.
         # Les points dessinés sont SOUS-ÉCHANTILLONNÉS (max ~1500/contraste) pour
@@ -6081,6 +6361,7 @@ def main():
     data['pca'] = build_pca(df_comp, sample_cols, cond_map_inv)
     data['proteome_data'] = build_proteome_data(df_comp, contrasts, cond_map)
     data['volcano_bh'] = build_volcano_bh(df_comp, contrasts)
+    data['pca_load'] = build_pca_loadings(stats)
     # Modules optionnels
     data['go_data'], data['chord'] = build_go(go, contrasts, df_comp)
     data['go_images'] = build_go_images(go, contrasts)
@@ -6141,6 +6422,7 @@ def main():
     # 3i. Patches post-monkey-patch (nécessitent que showPage soit déjà patché)
     html = patch_module_trait_js(html)
     html = patch_volcano_comp_js(html)
+    html = patch_pca_loadings(html)
     html = patch_go_network_js(html)
     html = patch_go_heatmap_js(html)
 

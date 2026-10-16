@@ -111,7 +111,8 @@ def compute_rbh(query_fasta: str, reference_fasta: str, workdir: str,
     for _, r in fwd_best.iterrows():
         q, ref = r["qseqid"], r["sseqid"]
         if rev_map.get(ref) == q:
-            coverage = 100.0 * r["length"] / min(r["qlen"], r["slen"])
+            # longueur d'alignement (gaps compris) / plus courte séquence, plafonnée à 100
+            coverage = min(100.0, 100.0 * r["length"] / min(r["qlen"], r["slen"]))
             if r["pident"] >= min_identity and coverage >= min_coverage:
                 rows.append({
                     "query_id": q, "reference_id": ref,

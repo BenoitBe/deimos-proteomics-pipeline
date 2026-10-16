@@ -32,6 +32,10 @@ volcano_ratio_min:   1.5
 # to the p.adj threshold of each contrast) | padj = -log10 of the threshold statistic
 volcano_y_axis:      pvalue
 
+# PCA loading plot: number of driving proteins labelled (most extreme loadings, split
+# between PC1+, PC1-, PC2+ and PC2-); 0 = no labels
+pca_n_drivers:       20
+
 
 # ── Statistical thresholds — ANOVA & Heatmap ─────────────────────────────────
 anova_use_padj:      false

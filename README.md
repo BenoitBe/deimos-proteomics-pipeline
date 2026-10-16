@@ -84,7 +84,7 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     estimated on the dataset, absorbs identification failures and individual presence/absence
   Results go to three sheets (Sensitivity_Summary, Sensitivity_DPC, Differential_Detection)
 - FDR correction per contrast or globally (BH)
-- Visualisations: volcano plots, PCA, UMAP (skipped below 5 samples), heatmaps, UpSet, scatter plots
+- Visualisations: volcano plots, PCA (score plot + protein loading plot on the same axes, driving proteins labelled per direction; interactive in the dashboard), UMAP (skipped below 5 samples), heatmaps, UpSet, scatter plots
 - Co-expression: **WGCNA** (modules, hub scores, trait correlation)
 - **Functional enrichment** (GO / KEGG / Reactome), two backends:
   - **gProfiler** (`go_backend: gprofiler`, default), with an automatic **coverage diagnostic**
@@ -315,7 +315,7 @@ proteomics_output/
 └── last_config.yaml                 # Last run config (reloadable)
 ```
 
-**Excel sheets** (full mode): Methods_Upstream · Methods · raw_data · Log2_Impute · QC · PCA_UMAP ·
+**Excel sheets** (full mode): Methods_Upstream · Methods · raw_data · Log2_Impute · QC · PCA_UMAP · PCA_Loadings · PCA_Scores ·
 UMAP · Scatter_Plots · Differential_Expression · Volcano_Plots · UpSet_Intersections ·
 Zscore_Heatmap · ANOVA_Results · ANOVA_Clusters, plus depending on the options: WGCNA_* · GO_* ·
 Cluster_Enrich_* · GSEA_* · Orthologues_Perseverance · Orthologues_STRING ·
