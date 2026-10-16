@@ -11,6 +11,9 @@
 #   - export Excel : un onglet par contraste (données + plots)
 #
 # SEUILS : identiques à ceux des volcanos du pipeline principal (params).
+# FOND (univers) : protéines quantifiées par défaut (enrichment_background), en
+#   gProfiler (domain_scope='custom_annotated') comme en STRING ; 'genome' =
+#   génome annoté entier (comportement antérieur).
 # ESPÈCE : demandée à l'utilisateur (ex: hsapiens, rnorvegicus, mmusculus...).
 # BACKEND : gProfiler (défaut) ou STRING (go_backend='string', espèce = NCBI
 #   taxid) — STRING couvre la quasi-totalité des bactéries séquencées. Les
@@ -144,16 +147,9 @@ def ask_go_params() -> dict | None:
         caller = input(
             f"  Caller identity for STRING (project/lab name, not personal "
             f"data) [{DEFAULT_STRING_CALLER}] -> ").strip() or DEFAULT_STRING_CALLER
-        print("\n  Statistical background (universe):")
-        print("     [1] whole genome (default — same as gProfiler 'known')")
-        print("     [2] quantified proteins only (corrects the detectability")
-        print("         bias of proteomics: abundant categories such as")
-        print("         ribosome/translation are no longer over-called)")
-        bg = "quantified" if input("  Background [1/2] (default 1) -> ").strip() == "2" \
-            else "genome"
         params = {"backend": "string",
                   "species_taxid": "auto" if taxid_raw == "auto" else int(taxid_raw),
-                  "caller_identity": caller, "string_background": bg,
+                  "caller_identity": caller,
                   "organism": None, "run_gsea": False}
     else:
         print("\n  [!] Requires internet access to g:Profiler (biit.cs.ut.ee).")
@@ -165,6 +161,18 @@ def ask_go_params() -> dict | None:
             print("  [WARN] No species provided — step skipped.\n")
             return None
         params = {"backend": "gprofiler", "organism": organism, "run_gsea": False}
+
+    # Univers statistique de l'ORA (les deux backends)
+    print("\n  Statistical background (universe) of the enrichment:")
+    print("     [1] quantified proteins (default — corrects the detectability bias")
+    print("         of proteomics: abundant categories such as ribosome/translation")
+    print("         are no longer over-called)")
+    print("     [2] whole annotated genome (behaviour before 10/2026)")
+    bg = "genome" if input("  Background [1/2] (default 1) -> ").strip() == "2" \
+        else "quantified"
+    params["enrichment_background"] = bg
+    if params["backend"] == "string":
+        params["string_background"] = bg
 
     # GSEA rank-based (optionnel, complément de l'ORA)
     print("\n  --- GSEA (rank-based, optional) ---")
@@ -1210,7 +1218,44 @@ def _prepare_string(protein_ids: list, species_taxid, caller_identity: str,
     return maps, background
 
 
-def run_gost(query: list[str], organism: str) -> pd.DataFrame | None:
+class _CustomAnnotatedScope:
+    """Le client gprofiler-official force domain_scope='custom' dès qu'un fond est
+    fourni : le domaine compte alors aussi les gènes du fond SANS annotation dans
+    la source testée, ce qui gonfle N et rend le test hypergéométrique optimiste.
+    'custom_annotated' (fond ∩ gènes annotés, option de l'API g:GOSt) est
+    l'équivalent correct de domain_scope='annotated' pour un fond personnalisé.
+    Ce gestionnaire réécrit la valeur dans la requête envoyée par le client, le
+    temps d'un appel ; si le client change de structure, on garde 'custom'."""
+
+    def __enter__(self):
+        try:
+            import gprofiler.gprofiler as _gpm
+        except Exception:
+            self._mod = None
+            return self
+        self._mod, self._orig = _gpm, _gpm.requests
+        orig = self._orig
+
+        class _Proxy:
+            def __getattr__(self, k):
+                return getattr(orig, k)
+
+            def post(self, *a, json=None, **kw):
+                if isinstance(json, dict) and json.get("domain_scope") == "custom":
+                    json = {**json, "domain_scope": "custom_annotated"}
+                return orig.post(*a, json=json, **kw)
+
+        _gpm.requests = _Proxy()
+        return self
+
+    def __exit__(self, *exc):
+        if self._mod is not None:
+            self._mod.requests = self._orig
+        return False
+
+
+def run_gost(query: list[str], organism: str,
+             background: "list[str] | None" = None) -> pd.DataFrame | None:
     """
     Appelle gProfiler (équivalent de gost() en R).
     Retourne un DataFrame de résultats ou None en cas d'échec.
@@ -1218,7 +1263,10 @@ def run_gost(query: list[str], organism: str) -> pd.DataFrame | None:
     Paramètres (équivalents du gost() R, adaptés à l'API Python) :
       user_threshold=0.05, no_iea=False (= exclude_iea=FALSE),
       significance_threshold_method='fdr' (= correction_method='fdr'),
-      domain_scope='known', no_evidences=False (= evcodes=TRUE).
+      no_evidences=False (= evcodes=TRUE).
+    background : None -> domain_scope='known' (génome annoté entier) ;
+                 liste d'IDs (ex. toutes les protéines quantifiées) ->
+                 domain_scope='custom_annotated' (fond ∩ gènes annotés).
     """
     try:
         from gprofiler import GProfiler
@@ -1229,16 +1277,17 @@ def run_gost(query: list[str], organism: str) -> pd.DataFrame | None:
 
     try:
         gp = GProfiler(return_dataframe=True)
-        res = gp.profile(
-            organism=organism,
-            query=query,
-            sources=GO_SOURCES,
-            user_threshold=0.05,
-            no_evidences=False,       # evcodes=TRUE → récupère les intersections
-            no_iea=False,             # exclude_iea=FALSE
-            domain_scope="known",
-            significance_threshold_method="fdr",   # correction_method='fdr'
-        )
+        kw = dict(organism=organism, query=query, sources=GO_SOURCES,
+                  user_threshold=0.05,
+                  no_evidences=False,       # evcodes=TRUE → récupère les intersections
+                  no_iea=False,             # exclude_iea=FALSE
+                  significance_threshold_method="fdr")   # correction_method='fdr'
+        if background:
+            bg = list(dict.fromkeys(list(background) + list(query)))   # requête ⊂ fond
+            with _CustomAnnotatedScope():
+                res = gp.profile(domain_scope="custom_annotated", background=bg, **kw)
+        else:
+            res = gp.profile(domain_scope="known", **kw)
         if res is None or len(res) == 0:
             return None
         return res
@@ -1715,12 +1764,15 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
         species_taxid = go_params.get("species_taxid")
         string_caller = go_params.get("caller_identity") or DEFAULT_STRING_CALLER
         string_categories = go_params.get("string_categories")
-        string_bg_mode = go_params.get("string_background", "genome")
+        bg_mode = go_params.get("background_mode", "quantified")
+        string_bg_mode = go_params.get("string_background") or bg_mode
         background = go_params.get("background")
+        # Univers = protéines testées (quantifiées) ; même nettoyage que la requête
+        id_col = "name" if "name" in df_comparaison.columns else df_comparaison.columns[0]
+        universe = list(dict.fromkeys(df_comparaison[id_col].astype(str)
+                                      .str.split(";").str[0].str.strip()))
         if background is None and custom_annotation is not None:
-            id_col = "name" if "name" in df_comparaison.columns else df_comparaison.columns[0]
-            background = (df_comparaison[id_col].astype(str)
-                          .str.split(";").str[0].tolist())
+            background = universe
 
         use_local = custom_annotation is not None
         use_ortholog = (ortholog_map is not None) and not use_local
@@ -1745,6 +1797,18 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
 
         reverse_ortholog_map = ({v: k for k, v in ortholog_map.items()}
                                 if use_ortholog else None)
+
+        # gProfiler : fond = protéines quantifiées (ou leurs orthologues)
+        gp_bg = None
+        if bg_mode == "quantified" and not use_local and not use_string \
+                and not use_string_orth:
+            gp_bg = ([ortholog_map[p] for p in universe if p in ortholog_map]
+                     if use_ortholog else universe)
+            print(f"   Background : {len(gp_bg)} "
+                  f"{'orthologues des protéines quantifiées' if use_ortholog else 'protéines quantifiées'}"
+                  f" (domain_scope='custom_annotated').")
+        elif not use_local and not use_string and not use_string_orth:
+            print("   Background : génome annoté complet (domain_scope='known').")
 
         # STRING : résolution UNIQUE de toutes les accessions du run (et du
         # background éventuel), réutilisée pour tous les contrastes.
@@ -1796,7 +1860,7 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                         continue
                     print(f"  [GO] {contrast}: {len(translated)} orthologue(s) -> "
                           f"gProfiler ({organism})...")
-                    gost_df = run_gost(translated, organism)
+                    gost_df = run_gost(translated, organism, background=gp_bg)
                     if gost_df is not None and not gost_df.empty and "intersections" in gost_df.columns:
                         # Retraduit les IDs de l'espece de reference vers les IDs
                         # d'origine AVANT process_enrichment, sinon son calcul de
@@ -1813,7 +1877,7 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                         label=contrast)
                 else:
                     print(f"  [GO] {contrast}: {len(prots)} proteins -> gProfiler...")
-                    gost_df = run_gost(prots, organism)
+                    gost_df = run_gost(prots, organism, background=gp_bg)
                 if gost_df is None or gost_df.empty:
                     print(f"     Aucun enrichissement significatif.")
                     continue
@@ -1893,13 +1957,15 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
 
 
 def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
-                               out_dir: str) -> dict | None:
+                               out_dir: str, universe: "list | None" = None) -> dict | None:
     """
     Enrichissement GO par cluster de la heatmap ANOVA.
 
     Contrairement à run_go_enrichment (qui part des DEP par contraste), on prend
     ici les protéines regroupées par profil d'expression (clusters k-means de la
-    heatmap). Background = protéome connu de l'espèce (domain_scope='known').
+    heatmap). Background (background_mode='quantified', défaut) = TOUTES les
+    protéines testées (universe), pas seulement celles des clusters ; sans
+    universe, ou en mode 'genome' : protéome connu de l'espèce.
 
     Parameters
     ----------
@@ -1924,6 +1990,14 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
         species_taxid = go_params.get("species_taxid")
         string_caller = go_params.get("caller_identity") or DEFAULT_STRING_CALLER
         ortholog_map = go_params.get("ortholog_map")   # RBH (Perseverance ou STRING)
+        bg_mode = go_params.get("background_mode", "quantified")
+        string_bg_mode = go_params.get("string_background") or bg_mode
+        universe = ([str(p).split(";")[0].strip() for p in universe]
+                    if universe is not None else None)
+        if universe is None and "quantified" in (bg_mode, string_bg_mode):
+            print("   [INFO] Cluster GO: list of tested proteins not provided — "
+                  "background = annotated genome.")
+            bg_mode = string_bg_mode = "genome"
         # Regrouper les protéines par cluster
         from collections import defaultdict
         clusters = defaultdict(list)
@@ -1940,12 +2014,14 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
             if ortholog_map:
                 string_maps = string_maps_from_orthologs(ortholog_map)
                 string_bg = (sorted(set(ortholog_map.values()))
-                             if go_params.get("string_background") == "quantified" else None)
+                             if string_bg_mode == "quantified" else None)
             else:
-                all_prots = [p for plist in clusters.values() for p in plist]
+                # Résolution sur l'univers complet : le fond « quantifié » ne doit
+                # pas se réduire aux protéines des clusters (ANOVA significatives).
+                all_prots = universe if universe is not None else \
+                    [p for plist in clusters.values() for p in plist]
                 string_maps, string_bg = _prepare_string(
-                    all_prots, species_taxid, string_caller,
-                    go_params.get("string_background", "genome"))
+                    all_prots, species_taxid, string_caller, string_bg_mode)
             if string_maps is None:
                 return None
         else:
@@ -1953,6 +2029,10 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
                 return None
             print(f"\n[GO] Cluster GO enrichment — species '{organism}' "
                   f"({len(clusters)} clusters)")
+        gp_bg = None
+        if not use_string and bg_mode == "quantified":
+            gp_bg = ([ortholog_map[p] for p in universe if p in ortholog_map]
+                     if ortholog_map else universe)
 
         results = {}
         for cid in sorted(clusters.keys()):
@@ -1976,7 +2056,7 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
                         print(f"  [SKIP] {cid}: too few orthologs ({len(tr)}), skipped.")
                         continue
                     print(f"  [GO] {cid}: {len(tr)} orthologue(s) -> gProfiler ({organism})...")
-                    gost_df = run_gost(tr, organism)
+                    gost_df = run_gost(tr, organism, background=gp_bg)
                     if gost_df is not None and not gost_df.empty and "intersections" in gost_df.columns:
                         gost_df = gost_df.copy()
                         gost_df["intersections"] = gost_df["intersections"].apply(
@@ -1984,7 +2064,7 @@ def run_go_enrichment_clusters(cluster_mapping, params: dict, go_params: dict,
                             if isinstance(inter, (list, tuple, np.ndarray)) else inter)
                 else:
                     print(f"  [GO] {cid}: {len(prots)} proteins -> gProfiler...")
-                    gost_df = run_gost(prots, organism)
+                    gost_df = run_gost(prots, organism, background=gp_bg)
                 if gost_df is None or gost_df.empty:
                     print(f"     No significant enrichment.")
                     continue
@@ -2119,15 +2199,20 @@ def export_go_sheets(wb, go_results: dict, write_df_fn, ins_img_fn):
     Ajoute un onglet par contraste au classeur Excel existant.
     Mise en page proche du script R : données en colonne U (21),
     plots empilés à gauche (Manhattan, lollipop, dotplot, chord).
+
+    Retourne {contraste: nom d'onglet} (repris dans l'onglet _manifest : les
+    noms raccourcis ne permettent pas de retrouver le contraste de façon sûre).
     """
     if not go_results:
-        return
+        return {}
 
     sheet_names = _make_go_sheet_names(list(go_results.keys()))
+    written = {}
 
     for contrast, data in go_results.items():
         sheet_name = sheet_names[contrast]
         ws = wb.create_sheet(sheet_name)
+        written[contrast] = ws.title     # titre réel (openpyxl peut le modifier)
 
         # Données décalées en colonne 21 (U) comme le script R
         df = data["table"]
@@ -2147,3 +2232,5 @@ def export_go_sheets(wb, go_results: dict, write_df_fn, ins_img_fn):
         # Layout vertical = images plus hautes → espacement vertical large.
         ins_img_fn(ws, data.get("lollipop"),  "A2")
         ins_img_fn(ws, data.get("dotplot"),   "A60")
+
+    return written

@@ -51,6 +51,15 @@ import pandas as pd
 # ──────────────────────────────────────────────────────────────────────────────
 P_THRESH = 0.05
 LFC_THRESH = 0.26
+# Statistique du seuil DEP (statut 's', résumés, volcano comparatif) : '_p.val' par
+# défaut, '_p.adj' si le pipeline a choisi la p.adj (--params-json). P_THRESH /
+# LFC_THRESH suivent alors aussi les seuils du pipeline (cf. main).
+SIG_SUFFIX = '_p.val'
+# Pré-filtre LARGE des points embarqués (curseurs du volcano) : indépendant des seuils
+# choisis, pour que l'exploration interactive en p.val reste complète.
+KEEP_P, KEEP_LFC = 0.05, 0.26
+# Seuils p.adj du curseur du volcano (0.001 -> 0.1) pour la ligne équivalente en p brute
+BH_GRID = [round(0.001 * k, 3) for k in range(1, 101)]
 NS_VOLCANO_MAX = 1200   # NS échantillonnés dans le volcano (nuage dense)
 NS_SCATTER_MAX = 2000   # NS échantillonnés dans le scatter (nuage dense comme l'Excel)
 NS_CV          = 400    # Points sous-échantillonnés pour le CV plot
@@ -58,10 +67,12 @@ SEED = 42
 
 META = {'Protein.Group', 'Protein.Names', 'Genes', 'First.Protein.Description',
         'N.Sequences', 'N.Proteotypic.Sequences', 'name',
-        'imputed', 'num_NAs', 'Peptide_Count_min', 'significant'}
+        'imputed', 'num_NAs', 'Peptide_Count_min', 'significant',
+        'dpc_source', 'n_precursors'}
 NON_SAMPLE = {'name', 'Protein.Group', 'Protein.Names', 'Genes',
               'First.Protein.Description', 'N.Sequences', 'N.Proteotypic.Sequences',
-              'ID', 'imputed', 'num_NAs', 'significant', 'Peptide_Count_min'}
+              'ID', 'imputed', 'num_NAs', 'significant', 'Peptide_Count_min',
+              'dpc_source', 'n_precursors'}
 
 IMG_LABELS = ['lollipop', 'dotplot']  # ordre d'insertion dans les sheets GO
 
@@ -308,7 +319,7 @@ def read_stats(path):
     # déduire sample_cols depuis la sheet Comparaison
     if not sample_cols:
         stat_suffixes = ('_p.val','_p.adj','_diff','_Pi_Score','_Robustness_Score',
-                         'Pi_Score_','Robustness_Score_')
+                         'Pi_Score_','Robustness_Score_', '_limma', '_imputed')
         sample_cols = [c for c in df_comp.columns
                        if c not in NON_SAMPLE
                        and not any(c.endswith(s) or c.startswith(s)
@@ -367,6 +378,7 @@ def build_proteome_data(df_comp, contrasts, cond_map):
         pacol = c + '_p.adj'
         rcol  = 'Robustness_Score_' + c
         picol = 'Pi_Score_' + c
+        scol  = c + SIG_SUFFIX if c + SIG_SUFFIX in df_comp.columns else pcol
 
         if pcol not in df_comp.columns or dcol not in df_comp.columns:
             continue
@@ -384,9 +396,11 @@ def build_proteome_data(df_comp, contrasts, cond_map):
             padj = float(row[pacol]) if pacol in df_comp.columns and pd.notna(row.get(pacol)) else None
             r    = int(row[rcol])    if rcol  in df_comp.columns and pd.notna(row.get(rcol))  else 0
             pi   = float(row[picol]) if picol in df_comp.columns and pd.notna(row.get(picol)) else None
+            ps   = float(row[scol]) if pd.notna(row.get(scol)) else 1.0
             s    = 'N'
-            if pv < P_THRESH and dv >  LFC_THRESH: s = 'U'
-            if pv < P_THRESH and dv < -LFC_THRESH: s = 'D'
+            if ps < P_THRESH and dv >  LFC_THRESH: s = 'U'
+            if ps < P_THRESH and dv < -LFC_THRESH: s = 'D'
+            keep = s != 'N' or (pv < KEEP_P and abs(dv) > KEEP_LFC)
             xa = round(float(mean_a[row.name]), 3)
             xb = round(float(mean_b[row.name]), 3)
             pt = {
@@ -403,17 +417,46 @@ def build_proteome_data(df_comp, contrasts, cond_map):
                 'x':    xa,
                 'y':    xb,
             }
-            pts.append(pt)
+            pts.append((keep, pt))
 
-        # Sous-échantillonner les NS pour alléger
+        # Sous-échantillonner les NS pour alléger (les points du pré-filtre large
+        # sont tous conservés : curseurs p.val / LFC du volcano)
         import random as _rnd
         _rnd.seed(SEED)
-        sig = [p for p in pts if p['s'] != 'N']
-        ns  = [p for p in pts if p['s'] == 'N']
+        sig = [p for k, p in pts if k]
+        ns  = [p for k, p in pts if not k]
         ns_sampled = _rnd.sample(ns, min(NS_VOLCANO_MAX, len(ns)))
         result[c] = sig + ns_sampled
 
     return result
+
+def build_volcano_bh(df_comp, contrasts):
+    """Ligne de seuil du volcano en mode p.adj, sur l'axe -log10(p brute) : pour chaque
+    seuil t de BH_GRID, p brute équivalente (entre la plus grande p brute à p.adj <= t
+    et la plus petite au-dessus ; BH est monotone en p), None si aucune protéine.
+    Calculé sur TOUTES les protéines (les points embarqués sont sous-échantillonnés)."""
+    out = {}
+    for c in contrasts:
+        pcol, pacol = c + '_p.val', c + '_p.adj'
+        if pcol not in df_comp.columns or pacol not in df_comp.columns:
+            continue
+        p = pd.to_numeric(df_comp[pcol], errors='coerce').to_numpy(float)
+        q = pd.to_numeric(df_comp[pacol], errors='coerce').to_numpy(float)
+        ok = np.isfinite(p) & np.isfinite(q)
+        p, q = p[ok], q[ok]
+        cuts = []
+        for t in BH_GRID:
+            passed = q <= t
+            if not passed.any():
+                cuts.append(None)
+                continue
+            hi = float(p[passed].max())
+            above = p[~passed & (p > hi)]
+            cut = float(np.sqrt(hi * above.min())) if above.size else hi
+            cuts.append(float('%.4g' % max(cut, 1e-300)))
+        out[c] = cuts
+    return out
+
 
 def build_volcano(df_comp, contrasts):
     volcano = {}
@@ -439,8 +482,9 @@ def build_volcano(df_comp, contrasts):
         sub['r'] = sub['r'].fillna(0).round().astype(int)
         sub['desc'] = sub['desc'].fillna('').astype(str).str.slice(0, 70)
         sub['s'] = 'N'
-        sub.loc[(sub['p'] < P_THRESH) & (sub['d'] > LFC_THRESH), 's'] = 'U'
-        sub.loc[(sub['p'] < P_THRESH) & (sub['d'] < -LFC_THRESH), 's'] = 'D'
+        ps = sub['padj'] if SIG_SUFFIX == '_p.adj' else sub['p']
+        sub.loc[(ps < P_THRESH) & (sub['d'] > LFC_THRESH), 's'] = 'U'
+        sub.loc[(ps < P_THRESH) & (sub['d'] < -LFC_THRESH), 's'] = 'D'
         sig = sub[sub['s'] != 'N']
         ns_all = sub[sub['s'] == 'N']
         ns = ns_all.sample(min(NS_VOLCANO_MAX, len(ns_all)), random_state=SEED) \
@@ -464,7 +508,9 @@ def build_stats(df_comp, df_anova, contrasts):
     summary = {}
     dep_union = set()  # protéines DEP dans au moins un contraste
     for c in contrasts:
-        pcol, dcol = c + '_p.val', c + '_diff'
+        pcol, dcol = c + SIG_SUFFIX, c + '_diff'
+        if pcol not in df_comp.columns:
+            pcol = c + '_p.val'
         if pcol in df_comp.columns and dcol in df_comp.columns:
             up_mask = (df_comp[pcol] < P_THRESH) & (df_comp[dcol] > LFC_THRESH)
             dn_mask = (df_comp[pcol] < P_THRESH) & (df_comp[dcol] < -LFC_THRESH)
@@ -692,7 +738,7 @@ def build_pca(df_comp, sample_cols, cond_map_inv):
         # repli : détection des colonnes d'intensité dans Comparaison
         stat_like = set()
         for col in df_comp.columns:
-            for suf in ('_diff', '_p.val', '_p.adj'):
+            for suf in ('_diff', '_p.val', '_p.adj', '_limma', '_imputed'):
                 if str(col).endswith(suf):
                     stat_like.add(col)
             if str(col).startswith(('Robustness_Score_', 'Pi_Score_')):
@@ -2021,8 +2067,22 @@ window.drawVolcanoComp = function(){
   // Ligne LFC=0 + seuil p
   ctx.strokeStyle=THEME.tx2; ctx.lineWidth=1.5;
   ctx.beginPath(); ctx.moveTo(toX(0),tH); ctx.lineTo(toX(0),tH+PH); ctx.stroke();
-  ctx.setLineDash([5,4]); ctx.strokeStyle=THEME.tx3; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(lW,toY(-Math.log10(0.05))); ctx.lineTo(lW+PW,toY(-Math.log10(0.05))); ctx.stroke();
+  // Seuil DEP du pipeline (statut s) : en p.adj, une ligne par contraste à la p brute
+  // équivalente (couleur du contraste) ; en p.value, une seule ligne.
+  var _ap = (typeof ABOUT_DATA!=='undefined' && ABOUT_DATA.params) ? ABOUT_DATA.params : {};
+  var _pT = (_ap.volcano_p!==undefined) ? parseFloat(_ap.volcano_p) : 0.05;
+  ctx.setLineDash([5,4]); ctx.lineWidth=1;
+  if(_ap.volcano_p_type==='p.adj' && typeof volcThreshY==='function'){
+    active.forEach(function(c){
+      var yT = volcThreshY(c, 'padj', _pT);
+      if(yT===null || yT>lpMax) return;
+      ctx.strokeStyle=colorMap[c];
+      ctx.beginPath(); ctx.moveTo(lW,toY(yT)); ctx.lineTo(lW+PW,toY(yT)); ctx.stroke();
+    });
+  } else {
+    ctx.strokeStyle=THEME.tx3;
+    ctx.beginPath(); ctx.moveTo(lW,toY(-Math.log10(_pT))); ctx.lineTo(lW+PW,toY(-Math.log10(_pT))); ctx.stroke();
+  }
   ctx.setLineDash([]);
 
   // NS d'abord (gris transparent)
@@ -2753,16 +2813,22 @@ window.drawVolcano = function(){
   if(!c || !VOLCANO[c]) return;
   var pts = VOLCANO[c];
 
-  // Récupérer les axes depuis le canvas (re-calculer toX/toY)
+  // Axes et points du volcano tel qu'il vient d'être dessiné (filtre robustesse,
+  // inversion du LFC) ; repli sur un recalcul si drawVolcano ne les expose pas.
   var lW=60, rW=20, tH=36, bH=44, PW=W-lW-rW, PH=H-tH-bH;
-  var allD = pts.map(function(p){return p.d;}).filter(function(v){return v!=null;});
-  var allLP = pts.map(function(p){return p.lp;}).filter(function(v){return v!=null;});
-  if(!allD.length) return;
-  var dMin=Math.min.apply(null,allD), dMax=Math.max.apply(null,allD);
-  var pad=(dMax-dMin)*0.05; dMin-=pad; dMax+=pad;
-  var lpMax=Math.max.apply(null,allLP)*1.1||4;
-  function toX(d){return lW+(d-dMin)/(dMax-dMin)*PW;}
-  function toY(lp){return tH+PH*(1-lp/lpMax);}
+  var toX, toY;
+  if(canvas._sx && canvas._sy && canvas._pts){
+    pts = canvas._pts; toX = canvas._sx; toY = canvas._sy;
+  } else {
+    var allD = pts.map(function(p){return p.d;}).filter(function(v){return v!=null;});
+    var allLP = pts.map(function(p){return p.lp;}).filter(function(v){return v!=null;});
+    if(!allD.length) return;
+    var dMin=Math.min.apply(null,allD), dMax=Math.max.apply(null,allD);
+    var pad=(dMax-dMin)*0.05; dMin-=pad; dMax+=pad;
+    var lpMax=Math.max.apply(null,allLP)*1.1||4;
+    toX = function(d){return lW+(d-dMin)/(dMax-dMin)*PW;};
+    toY = function(lp){return tH+PH*(1-lp/lpMax);};
+  }
 
   // Dessiner les anneaux hubs
   pts.forEach(function(p){
@@ -5882,6 +5948,7 @@ def inject(template_html, data):
         "const RANKED_DATA="      + json.dumps(data['ranked'], ensure_ascii=False)        + ";\n"
         "const CV_DATA="          + json.dumps(data['cv_plot'], ensure_ascii=False)       + ";\n"
         "const ABOUT_DATA="       + json.dumps(data['about'], ensure_ascii=False)         + ";\n"
+        "const VOLCANO_BH="       + json.dumps({'grid': BH_GRID, 'cuts': data.get('volcano_bh', {})}, ensure_ascii=False) + ";\n"
         "const QC_REPORT="        + json.dumps(data['qc_report'], ensure_ascii=False)     + ";\n"
         # PROTEOME_DATA contient lp précalculé — VOLCANO et SCATTER_DATA sont des vues dérivées.
         # Les points dessinés sont SOUS-ÉCHANTILLONNÉS (max ~1500/contraste) pour
@@ -5947,6 +6014,16 @@ def main():
                 chosen_params = json.load(_pf)
         except Exception:
             chosen_params = None
+    # Les seuils du pipeline définissent le statut DEP embarqué (volcano comparatif,
+    # résumés) : mêmes protéines significatives que l'Excel et les volcanos PNG.
+    global P_THRESH, LFC_THRESH, SIG_SUFFIX
+    if chosen_params:
+        try:
+            P_THRESH = float(chosen_params.get("volcano_p_thresh", P_THRESH))
+            LFC_THRESH = float(chosen_params.get("volcano_lfc_min", LFC_THRESH))
+            SIG_SUFFIX = '_p.adj' if chosen_params.get("volcano_use_padj") else '_p.val'
+        except (TypeError, ValueError):
+            pass
 
     # Résolution des entrées
     stats = args.stats
@@ -6003,6 +6080,7 @@ def main():
     # Projections de visualisation (dérivées des intensités, pas de recalcul de stats)
     data['pca'] = build_pca(df_comp, sample_cols, cond_map_inv)
     data['proteome_data'] = build_proteome_data(df_comp, contrasts, cond_map)
+    data['volcano_bh'] = build_volcano_bh(df_comp, contrasts)
     # Modules optionnels
     data['go_data'], data['chord'] = build_go(go, contrasts, df_comp)
     data['go_images'] = build_go_images(go, contrasts)

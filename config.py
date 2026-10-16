@@ -31,6 +31,10 @@ _DEFAULTS = {
     "volcano_use_padj":    False,
     "volcano_p_thresh":    0.05,
     "volcano_ratio_min":   1.5,
+    # Axe Y des volcanos : "pvalue" = -log10(p brute) (défaut, comme limma ; si le seuil
+    # porte sur la p.adj, la ligne est placée à la p brute équivalente) | "padj" =
+    # -log10 de la statistique du seuil (comportement antérieur)
+    "volcano_y_axis":      "pvalue",
     # ANOVA / Heatmap
     "anova_use_padj":      False,
     "anova_p_thresh":      0.05,
@@ -45,14 +49,17 @@ _DEFAULTS = {
     # ex: ["Live_{s}_vs_Heat_killed_{s}"]
     "contrasts":           "__auto__",
     # Imputation
-    "impute_method":       "auto",   # auto (diagnostic) | qrilc | mixed
+    "impute_method":       "auto",   # auto (diagnostic) | qrilc | mixed | mixed_legacy
     "seed":                42,      # graine du tirage d'imputation (reproductibilité)
     # Modules optionnels
     "go_organism":         None,    # None = désactivé
     "go_backend":          "gprofiler",  # "gprofiler" | "string" (bactéries, non-modèles)
     "go_species_taxid":    None,    # si go_backend == "string" : "auto" (détection depuis les accessions) ou taxid de SOUCHE (ex: 511145)
     "string_caller_identity": "Proteogen",  # identifiant appelant STRING (pas de donnée perso)
-    "string_background":   "genome",     # "genome" (défaut STRING) | "quantified" (protéines quantifiées)
+    # Univers de l'ORA (gProfiler, STRING, clusters) : "quantified" = protéines
+    # testées (défaut) | "genome" = génome annoté entier (comportement antérieur)
+    "enrichment_background": "quantified",
+    "string_background":   None,         # None = suit enrichment_background ; "genome" | "quantified" force STRING
     "string_reference_taxid": None,  # mode orthologie : organisme STRING cible (défaut : espèce parente via UniProt)
     "string_reference_fasta": None,  # protéome STRING local (sinon dossier des données, puis téléchargement)
     "string_categories":   None,    # None = GO:BP/MF/CC + KEGG + Reactome ; ex: [Process, KEGG, Keyword, Pfam]
@@ -69,6 +76,19 @@ _DEFAULTS = {
     "qc_only":             False,   # True = données brutes + M&M + figures QC seulement (auto si aucun réplicat)
     "make_wgcna":          False,
     "make_dashboard":      True,
+    # Statistique principale : "dpc" = sans imputation (méthode limpa, précurseurs,
+    # repli automatique sur l'imputation sans pr_matrix exploitable) | "imputation"
+    "primary_statistic":   "dpc",
+    # Sensibilité aux valeurs manquantes (comparaison DPC / imputation, détection)
+    "dpc_sensitivity":     True,    # analyse différentielle sans imputation (DPC)
+    "differential_detection": True, # protéines on/off : test de détection (DPC)
+    "dpc_level":           "auto",  # auto (précurseurs si pr_matrix, sinon protéines) | precursor | protein
+    # Pathfinder (synthèse multi-contrastes en fin de run, processus séparé)
+    "make_pathfinder":     False,   # True = lancer Pathfinder après l'Excel et le dashboard
+    "pathfinder_path":     None,    # clone Pathfinder ; None = $PATHFINDER_HOME puis ../Pathfinder
+    "pathfinder_publications": False,  # True = axe Publications (STRING PMID, réseau)
+    "pathfinder_options":  {},      # ex: {pthr: 0.05, jaccard: 0.5, no_umap: true}
+    "pathfinder_timeout":  1800,    # secondes
     "use_deqms":           False,
     "deqms_min_r2":        0.10,   # R2 min variance~comptage (sous-ensemble count>1)
     "deqms_max_pseudocount_pct": 50.0,  # % max de proteines a count<=1 tolere
@@ -130,6 +150,9 @@ def _validate(params: dict) -> list[str]:
     if params.get("volcano_ratio_min", 0) < 1:
         errors.append(f"  volcano_ratio_min doit être ≥ 1 "
                       f"(valeur : {params.get('volcano_ratio_min')!r})")
+    if str(params.get("volcano_y_axis", "pvalue")).lower() not in ("pvalue", "padj"):
+        errors.append(f"  volcano_y_axis doit être 'pvalue' ou 'padj' "
+                      f"(valeur : {params.get('volcano_y_axis')!r})")
     if params.get("n_heatmap_clusters", 0) < 2:
         errors.append(f"  n_heatmap_clusters doit être ≥ 2")
     if params.get("n_iter_robustness", 0) < 0:
@@ -138,8 +161,8 @@ def _validate(params: dict) -> list[str]:
         int(params.get("seed", 42))
     except (TypeError, ValueError):
         errors.append(f"  seed doit être un entier")
-    if params.get("impute_method") not in ("auto", "qrilc", "mixed"):
-        errors.append(f"  impute_method doit être 'auto', 'qrilc' ou 'mixed'")
+    if params.get("impute_method") not in ("auto", "qrilc", "mixed", "mixed_legacy"):
+        errors.append(f"  impute_method doit être 'auto', 'qrilc', 'mixed' ou 'mixed_legacy'")
     backend = params.get("go_backend", "gprofiler")
     if backend not in ("gprofiler", "string"):
         errors.append(f"  go_backend doit être 'gprofiler' ou 'string' (valeur : {backend!r})")
@@ -157,8 +180,20 @@ def _validate(params: dict) -> list[str]:
                 isinstance(x, str) and x.count("_vs_") == 1 for x in _items):
             errors.append(f"  contrasts : liste de motifs 'A_vs_B' attendue "
                           f"(ou 'all'), valeur : {_ct!r}")
-    if params.get("string_background", "genome") not in ("genome", "quantified"):
-        errors.append(f"  string_background doit être 'genome' ou 'quantified'")
+    if params.get("enrichment_background", "quantified") not in ("genome", "quantified"):
+        errors.append(f"  enrichment_background doit être 'quantified' ou 'genome'")
+    if params.get("string_background") not in (None, "genome", "quantified"):
+        errors.append(f"  string_background doit être 'genome', 'quantified' ou absent")
+    if str(params.get("primary_statistic", "dpc")).lower() not in ("dpc", "imputation"):
+        errors.append(f"  primary_statistic doit être 'dpc' ou 'imputation' "
+                      f"(valeur : {params.get('primary_statistic')!r})")
+    for k in ("dpc_sensitivity", "differential_detection"):
+        if not isinstance(params.get(k, True), bool):
+            errors.append(f"  {k} doit être true ou false (valeur : {params.get(k)!r})")
+    if str(params.get("dpc_level", "auto")).lower() not in ("auto", "precursor", "protein"):
+        errors.append(f"  dpc_level doit être 'auto', 'precursor' ou 'protein'")
+    from pathfinder_bridge import validate_pathfinder_params
+    errors += validate_pathfinder_params(params)
     return errors
 
 
@@ -234,23 +269,33 @@ def print_config_summary(params: dict) -> None:
     rob_txt = ("disabled" if params["n_iter_robustness"] == 0
                else f"{params['n_iter_robustness']} iterations")
     imp_txt = {"qrilc": "QRILC (pure MNAR)", "mixed": "Mixed (QRILC + kNN)",
+               "mixed_legacy": "Mixed, legacy rule (QRILC + kNN per condition)",
                "auto": "Auto (Mixed if >= 20% MAR, else QRILC)"}.get(
                params.get("impute_method", "auto"), str(params.get("impute_method")))
     if params.get("go_backend", "gprofiler") == "string":
         go_txt = (f"STRING, taxid {params['go_species_taxid']} "
-                  f"(background: {params.get('string_background', 'genome')})"
+                  f"(background: {params.get('string_background') or params.get('enrichment_background', 'quantified')})"
                   if params.get("go_species_taxid") else "no (STRING without taxid)")
     else:
-        go_txt = (f"gProfiler, {params['go_organism']}"
+        go_txt = (f"gProfiler, {params['go_organism']} (background: "
+                  f"{params.get('enrichment_background', 'quantified')})"
                   if params.get("go_organism") else "no")
     wgcna_txt = "yes" if params.get("make_wgcna") else "no"
     dash_txt  = "yes" if params.get("make_dashboard") else "no"
+    sens = [n for k, n in (("dpc_sensitivity", "imputation-free DPC"),
+                           ("differential_detection", "differential detection"))
+            if params.get(k, True)]
+    sens_txt  = " + ".join(sens) if sens else "no"
+    pf_txt    = ("yes" + (" (+ Publications, online)" if params.get("pathfinder_publications")
+                          else " (offline)")) if params.get("make_pathfinder") else "no"
     deqms_txt = "yes" if params.get("use_deqms") else "no"
 
     print("\n  [OK] Parameters:")
     print(f"     Volcanos/Robustness -> {v_stat} < {params['volcano_p_thresh']}"
           f"  |  ratio >= {params['volcano_ratio_min']}"
           f"  (log2FC >= {params['volcano_lfc_min']:.3f})")
+    print(f"     Volcano Y axis      -> -log10("
+          f"{'p.value' if str(params.get('volcano_y_axis', 'pvalue')).lower() == 'pvalue' else v_stat})")
     print(f"     ANOVA/Heatmap       -> {a_stat} < {params['anova_p_thresh']}")
     print(f"     Heatmap clusters    -> {params['n_heatmap_clusters']}")
     print(f"     Robustness          -> {rob_txt}")
@@ -260,12 +305,20 @@ def print_config_summary(params: dict) -> None:
               else "all pairs" if _ct in (None, "all")
               else ", ".join([_ct] if isinstance(_ct, str) else _ct))
     print(f"     Contrasts           -> {ct_txt}")
+    _ps = str(params.get("primary_statistic", "dpc")).lower()
+    print(f"     Primary statistic   -> "
+          + ("imputation-free DPC, precursor level (limpa method); imputed analysis "
+             "kept as secondary" if _ps == "dpc" else "imputation + limma/DEqMS"))
     print(f"     Imputation          -> {imp_txt}")
     print(f"     GO enrichment       -> {go_txt}")
     if params.get("qc_only"):
         print(f"     Mode                -> QC ONLY (raw data + M&M + QC figures)")
     print(f"     WGCNA               -> {wgcna_txt}")
     print(f"     Dashboard           -> {dash_txt}")
+    print(f"     Missing values      -> {sens_txt} "
+          + ("(comparison with the imputed analysis)" if _ps == "dpc"
+             else "(added to the imputed analysis)"))
+    print(f"     Pathfinder          -> {pf_txt}")
     print(f"     DEqMS               -> {deqms_txt}")
 
 
@@ -320,6 +373,12 @@ def parse_cli_args() -> argparse.Namespace:
         help=("Mode QC seul : Excel avec données brutes, M&M et figures QC, sans "
               "statistiques (activé automatiquement si aucune condition n'a de "
               "réplicat)."),
+    )
+    parser.add_argument(
+        "--pathfinder",
+        action="store_true",
+        help=("Lancer la synthèse Pathfinder en fin de run (make_pathfinder: true), "
+              "dans un processus séparé ; sorties dans <out_dir>/pathfinder/."),
     )
     parser.add_argument(
         "--batch-column",
@@ -412,6 +471,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.out_dir: params["out_dir"]     = args.out_dir
         if args.batch_column: params["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): params["qc_only"] = True
+        if getattr(args, "pathfinder", False): params["make_pathfinder"] = True
 
         # Les flags optionnels liés à la présence de fichiers/modules
         # peuvent ne pas être dans la config — on les complète
@@ -441,6 +501,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.out_dir: reloaded["out_dir"]      = args.out_dir
         if args.batch_column: reloaded["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): reloaded["qc_only"] = True
+        if getattr(args, "pathfinder", False): reloaded["make_pathfinder"] = True
         return reloaded
 
     # ── C. Questions interactives ──────────────────────────────────────────────
@@ -469,7 +530,9 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
             params["go_species_taxid"] = go_result.get("species_taxid")
             params["string_caller_identity"] = (go_result.get("caller_identity")
                                                 or _DEFAULTS["string_caller_identity"])
-            params["string_background"] = go_result.get("string_background", "genome")
+            params["enrichment_background"] = go_result.get("enrichment_background",
+                                                            "quantified")
+            params["string_background"] = go_result.get("string_background")
 
     # WGCNA
     rep = input("\n  Run the WGCNA co-expression analysis? "
@@ -482,6 +545,18 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         rep = input("\n  Generate the interactive HTML dashboard at the end? (Y/n) -> "
                     ).strip().lower()
         params["make_dashboard"] = rep in ("", "o", "oui", "y", "yes")
+
+    # Pathfinder — question posée seulement si un clone est trouvé
+    if getattr(args, "pathfinder", False):
+        params["make_pathfinder"] = True
+    else:
+        from pathfinder_bridge import locate_pathfinder
+        params["make_pathfinder"] = False
+        _pf = locate_pathfinder(params)
+        if _pf:
+            rep = input(f"\n  Run the Pathfinder multi-contrast synthesis at the end?\n"
+                        f"  ({_pf}) (y/N) -> ").strip().lower()
+            params["make_pathfinder"] = rep in ("o", "oui", "y", "yes")
 
     # DEqMS
     params["use_deqms"] = False
@@ -535,6 +610,7 @@ CONFIG_EXAMPLE = """\
 volcano_use_padj:    false        # true = FDR (p.adj), false = p-value brute
 volcano_p_thresh:    0.05
 volcano_ratio_min:   1.5          # ratio linéaire (ex: 1.5 = 50% de changement)
+volcano_y_axis:      pvalue       # axe Y : pvalue (p brute, défaut) | padj (statistique du seuil)
 
 anova_use_padj:      false
 anova_p_thresh:      0.05
@@ -547,16 +623,23 @@ fdr_global:          false        # true = correction BH sur toutes les p-values
 contrasts:           __auto__     # 'all', ou liste de motifs, ex :
                                   #   - "Live_{s}_vs_Heat_killed_{s}"   ({s} = même souche des deux côtés)
                                   #   - "Live_*_vs_Live_*"              (* = libre)
-impute_method:       auto         # 'auto' (choix par le diagnostic), 'qrilc' ou 'mixed'
+impute_method:       auto         # 'auto' (choix par le diagnostic), 'qrilc', 'mixed' ou 'mixed_legacy'
+primary_statistic:   dpc          # 'dpc' (sans imputation, précurseurs) ou 'imputation'
 seed:                42           # graine de l'imputation (résultats reproductibles)
 
 # ── Modules optionnels ───────────────────────────────────────────────────────
 go_organism:         null          # ex: 'bnapus', 'hsapiens', null = désactivé
 go_backend:          gprofiler     # 'gprofiler' ou 'string' (bactéries / non-modèles)
 go_species_taxid:    auto          # si go_backend = string : auto, ou taxid de SOUCHE (ex: 511145 = E. coli K-12 MG1655)
-string_background:   genome        # 'genome' ou 'quantified' (protéines quantifiées)
+enrichment_background: quantified  # univers de l'ORA : 'quantified' (protéines testées) ou 'genome'
+string_background:   null          # null = suit enrichment_background ; 'genome' ou 'quantified' pour forcer STRING
 make_wgcna:          false
 make_dashboard:      true
+dpc_sensitivity:     true          # analyse différentielle sans imputation (ajoutée)
+differential_detection: true       # protéines on/off : test de détection (ajouté)
+dpc_level:           auto          # auto (précurseurs si pr_matrix), precursor ou protein
+make_pathfinder:     false         # true = synthèse Pathfinder en fin de run (--pathfinder)
+pathfinder_path:     null          # clone Pathfinder ; null = $PATHFINDER_HOME puis ../Pathfinder
 use_deqms:           false
 
 # ── Chemins (optionnel — surchargeables aussi via CLI) ───────────────────────

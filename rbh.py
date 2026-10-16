@@ -17,6 +17,18 @@ import os
 import pandas as pd
 
 
+def clean_seqid(seqid: str) -> str:
+    """Identifiant utilisable par gProfiler / l'Excel : DIAMOND rend le premier mot
+    de l'en-tête FASTA tel quel, soit 'sp|Q9C5R8|NAME_ARATH' pour un FASTA UniProt,
+    que gProfiler ne reconnaît pas -> accession seule ('Q9C5R8'). Les autres
+    formats (AT1G01010.1, BnaA01g00010D, accession nue) sont rendus inchangés."""
+    s = str(seqid)
+    parts = s.split("|")
+    if len(parts) >= 3 and parts[0] in ("sp", "tr") and parts[1]:
+        return parts[1]
+    return s
+
+
 BLAST_COLUMNS = ["qseqid", "sseqid", "pident", "length", "mismatch",
                  "gapopen", "qstart", "qend", "sstart", "send",
                  "evalue", "bitscore", "qlen", "slen"]
@@ -120,4 +132,7 @@ def compute_rbh(query_fasta: str, reference_fasta: str, workdir: str,
         return "low"
 
     result["confidence"] = result.apply(_confidence, axis=1)
+    # En-têtes UniProt (sp|ACC|NAME) -> accession, des deux côtés
+    result["query_id"] = result["query_id"].map(clean_seqid)
+    result["reference_id"] = result["reference_id"].map(clean_seqid)
     return result.sort_values("bitscore", ascending=False).reset_index(drop=True)

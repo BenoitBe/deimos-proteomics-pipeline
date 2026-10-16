@@ -6,6 +6,7 @@ pandas
 numpy
 scipy
 scikit-learn
+scikit-misc         # R's loess (DEqMS trend, exact); optional: direct loess fallback
 
 # Visualisation
 matplotlib

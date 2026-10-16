@@ -85,6 +85,17 @@ except ImportError:
 # Module config YAML réutilisable
 from config import resolve_config
 
+# Contrat Deimos -> Pathfinder (onglet _manifest) et lancement de Pathfinder
+# Sensibilité aux valeurs manquantes (DPC) : analyses AJOUTÉES, non bloquantes
+try:
+    from dpc_sensitivity import run_missingness_sensitivity, estimate_dpc_intercept
+    _DPC_AVAILABLE = True
+except ImportError:
+    _DPC_AVAILABLE = False
+
+from pathfinder_bridge import (write_manifest, run_pathfinder_step,
+                               locate_pathfinder, pathfinder_version)
+
 
 # ==============================================================================
 # 0. PARAMÈTRES INTERACTIFS
@@ -194,7 +205,7 @@ def ask_params() -> dict:
         print("    [1] Auto (default) — chosen by the missingness diagnostic:")
         print("        Mixed if >= 20% of missing values are MAR, QRILC otherwise")
         print("    [2] QRILC (pure MNAR — every missing value imputed low)")
-        print("    [3] Mixed (QRILC if fully absent in a condition, kNN otherwise)")
+        print("    [3] Mixed (QRILC for proteins absent from a whole condition, kNN otherwise)")
         raw = input("  -> ").strip()
         if raw in ("", "1"):
             imp_method = "auto"
@@ -205,7 +216,23 @@ def ask_params() -> dict:
         else:
             print("  Answer: 1, 2 or 3.")
 
+    # Statistique principale
+    prim = None
+    while prim is None:
+        print("\n  Primary differential statistic:")
+        print("    [1] Imputation-free DPC (default) — limpa method, from the precursors")
+        print("        (pr_matrix); the imputed analysis is kept as secondary")
+        print("    [2] Imputation + limma/DEqMS (behaviour before 10/2026)")
+        raw = input("  -> ").strip()
+        if raw in ("", "1"):
+            prim = "dpc"
+        elif raw == "2":
+            prim = "imputation"
+        else:
+            print("  Answer: 1 or 2.")
+
     params = {
+        "primary_statistic": prim,
         "volcano_use_padj":  v_type == "2",
         "volcano_p_thresh":  v_val,
         "volcano_lfc_min":   np.log2(v_ratio),
@@ -226,6 +253,7 @@ def ask_params() -> dict:
     print(f"     Robustness          -> {'disabled' if n_iter_rob == 0 else str(n_iter_rob) + ' iterations'}")
     _fdr_txt = "global (whole study)" if fdr_global else "per contrast"
     print(f"     FDR correction      -> {_fdr_txt}")
+    print(f"     Primary statistic   -> {dict(dpc='Imputation-free DPC (limpa method)', imputation='Imputation + limma/DEqMS')[prim]}")
     print(f"     Imputation          -> {dict(auto='Auto (diagnostic-driven)', qrilc='QRILC (MNAR)', mixed='Mixed (MNAR+MAR)')[imp_method]}")
     print()
     return params
@@ -797,7 +825,9 @@ def export_perseverance_sheet(wb, correspondence_df: pd.DataFrame, _write_df,
 
 
 def build_peptide_count_table(pr_path: str, protein_names: list,
-                              count_level: str = "peptide") -> "pd.Series | None":
+                              count_level: str = "peptide",
+                              sample_labels: "list | None" = None,
+                              pg_path: "str | None" = None) -> "pd.Series | None":
     """
     Construit la count table DEqMS depuis le report.pr_matrix.tsv de DIA-NN.
 
@@ -813,6 +843,12 @@ def build_peptide_count_table(pr_path: str, protein_names: list,
                     pour aligner et ordonner le comptage
     count_level   : 'peptide' (Stripped.Sequence distinctes, défaut DEqMS LFQ)
                     ou 'precursor' (Precursor.Id distincts)
+    sample_labels : labels des échantillons ANALYSÉS : le minimum est pris sur
+                    leurs runs seulement (appariement par le pg_matrix, cf.
+                    _precursor_columns). Sans cela, ou si l'appariement échoue,
+                    tous les runs du fichier sont utilisés (comportement antérieur),
+                    y compris ceux exclus du design.
+    pg_path       : pg_matrix de la même recherche (appariement des runs)
 
     Returns
     -------
@@ -860,6 +896,15 @@ def build_peptide_count_table(pr_path: str, protein_names: list,
         if not run_cols:
             print("  [WARN] No intensity column detected in pr_matrix — DEqMS disabled.")
             return None
+        if sample_labels:
+            num = [c for c in pr.columns if pd.api.types.is_numeric_dtype(pr[c])]
+            found, _notes = _precursor_columns(num, list(sample_labels), pg_path)
+            if all(str(l) in found for l in sample_labels):
+                run_cols = [found[str(l)] for l in sample_labels]
+            else:
+                n_miss = sum(str(l) not in found for l in sample_labels)
+                print(f"  [WARN] DEqMS count: {n_miss} analysed sample(s) not matched in "
+                      f"the pr_matrix — minimum taken over all its runs.")
 
         # 'name' protéine = 1er Protein.Group
         pr["_name"] = pr["Protein.Group"].astype(str).str.split(";").str[0]
@@ -1200,14 +1245,24 @@ def impute_knn(mat: pd.DataFrame, k: int = 10) -> pd.DataFrame:
     return pd.DataFrame(arr, index=mat.index, columns=mat.columns)
 
 
-def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None) -> pd.DataFrame:
+def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None,
+                 legacy: bool = False) -> pd.DataFrame:
     """
     Imputation MIXTE (MNAR + MAR), approche Perseus/MSnbase :
-      • Une protéine ABSENTE de TOUS les réplicats d'une condition → manquement
-        MNAR (sous le seuil de détection) → QRILC (valeurs basses).
-      • Une protéine partiellement manquante (présente dans ≥1 réplicat de la
-        condition) → manquement MAR (aléatoire) → kNN.
-    Classification automatique par valeur manquante selon le design.
+      • Une protéine ABSENTE de TOUS les réplicats d'au moins une condition →
+        manquement MNAR (sous le seuil de détection) → QRILC pour TOUTES ses
+        valeurs manquantes, y compris les manques partiels des autres conditions.
+      • Une protéine sans absence totale (manques seulement partiels) → MAR → kNN.
+
+    Pourquoi la ligne entière (correction 10/2026) : avec QRILC pour le groupe
+    absent et kNN pour le manque partiel de l'autre groupe, le premier est placé
+    bas et le second près des valeurs observées → écart net à faible variance,
+    fabriqué par l'imputation (50 à 120 faux positifs par comparaison nulle sur
+    données réelles). Une absence totale signale une protéine proche du seuil de
+    détection : ses autres manques sont, eux aussi, plus probablement MNAR.
+
+    legacy=True : comportement d'origine (décision condition par condition),
+    conservé pour reproduire d'anciennes analyses (impute_method: mixed_legacy).
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -1225,6 +1280,12 @@ def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None) -> pd.DataFr
     # 2) Pour chaque NaN, décider MNAR (QRILC) ou MAR (kNN)
     out = mat_arr.copy()
     col_cond = np.array(conditions)
+    if not legacy:
+        whole_absent = np.zeros(mat_arr.shape[0], dtype=bool)
+        for cond in np.unique(col_cond):
+            whole_absent |= na_mask[:, col_cond == cond].all(axis=1)
+        out[na_mask] = np.where(whole_absent[:, None], qrilc_full, knn_full)[na_mask]
+        return pd.DataFrame(out, index=mat.index, columns=mat.columns)
     for i in range(mat_arr.shape[0]):
         if not na_mask[i].any():
             continue
@@ -1251,12 +1312,12 @@ AUTO_MIXED_MAR_PCT = 20.0
 
 def impute(mat: pd.DataFrame, method: str = "qrilc",
            design: pd.DataFrame = None, rng=None) -> pd.DataFrame:
-    """Dispatcher d'imputation. method ∈ {'mixed', 'qrilc', 'minprob'}."""
-    if method == "mixed":
+    """Dispatcher d'imputation. method ∈ {'mixed', 'mixed_legacy', 'qrilc', 'minprob'}."""
+    if method in ("mixed", "mixed_legacy"):
         if design is None:
             print("  [WARN] Mixed imputation requires the design -> falling back to QRILC.")
             return impute_qrilc(mat, rng=rng)
-        return impute_mixed(mat, design, rng=rng)
+        return impute_mixed(mat, design, rng=rng, legacy=(method == "mixed_legacy"))
     elif method == "minprob":
         return impute_minprob(mat, rng=rng)
     else:  # qrilc (défaut)
@@ -1700,7 +1761,8 @@ def warn_design(design: pd.DataFrame) -> "dict | None":
 def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
                                meta: pd.DataFrame, design: pd.DataFrame,
                                params: dict, out_dir: str, n_iter: int = 100,
-                               pep_count: "pd.Series | None" = None
+                               pep_count: "pd.Series | None" = None,
+                               model_out: "dict | None" = None
                                ) -> tuple[pd.DataFrame, list[str]]:
     """
     1. Modèle linéaire eBayes sur données imputées (référence)
@@ -1802,6 +1864,12 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         print(f"\n  [ERROR] contrasts : {e}")
         sys.exit(1)
 
+    # Exposé à l'appelant (analyses de sensibilité : MÊME design et contrastes)
+    if model_out is not None:
+        model_out.update({"design_mat": design_mat, "contrast_mat": contrast_mat,
+                          "contrast_names": list(contrast_names),
+                          "n_groups": len(group_names)})
+
     print(f"[MODEL] {len(contrast_names)} contrasts generated: "
           f"{contrast_names[:5]}{'...' if len(contrast_names)>5 else ''}")
 
@@ -1842,11 +1910,18 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         else:
             pc_aligned = pep_count.values
         # Remplacer NaN par 1 (count minimal) pour permettre le fit, mais marquer invalides
-        pc_for_fit = np.where(np.isfinite(pc_aligned) & (pc_aligned >= 1), pc_aligned, np.nan)
+        # Comptage DEqMS = minimum across échantillons + 1 (pseudo-comptage appliqué
+        # à toutes les protéines, comme la vignette LFQ de DEqMS) ; protéine sans
+        # peptide dans le pr_matrix = 0 + 1.
+        pc_for_fit = np.nan_to_num(np.asarray(pc_aligned, float), nan=0.0) + 1.0
         try:
-            fit_dq = spectra_count_ebayes(fit_c, np.nan_to_num(pc_for_fit, nan=1.0),
+            fit_dq = spectra_count_ebayes(fit_c, pc_for_fit,
                                           fdr_global=fdr_global)
-            print(f"  [OK] DEqMS model computed (df_prior={fit_dq['df_prior']:.2f})")
+            print(f"  [OK] DEqMS model computed (df_prior={fit_dq['df_prior']:.2f}; "
+                  f"{fit_dq.get('loess_engine', 'loess')})")
+            if model_out is not None:
+                model_out["deqms"] = {"df_prior": fit_dq["df_prior"],
+                                      "engine": fit_dq.get("loess_engine", "loess")}
         except Exception as e:
             print(f"  [WARN] DEqMS failed ({type(e).__name__}) — limma only will be used.")
             fit_dq = None
@@ -1857,13 +1932,7 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
     # fait group.replace(".", "_")). On construit donc cond_means avec la MÊME
     # convention pour éviter tout désalignement quand une condition contient un
     # séparateur (ex. "EP-HS-10" -> groupe "EP.HS.10" -> clé contraste "EP_HS_10").
-    cond_means = {}
-    for cond in np.unique(conditions):
-        idx = np.where(conditions == cond)[0]
-        cond_clean = re.sub(r"[^A-Za-z0-9_]", ".", cond)
-        cond_clean = "X" + cond_clean if cond_clean[0].isdigit() else cond_clean
-        cond_key = cond_clean.replace(".", "_")   # même forme que les contrastes
-        cond_means[cond_key] = expr[:, idx].mean(axis=1)
+    cond_means = condition_means(expr, conditions)
 
     # --- Initialisation du df résultats ---
     df_results = meta.iloc[mat_filt.index if hasattr(mat_filt, 'index') else range(len(meta))].copy()
@@ -1898,12 +1967,17 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
                                            (-np.log10(np.maximum(p_for_pi, 1e-10))))
 
     # Comptage peptidique en colonne (traçabilité)
+    # Avec primary_statistic: dpc, cette analyse imputée devient secondaire
+    # (bascule faite après coup si la DPC est disponible, cf. run_pipeline_core).
+    _lbl = ("Imputed-analysis statistic"
+            if str(params.get("primary_statistic", "dpc")).lower() == "dpc"
+            else "Primary statistic")
     if use_deqms and fit_dq is not None:
-        df_results["Peptide_Count_min"] = fit_dq["pep_count"]
-        print("  [INFO] Primary statistic = DEqMS (variance ~ peptide count); "
+        df_results["Peptide_Count_min"] = pc_aligned     # brut (sans pseudo-comptage)
+        print(f"  [INFO] {_lbl} = DEqMS (variance ~ peptide count); "
               "limma kept in _limma columns.")
     else:
-        print("  [INFO] Primary statistic = limma eBayes (no peptide "
+        print(f"  [INFO] {_lbl} = limma eBayes (no peptide "
               "count available for DEqMS).")
 
     # --- Robustness score (optionnel) ---
@@ -1949,7 +2023,7 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
             if use_deqms and fit_dq is not None:
                 try:
                     fit_ref = spectra_count_ebayes(
-                        fit_tmp_c, np.nan_to_num(pc_for_fit, nan=1.0),
+                        fit_tmp_c, pc_for_fit,
                         fdr_global=params.get("fdr_global", False))
                 except Exception:
                     fit_ref = fit_tmp_e   # repli limma si DEqMS échoue sur ce tirage
@@ -1994,18 +2068,29 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         print("\n[SKIP] Robustness score disabled (n_iter=0)")
 
     # --- Scatter plots (indépendants de la robustesse) ---
+    scatter_files = plot_contrast_scatters(df_results, contrast_names, cond_means,
+                                           params, out_dir)
+
+    return df_results, contrast_names, scatter_files
+
+
+def plot_contrast_scatters(df_results: pd.DataFrame, contrast_names: list,
+                           cond_means: dict, params: dict, out_dir: str) -> list:
+    """Scatter intensité moyenne g1 vs g2 par contraste, statut selon la règle des
+    volcanos (volcano_status) appliquée aux colonnes principales de df_results."""
+    scatter_files = []
     for i, cname in enumerate(contrast_names):
         try:
             g1, g2 = cname.split("_vs_")
             if g1 in cond_means and g2 in cond_means:
                 x_vals = cond_means[g1]
                 y_vals = cond_means[g2]
-                lfc    = df_results[f"{cname}_diff"].values
-                pv     = df_results[f"{cname}_p.val"].values
+                # Même règle que les volcanos (statistique et seuil choisis)
+                lfc, _, _, up, down = volcano_status(df_results, cname, params)
 
                 status = np.full(len(lfc), "Not changed", dtype=object)
-                status[(lfc >  params["volcano_lfc_min"]) & (pv < 0.05)] = "Up regulated"
-                status[(lfc < -params["volcano_lfc_min"]) & (pv < 0.05)] = "Down regulated"
+                status[up] = "Up regulated"
+                status[down] = "Down regulated"
 
                 col_map = {"Up regulated": "#f3a583",
                            "Down regulated": "#92dadd",
@@ -2034,52 +2119,113 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         except Exception as e:
             print(f"  [WARN] Scatter {cname}: {e}")
 
-    return df_results, contrast_names, scatter_files
+    return scatter_files
 
 
 # ==============================================================================
 # 6. VOLCANO PLOTS
 # ==============================================================================
 
+P_FLOOR = 1e-300   # p = 0 (sous-dépassement) affichée à ce plancher, marqueur triangle
+
+
+def volcano_status(df_results: pd.DataFrame, cname: str, params: dict):
+    """Règle DEP des volcanos pour un contraste, partagée par les volcanos, le facet et
+    les scatters : statistique choisie (p.adj ou p brute) < seuil ET |log2FC| >= seuil
+    (même règle que l'UpSet et le score de robustesse).
+    Retourne (lfc, p_raw, p_stat, up, down)."""
+    p_key = "p.adj" if params["volcano_use_padj"] else "p.val"
+    lfc = df_results[f"{cname}_diff"].to_numpy(float)
+    p_raw = df_results[f"{cname}_p.val"].to_numpy(float)
+    p_stat = df_results[f"{cname}_{p_key}"].to_numpy(float)
+    passed = p_stat < params["volcano_p_thresh"]
+    up = passed & (lfc >= params["volcano_lfc_min"])
+    down = passed & (lfc <= -params["volcano_lfc_min"])
+    return lfc, p_raw, p_stat, up, down
+
+
+def volcano_axis(df_results: pd.DataFrame, cname: str, params: dict):
+    """Axe Y du volcano et position de la ligne de seuil sur cet axe.
+
+    volcano_y_axis: pvalue (défaut) -> -log10(p brute), comme volcanoplot() de limma :
+      le nuage garde sa forme en V même sans protéine significative. Si le seuil
+      porte sur la p.adj, la ligne est placée à la p brute équivalente du contraste
+      (entre la plus grande p brute qui passe et la plus petite qui ne passe pas ;
+      BH est monotone en p). Aucune protéine ne passe -> pas de ligne.
+    volcano_y_axis: padj -> -log10 de la statistique du seuil (comportement antérieur).
+    Retourne (p_axis, cut, label) ; cut = None si aucune protéine ne passe."""
+    _, p_raw, p_stat, _, _ = volcano_status(df_results, cname, params)
+    thresh = params["volcano_p_thresh"]
+    use_padj = bool(params["volcano_use_padj"])
+    if str(params.get("volcano_y_axis", "pvalue")).lower() == "padj" or not use_padj:
+        return (p_stat, thresh,
+                "p.adj" if use_padj else "p.value")
+    ok = np.isfinite(p_raw) & np.isfinite(p_stat)
+    passed = ok & (p_stat < thresh)
+    if not passed.any():
+        return p_raw, None, "p.value"
+    hi = float(np.max(p_raw[passed]))
+    above = p_raw[ok & ~passed & (p_raw > hi)]
+    cut = float(np.sqrt(hi * np.min(above))) if above.size else hi
+    return p_raw, cut, "p.value"
+
+
+def _neglog10(p):
+    return -np.log10(np.maximum(np.asarray(p, float), P_FLOOR))
+
+
 def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
                    params: dict, out_dir: str) -> tuple[list[str], str]:
     """
     Génère les volcanos individuels + le facet volcano universel.
-    Seuils = seuils volcanos (= seuils robustness).
+    Seuils = seuils volcanos (= seuils robustness). Axe Y : cf. volcano_axis.
     """
-    p_key  = "p.adj" if params["volcano_use_padj"] else "p.val"
     thresh = params["volcano_p_thresh"]
     lfc    = params["volcano_lfc_min"]
+    stat_name = "p.adj" if params["volcano_use_padj"] else "p.value"
+    rule_txt = f"{stat_name} < {thresh} & |log2FC| >= {lfc:.2f}"
     indiv_files = []
 
     col_map = {"Up regulated":    "#E74C3C",
                "Down regulated":  "#3498DB",
                "Not significant": "#BDBDBD"}
 
+    def _threshold_line(ax, cut, y_name, fontsize, style, label=True):
+        if cut is None:
+            ax.text(0.5, 0.97, f"no protein at {stat_name} < {thresh}",
+                    transform=ax.transAxes, ha="center", va="top",
+                    fontsize=fontsize, color="#7F8C8D", style="italic")
+            return
+        ax.axhline(-np.log10(cut), **style)
+        if label and y_name != stat_name:
+            ax.text(0.99, -np.log10(cut), f" {stat_name} < {thresh}  (p ≈ {cut:.1e})",
+                    transform=ax.get_yaxis_transform(), ha="right", va="bottom",
+                    fontsize=fontsize, color="#7F8C8D",
+                    bbox=dict(facecolor="white", alpha=0.75, lw=0, pad=0.6))
+
     # --- Volcanos individuels ---
     for cname in contrast_names:
-        diff_col = f"{cname}_diff"
-        pval_col = f"{cname}_{p_key}"
-        if diff_col not in df_results.columns:
+        if f"{cname}_diff" not in df_results.columns:
             continue
-
-        d  = df_results[diff_col].values
-        p  = df_results[pval_col].values        # statistique du SEUIL (p.val ou p.adj)
+        d, _, _, up, down = volcano_status(df_results, cname, params)
+        p_axis, cut, y_name = volcano_axis(df_results, cname, params)
         nm = df_results["name"].values
 
         status = np.full(len(d), "Not significant", dtype=object)
-        status[(d > lfc)  & (p < thresh)] = "Up regulated"
-        status[(d < -lfc) & (p < thresh)] = "Down regulated"
-
-        # L'axe Y utilise la MÊME statistique que le seuil (cohérence visuelle :
-        # un point au-dessus de la ligne horizontale est significatif et coloré).
-        y_all = -np.log10(np.maximum(p, 1e-10))
+        status[up] = "Up regulated"
+        status[down] = "Down regulated"
+        y_all = _neglog10(p_axis)
+        floored = np.asarray(p_axis, float) < P_FLOOR
 
         fig, ax = plt.subplots(figsize=(7, 6))
         for s, col in col_map.items():
-            mask = status == s
+            mask = (status == s) & ~floored
             ax.scatter(d[mask], y_all[mask],
                        c=col, s=12, alpha=0.7, label=s)
+            mask_f = (status == s) & floored
+            if mask_f.any():
+                ax.scatter(d[mask_f], y_all[mask_f], c=col, s=30, marker="^",
+                           alpha=0.9, edgecolors="black", linewidths=0.4)
 
         # --- Labels des significatifs (anti-chevauchement) ---
         sig_mask = status != "Not significant"
@@ -2115,11 +2261,16 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
 
         ax.axvline(-lfc, ls="--", lw=0.8, color="grey")
         ax.axvline( lfc, ls="--", lw=0.8, color="grey")
-        ax.axhline(-np.log10(thresh), ls="--", lw=0.8, color="grey")
+        _threshold_line(ax, cut, y_name, 6, dict(ls="--", lw=0.8, color="grey"))
+        if floored.any():
+            ax.text(0.01, 0.99, f"▲ p < {P_FLOOR:.0e}", transform=ax.transAxes,
+                    ha="left", va="top", fontsize=6, color="#7F8C8D")
         ax.set_xlabel("log2 Fold Change")
-        ax.set_ylabel(f"-log10({'p.adj' if params['volcano_use_padj'] else 'p.value'})")
-        ax.set_title(cname.replace("_vs_", " vs "))
-        ax.legend(fontsize=7)
+        ax.set_ylabel(f"-log10({y_name})")
+        ax.set_title(f"{cname.replace('_vs_', ' vs ')}\n"
+                     f"Up {int(up.sum())} | Down {int(down.sum())}  ({rule_txt})",
+                     fontsize=10)
+        ax.legend(fontsize=7, loc="upper right")
         fig.tight_layout()
         f = os.path.join(out_dir, f"volc_{cname}.png")
         fig.savefig(f, dpi=150)
@@ -2133,37 +2284,27 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
     fig, axes = plt.subplots(n_rows, n_cols,
                              figsize=(n_cols * 4, n_rows * 3.5))
     axes = np.array(axes).flatten()
+    facet_y = "p.value"
 
     for idx, cname in enumerate(contrast_names):
         ax = axes[idx]
-        diff_col = f"{cname}_diff"
-        pval_col = f"{cname}_{p_key}"
-        praw_col = f"{cname}_p.val"
-        if diff_col not in df_results.columns:
+        if f"{cname}_diff" not in df_results.columns:
             ax.set_visible(False)
             continue
 
-        d = df_results[diff_col].values
-        p = df_results[pval_col].values
-        p_raw = df_results[praw_col].values
-
-        status = np.full(len(d), "Non-significant", dtype=object)
-        status[(d > lfc)  & (p < thresh)] = "Up-regulated"
-        status[(d < -lfc) & (p < thresh)] = "Down-regulated"
-
-        colors_pt = [{"Up-regulated": "#E74C3C",
-                      "Down-regulated": "#3498DB",
-                      "Non-significant": "#DDDDDD"}[s] for s in status]
-        ax.scatter(d, -np.log10(np.maximum(p_raw, 1e-10)),
-                   c=colors_pt, s=4, alpha=0.6)
+        d, _, _, up, down = volcano_status(df_results, cname, params)
+        p_axis, cut, facet_y = volcano_axis(df_results, cname, params)
+        colors_pt = np.where(up, "#E74C3C", np.where(down, "#3498DB", "#DDDDDD"))
+        ax.scatter(d, _neglog10(p_axis), c=colors_pt, s=4, alpha=0.6)
         ax.axvline(-lfc, ls=":", lw=0.6, color="black", alpha=0.4)
         ax.axvline( lfc, ls=":", lw=0.6, color="black", alpha=0.4)
-        ax.axhline(-np.log10(thresh), ls=":", lw=0.6, color="black", alpha=0.4)
-        ax.set_title(cname.replace("_vs_", " vs "), fontsize=7,
-                     fontweight="bold", color="white",
+        _threshold_line(ax, cut, facet_y, 5,
+                        dict(ls=":", lw=0.6, color="black", alpha=0.4), label=False)
+        ax.set_title(f"{cname.replace('_vs_', ' vs ')}  (↑{int(up.sum())} ↓{int(down.sum())})",
+                     fontsize=7, fontweight="bold", color="white",
                      bbox=dict(facecolor="#34495E", boxstyle="round,pad=0.2"))
         ax.set_xlabel("log2FC", fontsize=7)
-        ax.set_ylabel("-log10(p)", fontsize=7)
+        ax.set_ylabel(f"-log10({facet_y})", fontsize=7)
         ax.tick_params(labelsize=6)
 
     for idx in range(n_c, len(axes)):
@@ -2174,9 +2315,10 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
                mpatches.Patch(color="#3498DB", label="Down"),
                mpatches.Patch(color="#DDDDDD", label="NS")]
     fig.legend(handles=patches, loc="lower right", fontsize=9, ncol=3)
+    line_txt = ("" if facet_y == stat_name else
+                f" | dotted line = p.value equivalent to {stat_name} < {thresh}")
     fig.suptitle(f"Facet Volcano — {n_c} comparisons | "
-                 f"threshold {'p.adj' if params['volcano_use_padj'] else 'p.val'} < {thresh},"
-                 f" |log2FC| > {lfc:.2f}", fontsize=11, fontweight="bold")
+                 f"threshold {rule_txt}{line_txt}", fontsize=11, fontweight="bold")
     fig.tight_layout(rect=[0, 0.02, 1, 0.97])
 
     f_facet = os.path.join(out_dir, "all_volcano_plots_grid.png")
@@ -3002,10 +3144,17 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     _imp = params.get("impute_method", "qrilc")
     if _imp == "mixed":
         put_kv("Imputation", "Mixed (MNAR + MAR)",
-               "QRILC (truncated normal, Lazar 2016) for proteins absent "
-               "from all replicates of a condition (MNAR, below the detection "
-               "limit); kNN (k=10) for partial missingness (MAR). "
-               "Automatic per-missing-value classification based on the design.")
+               "QRILC (truncated normal, Lazar 2016) for every missing value of a "
+               "protein absent from all replicates of at least one condition (MNAR, "
+               "below the detection limit); kNN (k=10) for proteins with partial "
+               "missingness only (MAR). Classification per protein based on the design.")
+    elif _imp == "mixed_legacy":
+        put_kv("Imputation", "Mixed, legacy rule (MNAR + MAR)",
+               "QRILC for the conditions where the protein is absent from all "
+               "replicates; kNN (k=10) for partial missingness in the other "
+               "conditions, including for proteins absent from a whole condition. "
+               "Kept to reproduce earlier analyses: this rule can create artificial "
+               "group differences (low QRILC values vs kNN values near the observed ones).")
     else:
         put_kv("Imputation", "QRILC (MNAR)",
                "Quantile Regression Imputation of Left-Censored data (Lazar 2016): "
@@ -3016,13 +3165,52 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_kv("Random seed", str(params.get("seed", 42)),
            "Seed of the reference imputation draw (p-values, volcanos). "
            "Re-running with the same seed and inputs gives identical results.")
+    if (params.get("_primary") or {}).get("statistic") == "dpc":
+        put_kv("Imputed matrix used for", "secondary analyses",
+               "Imputed analysis kept in *_imputed columns, PCA, UMAP, correlation, "
+               "ANOVA heatmaps and WGCNA. The primary differential statistic does not "
+               "use it (section 3).")
 
     # ===== DIFFERENTIAL ANALYSIS =====
     put_section("3. DIFFERENTIAL ANALYSIS (Volcanos)")
     put_header()
     # Detect whether DEqMS is authoritative (presence of secondary limma columns)
     _deqms_active = any(str(c).endswith("_p.adj_limma") for c in df_results.columns)
-    if _deqms_active:
+    _prim = params.get("_primary") or {}
+    if _prim.get("statistic") == "dpc":
+        _d = _prim.get("dpc_precursor") or {}
+        put_kv("Primary statistic", "Imputation-free DPC + weighted limma (limpa method)",
+               "Detection probability curve (DPC) on the precursor matrix (report.pr_matrix): "
+               f"logit p = {_d.get('beta0', float('nan')):.3f} + "
+               f"{_d.get('beta1', float('nan')):.3f} y (50 % detection at log2 "
+               f"{-_d.get('beta0', 0) / _d.get('beta1', 1):.2f}), complete-normal model "
+               "(Li & Smyth 2023, Bioinformatics 39:btad200). Protein abundances and their "
+               "standard errors estimated from the precursors by maximum posterior under "
+               "the DPC (additive precursor + sample model; limpa dpcQuant): undetected "
+               "precursors contribute their probability of non-detection, nothing is "
+               "imputed. limma with vooma precision weights predicted by intensity and "
+               "standard error, residual df corrected when a whole group is unobserved "
+               f"({_prim.get('n_df_corrected', 0)} protein groups), eBayes (limpa dpcDE, "
+               "Li et al. 2025). Independent Python implementation, checked against "
+               "limpa 1.5.2 (same significant calls). Authoritative for volcanos, UpSet, "
+               "GO, GSEA, dashboard and Pathfinder.")
+        if _prim.get("n_protein_level"):
+            put_kv("Proteins without precursor", str(_prim["n_protein_level"]),
+                   "Absent from the pr_matrix: DPC at protein level (limpa "
+                   "dpcQuantByRow logic), same model and BH correction")
+        put_kv("Fold-changes", "DPC estimates",
+                "Weakly observed values are shrunk towards the prior: fold-changes of "
+                "proteins absent from a whole condition are conservative (about 12 % "
+                "compression in in-silico spike-ins); see Differential_Detection for "
+                "on/off proteins")
+        put_kv("Imputed analysis (secondary)",
+               "DEqMS on imputed data" if _prim.get("imputed_deqms") else
+               "limma eBayes on imputed data",
+               "Previous primary statistic, kept for comparison: columns *_diff_imputed, "
+               "*_p.val_imputed, *_p.adj_imputed"
+               + (", *_p.val_imputed_limma" if _prim.get("imputed_deqms") else "")
+               + ", Pi_Score_imputed_*, Robustness_Score_imputed_*")
+    elif _deqms_active:
         put_kv("Primary statistic", "DEqMS",
                "Residual variance modeled as a function of peptide count "
                "(Zhu et al. 2020). Authoritative for volcanos, UpSet, GO and robustness. "
@@ -3036,6 +3224,22 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
                "Variance moderated by information borrowing across proteins — "
                "essential for small sample sizes (n=3). "
                "DEqMS not available (no pr_matrix peptide count)")
+    _dq = params.get("_deqms")
+    if _dq and (_deqms_active or _prim.get("imputed_deqms")):
+        put_kv("DEqMS settings", f"prior df = {_dq['df_prior']:.1f}",
+               "Peptide count = minimum number of distinct peptides across the analysed "
+               "samples + 1 (pseudo-count of the DEqMS LFQ vignette); prior variance from "
+               "loess(log s² ~ log2 count, span 0.75) and prior df by the grid search of "
+               "spectraCounteBayes, reproduced exactly (same results as R DEqMS 1.31 on "
+               f"test data); loess: {_dq['engine']}")
+    put_kv("Implementation", "limma_ebayes.py (Python)",
+           "lmFit, contrasts.fit, eBayes (squeezeVar/fitFDist) and BH reproduced "
+           "exactly: coefficients, moderated t and p-values identical to R limma 3.58 "
+           "and to InMoose to 1e-12 on simulated and real datasets")
+    if _prim.get("statistic") == "imputation" and _prim.get("requested") == "dpc":
+        put_kv("DPC primary statistic", "not applied",
+               f"primary_statistic: dpc requested, but {_prim.get('fallback') or 'not available'}; "
+               "the imputed analysis is the primary statistic")
     _has_subj = any(c in design.columns for c in
                     ("subject", "pair", "patient", "individual"))
     _paired = False
@@ -3072,6 +3276,15 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_kv("Fold-Change threshold",
            f"ratio >= {params['volcano_ratio_min']}",
            f"|log2FC| >= {params['volcano_lfc_min']:.3f}")
+    _yax = str(params.get("volcano_y_axis", "pvalue")).lower()
+    put_kv("Volcano Y axis",
+           "-log10(p.value)" if (_yax == "pvalue" or not params["volcano_use_padj"])
+           else "-log10(p.adj)",
+           ("Raw p-value (limma volcanoplot convention); colours follow the p.adj "
+            "threshold, and the dashed line sits at the raw p-value equivalent to it in "
+            "each contrast (Benjamini-Hochberg is monotone in p)")
+           if (_yax == "pvalue" and params["volcano_use_padj"]) else
+           "Same statistic as the significance threshold")
     put_kv("Pi-score", "|log2FC| x -log10(p)",
            "Combined magnitude x significance score (Xiao et al.). "
            "Uses the p-value of the primary statistic.")
@@ -3079,17 +3292,37 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     # ===== ROBUSTNESS =====
     put_section("4. ROBUSTNESS SCORE")
     put_header()
-    put_kv("Principle", f"{n_iter} re-imputations",
-           f"Repeated stochastic imputation ({params.get('impute_method', 'qrilc').upper()}, "
-           f"same method as the reference draw; base seed={params.get('seed', 42)}), model re-estimation "
-           "at each iteration to assess stability against missing-value "
-           "imputation uncertainty")
-    put_kv("Applied thresholds", p_volc + f" < {params['volcano_p_thresh']} "
-           f"& ratio >= {params['volcano_ratio_min']}",
-           "IDENTICAL to the volcano thresholds (consistency)")
-    put_kv("Score", f"0-{n_iter}",
-           f"Number of iterations (out of {n_iter}) where the protein passes the thresholds. "
-           "High score = differential robust to imputation uncertainty")
+    if _prim.get("statistic") == "dpc" and _prim.get("robustness"):
+        put_kv("Principle", "Leave-one-sample-out (DPC statistic)",
+               "For each contrast, the DPC analysis is refitted after removing, in turn, "
+               "each sample of the two compared conditions (abundances and standard "
+               "errors of the full quantification kept). No random draw is involved in "
+               "the DPC statistic, so the re-imputation score has no direct equivalent"
+               + (f"; {_prim['loo_skipped']} sample(s) skipped (design not estimable "
+                  "without them)" if _prim.get("loo_skipped") else ""))
+        put_kv("Applied thresholds", p_volc + f" < {params['volcano_p_thresh']} "
+               f"& ratio >= {params['volcano_ratio_min']}",
+               "IDENTICAL to the volcano thresholds (consistency)")
+        put_kv("Score", "0-100",
+               "Percentage of the refits where the protein still passes the thresholds. "
+               "High score = call not driven by a single sample (outlier injection, "
+               "one replicate carrying the effect)")
+        put_kv("Imputation robustness", f"{n_iter} re-imputations",
+               f"Stability of the secondary imputed analysis "
+               f"({params.get('impute_method', 'qrilc').upper()}), columns "
+               "Robustness_Score_imputed_* (0-" + str(n_iter) + ")")
+    else:
+        put_kv("Principle", f"{n_iter} re-imputations",
+               f"Repeated stochastic imputation ({params.get('impute_method', 'qrilc').upper()}, "
+               f"same method as the reference draw; base seed={params.get('seed', 42)}), "
+               "model re-estimation at each iteration to assess stability against "
+               "missing-value imputation uncertainty")
+        put_kv("Applied thresholds", p_volc + f" < {params['volcano_p_thresh']} "
+               f"& ratio >= {params['volcano_ratio_min']}",
+               "IDENTICAL to the volcano thresholds (consistency)")
+        put_kv("Score", f"0-{n_iter}",
+               f"Number of iterations (out of {n_iter}) where the protein passes the "
+               "thresholds. High score = differential robust to imputation uncertainty")
 
     # ===== ANOVA / HEATMAPS =====
     put_section("5. ANOVA & HEATMAPS")
@@ -3145,7 +3378,8 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
         put_section("8. FUNCTIONAL ENRICHMENT (GO)")
         put_header()
         if params.get("go_backend", "gprofiler") == "string":
-            _bg = params.get("string_background", "genome")
+            _bg = params.get("string_background") or params.get("enrichment_background",
+                                                                  "quantified")
             _cats = params.get("string_categories") or ["Process", "Function",
                                                          "Component", "KEGG", "RCTM"]
             put_kv("Tool", "STRING (API 'enrichment')",
@@ -3188,12 +3422,98 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
             put_kv("Input list", "DEP per contrast",
                    f"Proteins passing {p_volc} < {params['volcano_p_thresh']} "
                    f"& ratio >= {params['volcano_ratio_min']} (volcano thresholds)")
+            _gbg = params.get("enrichment_background", "quantified")
+            put_kv("Background", ("quantified proteins" if _gbg == "quantified"
+                                  else "whole annotated genome"),
+                   ("custom background = all proteins tested in the differential "
+                    "analysis (or their orthologues), restricted to annotated genes "
+                    "(domain_scope='custom_annotated'); also used for the ANOVA "
+                    "cluster enrichment. Corrects the detectability bias of proteomics "
+                    "(abundant categories over-called against the genome)"
+                    if _gbg == "quantified" else
+                    "all known genes of the species (domain_scope='known')"))
             put_kv("Multiple correction", "FDR (g:SCS disabled in favor of FDR)",
                    "significance_threshold_method='fdr'")
         put_kv("Term filters", "size 5-1000, roots excluded",
                "Exclusion of GO:0003674/0008150/0005575")
         put_kv("Z-score", "term mean log2FC",
                "Pathway regulation direction")
+
+    _next_sec = 9 if go_enabled else 8
+
+    # ===== SENSITIVITY TO MISSING VALUES (added analyses) =====
+    _sm = params.get("_sensitivity_methods")
+    if _sm:
+        put_section(f"{_next_sec}. SENSITIVITY TO MISSING VALUES (complementary)")
+        _next_sec += 1
+        put_header()
+        if _sm.get("primary_dpc"):
+            put_kv("Principle", "Comparison of the two treatments of missing values",
+                   "The DPC analysis is the primary statistic (section 3); the imputed "
+                   "analysis is kept in *_imputed columns. Sensitivity_DPC and "
+                   "Sensitivity_Summary compare their calls; Differential_Detection "
+                   "tests on/off proteins.")
+        else:
+            put_kv("Principle", "Added to the main analysis, which is unchanged",
+                   "Volcanos, robustness, GO and dashboard use the imputed analysis "
+                   "above. These analyses read the filtered, NON-imputed matrix and are "
+                   "reported in separate sheets (Sensitivity_Summary, Sensitivity_DPC, "
+                   "Differential_Detection).")
+        put_kv("Detection probability curve",
+               f"logit p = {_sm['beta0']:.3f} + {_sm['beta1']:.3f} y",
+               f"Probability that a protein is detected as a function of its log2 "
+               f"intensity y (50 % at {_sm['lod50']:.2f}); maximum likelihood under "
+               f"the complete-normal model (Li & Smyth 2023, Bioinformatics "
+               f"39:btad200), on {_sm['n_rows']} protein groups before filtering")
+        if _sm.get("dpc"):
+            _lvl = _sm.get("level", "protein")
+            put_kv("Imputation-free analysis",
+                   f"DPC quantification ({_lvl} level) + weighted limma",
+                   ("Protein abundances estimated from the precursor matrix "
+                    "(report.pr_matrix) by maximum posterior under the precursor-level "
+                    "DPC (additive precursor + sample model, method of limpa dpcQuant), "
+                    "with standard errors; " if _lvl == "precursor" else
+                    "Missing values replaced by their maximum posterior under the "
+                    "DPC, with standard errors; ") +
+                   "limma with vooma precision weights "
+                   "predicted by intensity and standard error, residual df corrected "
+                   "when a whole group is unobserved "
+                   f"({_sm.get('n_df_corrected') or 0} protein groups), eBayes. "
+                   "Method of limpa dpcQuant/dpcQuantByRow + dpcDE (Li et al. 2025), "
+                   "independent Python implementation, checked against limpa 1.5.2. "
+                   "Same design and contrasts as the main model.")
+        if _sm.get("detection"):
+            _dp = _sm.get("dropout") or {}
+            put_kv("Differential detection", "On/off proteins",
+                   "For each contrast: probability of the observed non-detections in "
+                   "one condition if the protein had the abundance of the other. "
+                   "Probability of non-detection = pi + (1 - pi) x (1 - DPC), where pi "
+                   "is a protein-specific sporadic dropout rate (identification failures, "
+                   "presence in some individuals only): prior estimated on this dataset "
+                   "from abundant protein x condition cells (nonparametric maximum "
+                   "likelihood"
+                   + (f"; mean {_dp['mean']:.3f}, {100 * _dp['frac_above_0.1']:.1f} % of "
+                      f"proteins with pi > 0.1" if _dp.get("mean") is not None else "")
+                   + "), updated by the non-detections of the condition where the "
+                   "protein is present; binomial, integrated over the uncertainty of the "
+                   "abundance and of pi; two-sided, BH over all proteins of the contrast. "
+                   "Listed: on/off patterns (detected in >= n-1 samples of one "
+                   "condition, < half of the other) and significant pairs")
+        put_kv("Concordance", f"volcano rule on both analyses ({_sm['pkey']})",
+               "both / imputation only / DPC only, per protein and contrast "
+               "(sheet Sensitivity_DPC); counts per contrast in Sensitivity_Summary")
+
+    # ===== PATHFINDER (if requested and found) =====
+    _pf_dir = locate_pathfinder(params) if params.get("make_pathfinder") else None
+    if _pf_dir:
+        put_section(f"{_next_sec}. DOWNSTREAM SYNTHESIS")
+        put_header()
+        _pthr = (params.get("pathfinder_options") or {}).get("pthr", 0.05)
+        put_kv("Downstream synthesis", f"Pathfinder {pathfinder_version(_pf_dir)}",
+               "Reads this workbook after it is saved, no recomputation; outputs in "
+               "pathfinder/ (report, synthesis workbook, summary, log). Protein "
+               f"signature = p.adj < {_pthr} without fold-change criterion "
+               "(independent of the volcano thresholds above)")
 
     # ===== LARGEURS DE COLONNES =====
     ws.column_dimensions["A"].width = 26
@@ -3374,12 +3694,20 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
             cols_keep.append(extra)
     if "Peptide_Count_min" in df_comp_src.columns:
         cols_keep.append("Peptide_Count_min")
+    for extra in ("dpc_source", "n_precursors"):        # statistique principale DPC
+        if extra in df_comp_src.columns:
+            cols_keep.append(extra)
     for cname in contrast_names:
-        # Colonnes principales (_p.val/_p.adj = DEqMS si dispo, sinon limma),
-        # puis colonnes limma secondaires (_limma) pour comparaison directe.
+        # Colonnes principales (_p.val/_p.adj = DPC si primary_statistic: dpc,
+        # sinon DEqMS si dispo, sinon limma), colonnes limma secondaires (_limma),
+        # puis analyse imputée conservée (_imputed) quand la DPC est principale.
         ordered = [f"{cname}_diff", f"{cname}_p.val", f"{cname}_p.adj",
                    f"{cname}_p.val_limma", f"{cname}_p.adj_limma",
-                   f"Pi_Score_{cname}", f"Robustness_Score_{cname}"]
+                   f"Pi_Score_{cname}", f"Robustness_Score_{cname}",
+                   f"{cname}_diff_imputed", f"{cname}_p.val_imputed",
+                   f"{cname}_p.adj_imputed", f"{cname}_p.val_imputed_limma",
+                   f"{cname}_p.adj_imputed_limma", f"Pi_Score_imputed_{cname}",
+                   f"Robustness_Score_imputed_{cname}"]
         for col in ordered:
             if col in df_comp_src.columns:
                 cols_keep.append(col)
@@ -4110,12 +4438,19 @@ def main():
         print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "
               f"({len(_perseverance_annot)} proteines annotees)")
     elif _GO_AVAILABLE and _go_target:
+        _bg_mode = params.get("enrichment_background", "quantified")
         go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
                     "backend": _go_backend,
                     "species_taxid": params.get("go_species_taxid"),
                     "caller_identity": params.get("string_caller_identity"),
-                    "string_background": params.get("string_background", "genome"),
+                    "background_mode": _bg_mode,
+                    "string_background": params.get("string_background") or _bg_mode,
                     "string_categories": params.get("string_categories")}
+        if (_go_backend == "string" and params.get("string_background")
+                and params["string_background"] != _bg_mode):
+            print(f"[GO] STRING background = '{params['string_background']}' "
+                  f"(string_background set in the configuration; remove the key to "
+                  f"follow enrichment_background: {_bg_mode}).")
     else:
         go_params = None
         if _go_backend == "string" and not params.get("go_species_taxid"):
@@ -4383,6 +4718,346 @@ def run_qc_only(tsv: pd.DataFrame, mat_log2: pd.DataFrame, meta: pd.DataFrame,
     return out_path
 
 
+def _run_basename(c: str) -> str:
+    return re.split(r"[\\/]", str(c))[-1]
+
+
+def _injection_key(c: str) -> str:
+    """Nom de run sans le label d'échantillon (ex. '260622-_Slot1-19_1_5580.d') :
+    identifie l'injection même quand le label a été corrigé dans un seul des deux
+    fichiers DIA-NN."""
+    b = _run_basename(c)
+    m = re.search(r"(Sple-[^_]+)_", b)
+    return b.replace(m.group(1), "", 1) if m else ""
+
+
+def _precursor_columns(pr_cols: list, labels: list, pg_path=None) -> "tuple[dict, list]":
+    """Colonne du pr_matrix pour chaque label analysé. Retourne (mapping, notes).
+
+    1. Par le pg_matrix (même recherche DIA-NN) : nom de run identique, sinon même
+       injection (nom de run sans le label) quand le label a été corrigé dans le
+       pg_matrix seulement (ex. doublon Sple-21 renommé Sple-33).
+    2. Sinon par label ('Sple-xxx' extrait du nom de run, ou nom exact, ou nom se
+       terminant par '.<label>' / '-<label>'), comme pour le pg_matrix.
+    Un label porté par plusieurs runs du pr_matrix n'est jamais choisi au hasard :
+    il reste non apparié (repli, avec avertissement)."""
+    notes = []
+    by_label = {}
+    for c in pr_cols:
+        m = re.search(r"(Sple-[^_]+)_", str(c))
+        by_label.setdefault(m.group(1) if m else str(c), []).append(c)
+    by_name = {_run_basename(c): c for c in pr_cols}
+    by_inj = {}
+    for c in pr_cols:
+        k = _injection_key(c)
+        if k:
+            by_inj.setdefault(k, []).append(c)
+    pg_of = {}
+    if pg_path and os.path.exists(str(pg_path)):
+        try:
+            raw, clean = _extract_labels_from_tsv(str(pg_path))
+            for r, cl in zip(raw, clean):
+                pg_of.setdefault(cl, []).append(r)
+        except Exception:
+            pg_of = {}
+    out = {}
+    for lbl in map(str, labels):
+        cand_pg = pg_of.get(lbl) or [r for cl, rs in pg_of.items()
+                                     if cl.endswith(f".{lbl}") or cl.endswith(f"-{lbl}")
+                                     for r in rs]
+        if len(cand_pg) == 1:
+            r = cand_pg[0]
+            if _run_basename(r) in by_name:
+                out[lbl] = by_name[_run_basename(r)]
+                continue
+            inj = by_inj.get(_injection_key(r), [])
+            if len(inj) == 1:
+                out[lbl] = inj[0]
+                notes.append(f"{_run_basename(inj[0])} -> {lbl}")
+                continue
+        cand = by_label.get(lbl)
+        if cand is None:
+            keys = [k for k in by_label if k.endswith(f".{lbl}") or k.endswith(f"-{lbl}")]
+            cand = by_label[min(keys, key=len)] if keys else []
+        if len(cand) == 1:
+            out[lbl] = cand[0]
+        elif len(cand) > 1:
+            notes.append(f"AMBIGUOUS {lbl}: {len(cand)} runs in the pr_matrix")
+    return out, notes
+
+
+def _load_precursor_matrix(pr_path, labels, pg_path=None) -> "dict | None":
+    """Matrice log2 des précurseurs (report.pr_matrix.tsv de DIA-NN), colonnes dans
+    l'ordre des échantillons analysés (labels du design), et Protein.Group de chaque
+    précurseur. None si le fichier est absent, illisible ou incomplet.
+    Appariement des runs : _precursor_columns (par le pg_matrix si pg_path est
+    donné, sinon par label)."""
+    if not pr_path or not os.path.exists(str(pr_path)):
+        return None
+    try:
+        pr = pd.read_csv(pr_path, sep="\t", low_memory=False)
+    except Exception as e:
+        print(f"  [WARN] pr_matrix unreadable ({type(e).__name__}).")
+        return None
+    if "Protein.Group" not in pr.columns:
+        return None
+    num = [c for c in pr.columns if pd.api.types.is_numeric_dtype(pr[c])]
+    found, notes = _precursor_columns(num, list(labels), pg_path)
+    for n_ in notes:
+        if n_.startswith("AMBIGUOUS"):
+            print(f"  [WARN] pr_matrix: {n_[10:]} — sample not matched (fix the run "
+                  f"names so that each sample has one injection).")
+    renamed = [n_ for n_ in notes if not n_.startswith("AMBIGUOUS")]
+    if renamed:
+        print(f"  [INFO] pr_matrix: {len(renamed)} run(s) matched to the pg_matrix by "
+              f"injection (label differs between the two files): {'; '.join(renamed[:4])}")
+    missing = [l for l in map(str, labels) if l not in found]
+    if missing:
+        print(f"  [WARN] {len(missing)} sample(s) not found in the pr_matrix "
+              f"({missing[:3]}...).")
+        return None
+    Y = pr[[found[str(l)] for l in labels]].to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Y = np.log2(np.where(Y > 0, Y, np.nan))
+    pid = pr["Protein.Group"].astype(str)
+    # Contaminants cRAP retirés comme dans load_data
+    keep = ~pid.str.startswith("cRAP").to_numpy()
+    if "Protein.Names" in pr.columns:
+        keep &= ~pr["Protein.Names"].astype(str).str.startswith("cRAP").to_numpy()
+    return {"Y": Y[keep], "protein_ids": pid.to_numpy()[keep], "renamed": renamed}
+
+
+def run_dpc_primary_step(mat_log2: pd.DataFrame, mat_filt: pd.DataFrame,
+                         df_results: pd.DataFrame, model_info: dict,
+                         params: dict, pr_path: "str | None") -> "dict | None":
+    """primary_statistic: dpc — statistique principale SANS imputation (méthode
+    limpa : DPC au niveau précurseur -> quantification -> limma pondéré), sur le
+    MÊME design et les MÊMES contrastes que le modèle imputé.
+
+    Retourne le résultat (dpc_sensitivity.dpc_primary_analysis + robustesse
+    leave-one-sample-out), ou None : la statistique principale reste alors
+    l'analyse imputée (pr_matrix absent ou inutilisable, module absent, échec).
+    Ne lève jamais."""
+    if str(params.get("primary_statistic", "dpc")).lower() != "dpc":
+        return None
+    print("\n[STEP] Primary statistic: imputation-free DPC analysis (limpa method)...")
+    why = None
+    if not _DPC_AVAILABLE:
+        why = "dpc_sensitivity.py not found next to deimos.py"
+    elif not model_info:
+        why = "model not available"
+    elif "Protein.Group" not in df_results.columns:
+        why = "no Protein.Group column"
+    precursors = None
+    if why is None:
+        precursors = _load_precursor_matrix(pr_path or params.get("pr_path"),
+                                            list(mat_filt.columns),
+                                            pg_path=params.get("tsv_path"))
+        if precursors is None:
+            why = f"no usable pr_matrix ({pr_path or params.get('pr_path')})"
+    if why is None:
+        try:
+            from dpc_sensitivity import dpc_primary_analysis, dpc_loo_robustness
+            res = dpc_primary_analysis(
+                mat_log2.values, mat_filt.values,
+                df_results["Protein.Group"].astype(str).to_numpy(),
+                model_info["design_mat"], model_info["contrast_mat"],
+                fdr_global=bool(params.get("fdr_global")), precursors=precursors)
+            if res["level"] != "precursor":
+                why = "pr_matrix proteins do not match the pg_matrix"
+            else:
+                res["robustness"] = None
+                if int(params.get("n_iter_robustness", 0) or 0) > 0:
+                    print("  [...] DPC robustness score (leave-one-sample-out)...")
+                    res["robustness"] = dpc_loo_robustness(
+                        res, model_info["n_groups"], params,
+                        fdr_global=bool(params.get("fdr_global")))
+                n_sig = [int(((res["p_adj"] if params.get("volcano_use_padj")
+                               else res["p_value"])[:, k] < params["volcano_p_thresh"]).sum())
+                         for k in range(res["p_value"].shape[1])]
+                print(f"  [OK] Primary statistic = DPC + weighted limma "
+                      f"({res['dpc_precursor']['n_proteins_quantified']} proteins from "
+                      f"precursors); imputed analysis kept in _imputed columns. "
+                      f"p-threshold passed per contrast: {n_sig[:6]}"
+                      f"{'...' if len(n_sig) > 6 else ''}")
+                return res
+        except Exception as e:
+            why = f"{type(e).__name__}: {e}"
+    print(f"  [WARN] DPC primary statistic not available ({why}) — the primary statistic "
+          f"stays the imputed analysis (imputation + limma/DEqMS).")
+    params["_dpc_primary_fallback"] = why
+    return None
+
+
+def condition_means(expr: np.ndarray, conditions) -> dict:
+    """Moyenne par condition, clés au format des contrastes (cf. make_all_contrasts)."""
+    conditions = np.asarray(conditions)
+    out = {}
+    for cond in np.unique(conditions):
+        idx = np.where(conditions == cond)[0]
+        cond_clean = re.sub(r"[^A-Za-z0-9_]", ".", cond)
+        cond_clean = "X" + cond_clean if cond_clean[0].isdigit() else cond_clean
+        out[cond_clean.replace(".", "_")] = np.nanmean(expr[:, idx], axis=1)
+    return out
+
+
+def apply_dpc_primary(df_results: pd.DataFrame, primary: dict,
+                      contrast_names: list) -> pd.DataFrame:
+    """Met la statistique DPC dans les colonnes principales lues par tout l'aval
+    (volcanos, UpSet, GO, GSEA, dashboard, Pathfinder) et CONSERVE l'analyse
+    imputée sous des noms suffixés : rien n'est supprimé.
+      <C>_diff / _p.val / _p.adj, Pi_Score_<C>, Robustness_Score_<C>  -> DPC
+      <C>_diff_imputed / _p.val_imputed / _p.adj_imputed,
+      <C>_p.val_imputed_limma / _p.adj_imputed_limma (si DEqMS),
+      Pi_Score_imputed_<C>, Robustness_Score_imputed_<C>                -> imputé"""
+    df = df_results.copy()
+    ren = {}
+    for c in contrast_names:
+        for suf in ("_diff", "_p.val", "_p.adj"):
+            ren[f"{c}{suf}"] = f"{c}{suf}_imputed"
+        for suf in ("_p.val_limma", "_p.adj_limma"):
+            ren[f"{c}{suf}"] = f"{c}{suf.replace('_limma', '_imputed_limma')}"
+        ren[f"Pi_Score_{c}"] = f"Pi_Score_imputed_{c}"
+        ren[f"Robustness_Score_{c}"] = f"Robustness_Score_imputed_{c}"
+    df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
+    rob = primary.get("robustness")
+    new = {"dpc_source": primary["source"], "n_precursors": primary["n_precursors"]}
+    for k, c in enumerate(contrast_names):
+        lfc, pv = primary["logFC"][:, k], primary["p_value"][:, k]
+        new[f"{c}_diff"] = lfc
+        new[f"{c}_p.val"] = pv
+        new[f"{c}_p.adj"] = primary["p_adj"][:, k]
+        new[f"Pi_Score_{c}"] = np.abs(lfc) * (-np.log10(np.maximum(pv, 1e-10)))
+        if rob is not None:
+            new[f"Robustness_Score_{c}"] = rob["score"][:, k]
+    return pd.concat([df.reset_index(drop=True), pd.DataFrame(new)], axis=1)
+
+
+def run_sensitivity_step(mat_log2: pd.DataFrame, mat_filt: pd.DataFrame,
+                         df_results: pd.DataFrame, model_info: dict,
+                         params: dict, out_dir: str, primary: "dict | None" = None,
+                         pr_path: "str | None" = None) -> "dict | None":
+    """Analyses de sensibilité aux valeurs manquantes (dpc_sensitivity.py) :
+    1. analyse différentielle sans imputation (DPC), comparée à l'analyse imputée ;
+    2. détection différentielle (protéines on/off).
+    df_results doit porter l'analyse IMPUTÉE dans ses colonnes principales (appel
+    avant apply_dpc_primary). primary : analyse DPC déjà faite comme statistique
+    principale, réutilisée sans recalcul ; les onglets comparent alors la
+    statistique principale (DPC) à l'analyse imputée. Ne lève jamais : retourne
+    None si désactivées, sans objet ou en échec."""
+    do_dpc = bool(params.get("dpc_sensitivity", True))
+    do_det = bool(params.get("differential_detection", True))
+    if not (do_dpc or do_det):
+        return None
+    print("\n[STEP] Sensitivity to missing values (detection probability curve)...")
+    if not _DPC_AVAILABLE:
+        print("  [SKIP] dpc_sensitivity.py not found next to deimos.py.")
+        return None
+    if not model_info or (primary is None and not mat_filt.isna().values.any()):
+        print("  [SKIP] No missing value after filtering: nothing to assess.")
+        return None
+    precursors = None
+    level = str(params.get("dpc_level", "auto")).lower()
+    if do_dpc and primary is None and level in ("auto", "precursor"):
+        precursors = _load_precursor_matrix(pr_path or params.get("pr_path"),
+                                            list(mat_filt.columns),
+                                            pg_path=params.get("tsv_path"))
+        if precursors is None and level == "precursor":
+            print("  [INFO] dpc_level: precursor requested but no usable pr_matrix — "
+                  "protein level used.")
+    try:
+        res = run_missingness_sensitivity(
+            mat_log2.values, mat_filt.values, df_results,
+            model_info["design_mat"], model_info["contrast_mat"],
+            model_info["contrast_names"], model_info["n_groups"], params,
+            do_dpc=do_dpc, do_detection=do_det, precursors=precursors,
+            primary=primary)
+    except Exception as e:
+        print(f"  [WARN] Sensitivity analyses skipped ({type(e).__name__}: {e}) "
+              f"— main results not affected.")
+        return None
+    try:
+        from dpc_sensitivity import plot_dpc
+        res["plot"] = plot_dpc(mat_log2.values, res["dpc"]["beta0"], res["dpc"]["beta1"],
+                               os.path.join(out_dir, "dpc_curve.png"))
+    except Exception:
+        res["plot"] = None
+    d = res["dpc"]
+    res["methods"] = {
+        "beta0": d["beta0"], "beta1": d["beta1"], "n_rows": d["n_rows"],
+        "lod50": -d["beta0"] / d["beta1"], "dpc": "dpc_sheet" in res,
+        "detection": "detection_sheet" in res,
+        "n_df_corrected": (res.get("dpc_de") or {}).get("n_df_corrected"),
+        "pkey": res["pkey"], "level": res.get("dpc_level", "protein"),
+        "precursor": res.get("dpc_precursor"), "primary_dpc": primary is not None,
+        "dropout": res.get("dropout_prior")}
+    return res
+
+
+def _sensitivity_manifest_rows(sensitivity, sheets) -> list:
+    """Lignes 'sensitivity' du manifeste (schéma 1.1, ajout)."""
+    if not sensitivity or not sheets:
+        return []
+    m = sensitivity["methods"]
+    rows = [("sensitivity", "summary_sheet", "Sensitivity_Summary"),
+            ("sensitivity", "dpc_beta0", f"{m['beta0']:.4f}"),
+            ("sensitivity", "dpc_beta1", f"{m['beta1']:.4f}")]
+    if "Sensitivity_DPC" in sheets:
+        rows.append(("sensitivity", "dpc_sheet", "Sensitivity_DPC"))
+    if "Differential_Detection" in sheets:
+        rows.append(("sensitivity", "detection_sheet", "Differential_Detection"))
+    return rows
+
+
+def export_sensitivity_sheets(wb, sensitivity: dict, write_df_fn, ins_img_fn) -> list:
+    """Onglets Sensitivity_Summary, Sensitivity_DPC, Differential_Detection
+    (ajoutés après l'existant). Noms choisis pour n'être captés ni par les
+    filtres GO/WGCNA/UMAP du dashboard, ni comme matrice d'échantillons par
+    Pathfinder. Retourne la liste des onglets écrits."""
+    written = []
+    m = sensitivity["methods"]
+    ws = wb.create_sheet("Sensitivity_Summary")
+    head = pd.DataFrame({
+        "item": ["Detection probability curve (DPC), protein level", "50 % detection at",
+                 "Rows used to fit the DPC",
+                 "Main analysis" if m.get("primary_dpc") else "Main analysis (unchanged)",
+                 "Imputation-free analysis", "Differential detection", "Significance rule"],
+        "value": [f"logit p = {m['beta0']:.3f} + {m['beta1']:.3f} x log2 intensity",
+                  f"log2 intensity {m['lod50']:.2f}", str(m["n_rows"]),
+                  ("imputation-free DPC (sheet Differential_Expression); imputed analysis "
+                   "in the *_imputed columns, compared below")
+                  if m.get("primary_dpc") else
+                  "imputation + limma/DEqMS (sheet Differential_Expression)",
+                  (f"sheet Sensitivity_DPC ({m['level']} level"
+                   + (f"; precursor DPC logit p = {m['precursor']['beta0']:.3f} + "
+                      f"{m['precursor']['beta1']:.3f} y, {m['precursor']['n_precursors']} "
+                      f"precursors" if m.get("precursor") else "") + ")")
+                  if m["dpc"] else "not run",
+                  "sheet Differential_Detection" if m["detection"] else "not run",
+                  "volcano thresholds applied to both analyses (detection: p.adj < 0.05)"]})
+    write_df_fn(ws, head)
+    ws.append([])
+    start = ws.max_row + 1
+    summ = sensitivity["summary"]
+    ws.append(list(summ.columns))
+    for row in summ.itertuples(index=False):
+        ws.append([None if (isinstance(v, float) and np.isnan(v)) else v for v in row])
+    for cell in ws[start]:
+        cell.font = Font(bold=True)
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 58
+    if sensitivity.get("plot"):
+        ins_img_fn(ws, sensitivity["plot"], f"A{ws.max_row + 3}", max_w_px=640, max_h_px=440)
+    written.append("Sensitivity_Summary")
+    if "dpc_sheet" in sensitivity:
+        write_df_fn(wb.create_sheet("Sensitivity_DPC"), sensitivity["dpc_sheet"])
+        written.append("Sensitivity_DPC")
+    if "detection_sheet" in sensitivity:
+        write_df_fn(wb.create_sheet("Differential_Detection"), sensitivity["detection_sheet"])
+        written.append("Differential_Detection")
+    return written
+
+
 def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                        pr_path: str, params: dict, go_params: "dict | None",
                        make_wgcna: bool, make_dash: bool, use_deqms: bool):
@@ -4414,6 +5089,8 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     # --- Mode QC seul : données brutes + M&M + figures QC, rien d'autre ---
     if params.get("qc_only"):
         run_qc_only(tsv, mat_log2, meta, design_filt, params, qc_files, out_dir)
+        if params.get("make_pathfinder"):
+            print("  [SKIP] Pathfinder: QC-only mode, no p-values to synthesise.")
         return
 
     # --- 4. Filtration + Imputation ---
@@ -4472,17 +5149,64 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     if use_deqms:
         print("\n[STEP] Building peptide count (DEqMS)...")
         pep_count = build_peptide_count_table(
-            pr_path, meta_filt["name"].tolist(), count_level="peptide")
+            pr_path, meta_filt["name"].tolist(), count_level="peptide",
+            sample_labels=design_filt["label"].astype(str).tolist(),
+            pg_path=params.get("tsv_path"))
         if pep_count is None:
             print("  -> DEqMS disabled (counting unavailable).")
 
     # --- 5. Analyse différentielle + Robustness ---
     print("\n[STEP] Differential analysis + robustness score...")
     N_ITER = params.get("n_iter_robustness", 100)
+    model_info = {}
     df_results, contrast_names, scatter_files = run_differential_analysis(
         mat_imp, mat_filt, meta_filt, design_filt, params, out_dir,
-        n_iter=N_ITER, pep_count=pep_count
+        n_iter=N_ITER, pep_count=pep_count, model_out=model_info
     )
+
+    if model_info.get("deqms"):
+        params = {**params, "_deqms": model_info["deqms"]}
+
+    # --- 5bis. Statistique principale sans imputation (primary_statistic: dpc) ---
+    # Méthode limpa au niveau précurseur, même design et mêmes contrastes. En cas
+    # d'indisponibilité (pas de pr_matrix exploitable...), la statistique
+    # principale reste l'analyse imputée ci-dessus.
+    dpc_primary = run_dpc_primary_step(mat_log2, mat_filt, df_results,
+                                       model_info, params, pr_path)
+
+    # --- 5ter. Sensibilité aux valeurs manquantes (AJOUT, non bloquant) ---
+    # Lit la matrice NON imputée ; compare la DPC à l'analyse imputée (avant le
+    # basculement des colonnes) et ajoute la détection différentielle (on/off).
+    sensitivity = run_sensitivity_step(mat_log2, mat_filt, df_results,
+                                       model_info, params, out_dir,
+                                       primary=dpc_primary, pr_path=pr_path)
+    if sensitivity is not None:
+        params = {**params, "_sensitivity_methods": sensitivity["methods"]}
+
+    # Basculement : la DPC occupe les colonnes principales lues par tout l'aval
+    # (volcanos, UpSet, GO, GSEA, dashboard, Pathfinder) ; l'analyse imputée est
+    # conservée dans les colonnes *_imputed.
+    if dpc_primary is not None:
+        df_results = apply_dpc_primary(df_results, dpc_primary, contrast_names)
+        scatter_files = plot_contrast_scatters(
+            df_results, contrast_names,
+            condition_means(dpc_primary["E"], design_filt["condition"].values),
+            params, out_dir)
+        _rob = dpc_primary.get("robustness")
+        params = {**params, "_primary": {
+            "statistic": "dpc", "level": dpc_primary["level"],
+            "dpc": dpc_primary["dpc"], "dpc_precursor": dpc_primary["dpc_precursor"],
+            "n_df_corrected": dpc_primary["n_df_corrected"],
+            "n_protein_level": int((dpc_primary["source"] == "protein").sum()),
+            "robustness": _rob is not None,
+            "loo_skipped": (_rob or {}).get("n_skipped", 0),
+            "imputed_deqms": any(str(c).endswith("_p.adj_imputed_limma")
+                                 for c in df_results.columns)}}
+    else:
+        params = {**params, "_primary": {
+            "statistic": "imputation",
+            "requested": str(params.get("primary_statistic", "dpc")).lower(),
+            "fallback": params.get("_dpc_primary_fallback")}}
 
     # --- 6. Volcanos ---
     print("\n[STEP] Generating volcano plots...")
@@ -4573,6 +5297,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     if wgcna_results is not None:
         export_wgcna_sheets(wb, wgcna_results, _write_df, _ins_img)
 
+    # --- 13bis0. Onglets de sensibilité aux valeurs manquantes (ajoutés) ---
+    sensitivity_sheets = []
+    if sensitivity is not None:
+        try:
+            sensitivity_sheets = export_sensitivity_sheets(wb, sensitivity, _write_df, _ins_img)
+            print(f"  [OK] Sensitivity sheets added: {', '.join(sensitivity_sheets)}")
+        except Exception as e:
+            print(f"  [WARN] Sensitivity sheets not written ({type(e).__name__}: {e})")
+
     # --- 13bis. Perseverance (orthologues, optionnel) — APRÈS les stats, AVANT le GO ---
     # Ne mute PAS le go_params partagé entre sous-espèces (boucle multi-especes) :
     # on travaille sur une copie locale, propre à ce subset.
@@ -4596,19 +5329,26 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         print("  [WARN] Orthologie STRING indisponible — GO STRING ignoré pour ce run.")
         local_go_params = None
 
+    # GO sur l'espèce de RÉFÉRENCE (annotation Perseverance ou orthologues
+    # Perseverance) : l'organisme mesuré n'est pas celui du GO.
+    _persev_go = bool((go_params or {}).get("custom_annotation") is not None
+                      or (persev_override is not None and not _string_orth))
+
     # --- 14. Enrichissement GO/gProfiler (optionnel, non bloquant) ---
+    go_sheet_map = {}
     if local_go_params is not None:
         print("\n[STEP] GO enrichment...")
         go_results = run_go_enrichment(
             df_results, contrast_names, params, local_go_params, out_dir)
         if go_results:
-            export_go_sheets(wb, go_results, _write_df, _ins_img)
+            go_sheet_map = export_go_sheets(wb, go_results, _write_df, _ins_img) or {}
             print(f"  [OK] {len(go_results)} GO sheet(s) added.")
 
         # GO par cluster de la heatmap ANOVA (réutilise cluster_mapping)
         if cluster_mapping:
             go_cluster_results = run_go_enrichment_clusters(
-                cluster_mapping, params, local_go_params, out_dir)
+                cluster_mapping, params, local_go_params, out_dir,
+                universe=df_results["name"].astype(str).tolist())
             if go_cluster_results:
                 export_go_cluster_sheets(
                     wb, go_cluster_results, _write_df, _ins_img)
@@ -4628,6 +5368,20 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                 print(f"  [WARN] GSEA step skipped ({type(e).__name__}) — "
                       f"pipeline not affected.")
 
+    # --- 13ter. Manifeste (contrat lu par Pathfinder), dernier onglet, caché ---
+    try:
+        write_manifest(
+            wb, params, contrast_names, go_sheet_map, design_filt,
+            perseverance=_persev_go,
+            primary_statistic=(
+                "DPC (limpa method, precursor level) + weighted limma eBayes"
+                if params["_primary"]["statistic"] == "dpc" else
+                "DEqMS" if any(str(c).endswith("_p.adj_limma") for c in df_results.columns)
+                else "limma eBayes"),
+            extra_rows=_sensitivity_manifest_rows(sensitivity, sensitivity_sheets))
+    except Exception as e:      # jamais bloquant pour le livrable
+        print(f"  [WARN] _manifest sheet not written ({type(e).__name__}: {e})")
+
     wb.save(output_name)
 
     print(f"\n[DONE] Full pipeline finished.")
@@ -4644,6 +5398,17 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
             print(f"  [OK] Dashboard generated: {result}")
         else:
             print("  [WARN] Dashboard not generated (see messages above).")
+
+    # --- 15bis. Pathfinder (optionnel, processus séparé, non bloquant) ---
+    # Relit le classeur qui vient d'être enregistré : le rapport dérive exactement
+    # du fichier livré. Le nettoyage (16) ne touche pas pathfinder/.
+    if params.get("make_pathfinder"):
+        print("\n[STEP] Pathfinder — multi-contrast synthesis...")
+        pf_html = run_pathfinder_step(output_name, design_filt, params, out_dir,
+                                      go_ran=bool(go_sheet_map),
+                                      perseverance=_persev_go)
+        if pf_html:
+            print(f"  [OK] Pathfinder report: {pf_html}")
 
     # --- 16. Nettoyage des figures temporaires ---
     # Toutes les figures sont déjà intégrées dans l'Excel (et le dashboard les

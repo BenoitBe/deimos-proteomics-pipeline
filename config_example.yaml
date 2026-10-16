@@ -27,6 +27,11 @@ volcano_p_thresh:    0.05
 # e.g. 1.5 → log2FC ≥ 0.585 | 2.0 → log2FC ≥ 1.0
 volcano_ratio_min:   1.5
 
+# Volcano Y axis: pvalue = -log10(raw p-value) (default, as limma's volcanoplot;
+# with volcano_use_padj: true the dashed line sits at the raw p-value equivalent
+# to the p.adj threshold of each contrast) | padj = -log10 of the threshold statistic
+volcano_y_axis:      pvalue
+
 
 # ── Statistical thresholds — ANOVA & Heatmap ─────────────────────────────────
 anova_use_padj:      false
@@ -41,6 +46,9 @@ n_heatmap_clusters:  3            # Number of k-means clusters (≥ 2)
 # Repeated stochastic imputation with the same method as the reference run.
 # 0 = disabled (significant time saving on large datasets)
 # Recommended: 100 for production analysis, 20 for a quick test
+# With primary_statistic: dpc, Robustness_Score_* is the leave-one-sample-out
+# score of the DPC statistic (0-100, independent of this number) and the
+# re-imputation score goes to Robustness_Score_imputed_*; 0 disables both.
 n_iter_robustness:   100
 
 
@@ -75,11 +83,32 @@ control_synonyms:    null         # null = default list; or a custom list
 #            otherwise. The choice and its reason are written to Methods.
 # 'qrilc'  : pure MNAR — left-censored normal, mean/SD estimated by quantile
 #            regression (Lazar et al. 2016)
-# 'mixed'  : QRILC if fully absent in a condition (MNAR), kNN if partial (MAR)
+# 'mixed'  : a protein absent from all replicates of at least one condition is
+#            imputed by QRILC for ALL its missing values (MNAR); proteins with
+#            partial missingness only are imputed by kNN (MAR)
 #            ⚠️ kNN can artificially inflate statistical power if MAR > 50%
+# 'mixed_legacy' : rule before 10/2026 (QRILC per fully-absent condition, kNN for
+#            the partial missingness of the other conditions). Kept to reproduce
+#            earlier analyses only: it creates artificial differences (50-120 false
+#            positives per null comparison on real data).
 # Multi-run studies (e.g. one run per temperature in TPP): set the same
 # explicit method for every run instead of 'auto'.
+# With primary_statistic: dpc, the imputed matrix still feeds the secondary
+# imputed analysis (*_imputed columns), PCA, UMAP, correlation, ANOVA and WGCNA.
 impute_method:       auto
+
+# ── Primary differential statistic ────────────────────────────────────────────
+# 'dpc'        : imputation-free analysis, method of the limpa package (Li & Smyth):
+#                detection probability curve on the precursors (pr_path), protein
+#                quantification with standard errors, weighted limma. Calibrated
+#                FDR on null comparisons of real data, where imputation was not.
+#                Volcanos, UpSet, GO, GSEA, dashboard and Pathfinder use it; the
+#                imputed analysis is kept in *_imputed columns. Robustness score =
+#                leave-one-sample-out (0-100). Falls back to 'imputation' (with a
+#                warning, written to Methods) when no usable pr_matrix is found.
+# 'imputation' : imputation + limma/DEqMS as primary statistic (behaviour before
+#                10/2026).
+primary_statistic:   dpc
 
 # Seed of the imputation draw and of the robustness iterations.
 # Same input + same seed = same p-values. Recorded in Methods.
@@ -120,6 +149,16 @@ deqms_force:               false  # true = ignore the diagnostic and force DEqMS
 # Backend: 'gprofiler' (model organisms) | 'string' (bacteria, non-model species)
 go_backend:          gprofiler
 
+# Statistical universe of the over-representation tests (gProfiler, STRING,
+# ANOVA clusters):
+# 'quantified' (default): all proteins tested in the differential analysis.
+#               In proteomics only detectable (mostly abundant) proteins can be
+#               called; against the whole genome, abundant categories (ribosome,
+#               translation, glycolysis...) come out enriched for that reason
+#               alone. gProfiler: domain_scope='custom_annotated'.
+# 'genome'    : whole annotated genome (behaviour before 10/2026).
+enrichment_background: quantified
+
 # gProfiler organism code — null = GO enrichment disabled (gprofiler backend)
 # Examples: hsapiens, mmusculus, bnapus, athaliana, efa (E. faecalis), rnorvegicus
 go_organism:         null
@@ -130,8 +169,8 @@ go_organism:         null
 # Non-UniProt identifiers (in-house FASTA): give the taxid and put the search
 # FASTA in the data folder.
 go_species_taxid:    null         # "auto" or an NCBI taxid, e.g. 511145
-string_background:   genome       # genome | quantified (quantified proteins only;
-                                  # recommended when a small fraction of the proteome is quantified)
+string_background:   null         # null = follows enrichment_background (below);
+                                  # genome | quantified to force the STRING universe
 string_categories:   null         # null = GO:BP/MF/CC + KEGG + Reactome
                                   # e.g. [Process, Function, Component, KEGG, Keyword, Pfam]
 string_reference_taxid: null      # orthology mode: STRING organism to map to
@@ -167,6 +206,24 @@ make_wgcna:          false
 
 # Interactive HTML dashboard (requires build_dashboardv7.py)
 make_dashboard:      true
+
+# Sensitivity to missing values — sheets Sensitivity_Summary, Sensitivity_DPC,
+# Differential_Detection. With primary_statistic: dpc they compare the DPC calls
+# with the imputed ones; with primary_statistic: imputation they are added to the
+# imputed main analysis, which is unchanged. dpc_level applies to the sensitivity
+# analysis only (the DPC primary statistic always uses the precursors).
+dpc_sensitivity:         true    # imputation-free differential analysis (detection probability curve)
+differential_detection:  true    # on/off proteins: probability of the non-detections (DPC)
+dpc_level:               auto    # auto: from precursors when pr_path exists, else proteins; or precursor / protein
+
+# Pathfinder — multi-contrast synthesis at the end of the run (also: --pathfinder)
+# Runs in a separate process on the saved workbook: no question, no recomputation,
+# and a Pathfinder failure never stops Deimos. Outputs in <out_dir>/pathfinder/.
+make_pathfinder:         false   # true = run Pathfinder after the Excel and the dashboard
+pathfinder_path:         null    # Pathfinder clone; null = $PATHFINDER_HOME, then ../Pathfinder
+pathfinder_publications: false   # true = Publications axis (STRING PMID, needs network)
+pathfinder_options:      {}      # e.g. {pthr: 0.05, jaccard: 0.5, no_umap: true}
+pathfinder_timeout:      1800    # seconds
 
 
 # ── Input file paths ──────────────────────────────────────────────────────────

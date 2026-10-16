@@ -35,7 +35,13 @@ def lm_fit(expr_matrix: np.ndarray, design: np.ndarray):
     """
     n_proteins, n_samples = expr_matrix.shape
     n_coef = design.shape[1]
-    df_residual = n_samples - n_coef
+    # ddl résiduels = n - rang(X), comme lmFit (QR) : un design de rang
+    # incomplet ne doit pas gonfler les ddl.
+    rank = int(np.linalg.matrix_rank(design))
+    if rank < n_coef:
+        print(f"  [WARN] Design matrix not of full rank ({rank} < {n_coef} columns): "
+              "some coefficients are not estimable.")
+    df_residual = n_samples - rank
 
     # Pseudo-inverse de la design matrix (stable même si colonnes corrélées)
     XtX_inv = np.linalg.pinv(design.T @ design)
@@ -115,75 +121,45 @@ def ebayes(fit: dict, fdr_global: bool = False):
     -------
     dict enrichi : t_stat, p_value, p_adj (BH), logFC, s2_post, df_total
     """
-    sigma   = fit["sigma"]          # (n_proteins,)
-    su      = fit["stdev_unscaled"] # (n_proteins × n_contrasts)
-    df_res  = fit["df_residual"]
-    coef    = fit["coefficients"]   # (n_proteins × n_contrasts)
+    sigma   = np.asarray(fit["sigma"], float)   # (n_proteins,)
+    su      = fit["stdev_unscaled"]             # (n_proteins × n_contrasts)
+    df_res  = float(fit["df_residual"])
+    coef    = fit["coefficients"]               # (n_proteins × n_contrasts)
 
     n_proteins, n_contrasts = coef.shape
 
-    # --- Estimation des hyperparamètres d0, s0² (fitFDist exact de limma) ---
-    # Référence : Smyth (2004), limma::fitFDist.
-    # Transformation : e = log(s²) - digamma(df_res/2) + log(df_res/2)
-    #   E[e]   = log(s0²) - digamma(d0/2) + log(d0/2)
-    #   Var[e] = trigamma(df_res/2) + trigamma(d0/2)
-    # => trigamma(d0/2) = Var[e] - trigamma(df_res/2)
-    # => d0 = 2 * trigamma^{-1}(excess)
-    # => s0² = exp( E[e] + digamma(d0/2) - log(d0/2) )
+    # --- Hyperparamètres d0, s0² : limma::squeezeVar -> fitFDist (ddl égaux) ---
+    # Reproduction exacte de limma 3.58 (Smyth 2004) :
+    #   x = max(s², 1e-5 × médiane(s²))   (variances nulles décalées, pas exclues)
+    #   e = log(x) - digamma(df/2) + log(df/2)
+    #   evar = var(e) - trigamma(df/2)
+    #   evar > 0  : d0 = 2 trigamma^-1(evar), s0² = exp(mean(e) + digamma(d0/2) - log(d0/2))
+    #   evar <= 0 : d0 = Inf, s0² = mean(x)  (variance poolée, limma >= 2017)
     s2 = sigma ** 2
-    valid = s2 > 0
-    z = np.log(s2[valid])
+    ok = np.isfinite(s2) & (df_res > 1e-15)
+    d0, s0_sq = _fit_fdist(s2[ok], df_res)
 
-    e = z - digamma(df_res / 2.0) + np.log(df_res / 2.0)
-    emean = np.mean(e)
-    evar  = np.var(e, ddof=1) - polygamma(1, df_res / 2.0)
-
-    if evar > 0:
-        d0 = 2.0 * _inverse_trigamma(evar)
-        d0 = float(min(d0, 1e6))
-        s0_sq = np.exp(emean + digamma(d0 / 2.0) - np.log(d0 / 2.0))
-    else:
-        # Variances homogènes : df.prior = Inf (modération complète vers s0²)
-        d0 = np.inf
-        s0_sq = np.exp(emean)
-    s0_sq = max(float(s0_sq), 1e-12)
-
-    # --- Variance postérieure modérée ---
+    # --- Variance postérieure modérée (sur les s² d'origine) ---
     if np.isinf(d0):
         s2_post = np.full_like(s2, s0_sq)
-        df_total = float(df_res + 1e6)   # ddl quasi-infinis pour le test t
     else:
-        df_total = df_res + d0
-        s2_post = (df_res * s2 + d0 * s0_sq) / df_total  # shrinkage vers s0²
-    s2_post = np.maximum(s2_post, 1e-12)
+        s2_post = (df_res * s2 + d0 * s0_sq) / (df_res + d0)   # shrinkage vers s0²
+    s2_post[~np.isfinite(s2)] = np.nan
+    # ddl totaux plafonnés aux ddl poolés (eBayes : pmin(df.total, df.pooled))
+    df_pooled = df_res * int(ok.sum())
+    df_total = float(min(df_res + d0, df_pooled))
 
     # --- t-statistiques modérées et p-values ---
-    t_stat  = np.zeros((n_proteins, n_contrasts))
-    p_value = np.zeros((n_proteins, n_contrasts))
-    p_adj   = np.zeros((n_proteins, n_contrasts))
-
-    for j in range(n_contrasts):
-        se_j = su[:, j] * np.sqrt(s2_post)
-        se_j = np.maximum(se_j, 1e-10)
-        t_j = coef[:, j] / se_j
-        t_stat[:, j] = t_j
-
-        # p-value bilatérale (distribution t avec df_total)
-        p_j = 2 * stats.t.sf(np.abs(t_j), df=df_total)
-        p_value[:, j] = p_j
-
-        if not fdr_global:
-            # Correction BH par contraste (une famille de tests par comparaison)
-            p_adj[:, j] = _bh_correction(p_j)
-
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = coef / su / np.sqrt(s2_post)[:, None]
+    p_value = 2 * stats.t.sf(np.abs(t_stat), df=df_total)
     if fdr_global:
-        # Correction BH GLOBALE : toutes les p-values empilées en une seule
-        # famille de tests, puis re-dispatchées dans leur colonne d'origine.
-        flat = p_value.flatten()
-        valid = ~np.isnan(flat)
-        adj_flat = np.full_like(flat, np.nan)
-        adj_flat[valid] = _bh_correction(flat[valid])
-        p_adj = adj_flat.reshape(p_value.shape)
+        # Correction BH GLOBALE : toutes les p-values en une seule famille
+        p_adj = _bh_correction(p_value.ravel()).reshape(p_value.shape)
+    else:
+        # Correction BH par contraste (une famille de tests par comparaison)
+        p_adj = np.column_stack([_bh_correction(p_value[:, j])
+                                 for j in range(n_contrasts)])
 
     fit_eb = fit.copy()
     fit_eb.update({
@@ -204,124 +180,81 @@ def ebayes(fit: dict, fdr_global: bool = False):
 def spectra_count_ebayes(fit: dict, pep_count: np.ndarray,
                          loess_span: float = 0.75, fdr_global: bool = False):
     """
-    Réplique DEqMS::spectraCounteBayes.
+    Reproduction de DEqMS::spectraCounteBayes (Zhu et al. 2020, DEqMS 1.31,
+    fit.method = "loess") puis BH comme outputDEqMS.
 
-    Au lieu de modérer la variance vers une constante a priori (eBayes classique),
-    DEqMS modélise la variance résiduelle EN FONCTION du nombre de peptides
-    quantifiés par protéine. La régression se fait sur log2(count), suivant
-    l'IBMT de Sartor et al. (2006) adapté à la protéomique.
+    La variance a priori dépend du nombre de peptides quantifiés :
+      1. logVAR = log(s²) ; tendance loess(logVAR ~ log2(count), span = 0.75),
+         paramètres par défaut de R (degré 2, gaussien, surface interpolée) ;
+      2. eg = logVAR - digamma(df/2) + log(df/2), egpred idem sur la tendance ;
+         m = moyenne((eg - egpred)² - trigamma(df/2)) ;
+      3. d0 = première valeur de la grille 0.1, 0.2, ... qui minimise
+         |m - trigamma(d0/2)| (recherche séquentielle de DEqMS) ;
+      4. s0²(count) = exp(egpred + digamma(d0/2) - log(d0/2)) ;
+      5. variance postérieure (d0 s0² + df s²)/(d0 + df), t sur d0 + df ddl.
+
+    La loess est celle de R (même code Fortran, via scikit-misc) quand le paquet
+    est installé ; sinon une loess directe (approximation, voir _loess_direct).
 
     Parameters
     ----------
     fit       : dict retourné par lm_fit + contrasts_fit (avant ou après ebayes)
-    pep_count : np.ndarray (n_proteins,) — nombre MINIMUM de peptides quantifiés
-                par protéine across échantillons (depuis le pr_matrix)
-    loess_span: fraction pour le lissage loess de la relation variance~count
+    pep_count : np.ndarray (n_proteins,) — comptage peptidique par protéine
+                (déjà augmenté du pseudo-comptage de 1, comme dans la vignette
+                LFQ de DEqMS) ; NaN ou < 1 = protéine exclue
+    loess_span: span de la loess (0.75 dans DEqMS)
 
     Returns
     -------
-    dict enrichi : t_stat, p_value, p_adj, s2_post (DEqMS), df_prior, df_total
+    dict enrichi : t_stat, p_value, p_adj, s2_post, s2_prior, df_prior, df_total,
+                   pep_count, count_valid, loess_fit, loess_engine
     """
-    from scipy.interpolate import UnivariateSpline
-    from scipy.special import digamma, polygamma
-
-    sigma   = fit["sigma"]            # écart-type résiduel par protéine
-    su      = fit["stdev_unscaled"]   # (n_proteins × n_contrasts)
-    df_res  = fit["df_residual"]
-    coef    = fit["coefficients"]     # (n_proteins × n_contrasts)
+    sigma   = np.asarray(fit["sigma"], float)
+    su      = fit["stdev_unscaled"]           # (n_proteins × n_contrasts)
+    df_res  = float(fit["df_residual"])
+    coef    = fit["coefficients"]             # (n_proteins × n_contrasts)
     n_proteins, n_contrasts = coef.shape
 
     s2 = sigma ** 2
-
-    # --- Filtrer les protéines valides (variance > 0, count >= 1) ---
     pep_count = np.asarray(pep_count, dtype=float)
     valid = (s2 > 0) & np.isfinite(s2) & (pep_count >= 1) & np.isfinite(pep_count)
+    if valid.sum() < 10:
+        raise ValueError("too few proteins with a peptide count for DEqMS")
 
-    log_count = np.log2(pep_count)
-    log_var   = np.log(s2)
+    log_var = np.full(n_proteins, np.nan)
+    log_var[valid] = np.log(s2[valid])
+    x = np.full(n_proteins, np.nan)
+    x[valid] = np.log2(pep_count[valid])
 
-    # --- Régression de la variance log(s²) sur log2(count) ---
-    # DEqMS ajuste une loess ; on l'approxime par un spline lissé monotone-friendly.
-    x_fit = log_count[valid]
-    y_fit = log_var[valid]
-    order = np.argsort(x_fit)
-    x_sorted, y_sorted = x_fit[order], y_fit[order]
+    # --- 1. Tendance loess de log(s²) sur log2(comptage) ---
+    y_pred = np.full(n_proteins, np.nan)
+    y_pred[valid], engine = _loess_fit(x[valid], log_var[valid], span=loess_span)
+    if not np.all(np.isfinite(y_pred[valid])):
+        raise ValueError("loess fit failed (degenerate peptide counts)")
 
-    # Moyenne des y par valeur unique de x (stabilise le spline sur comptages discrets)
-    x_unique = np.unique(x_sorted)
-    y_means = np.array([y_sorted[x_sorted == xu].mean() for xu in x_unique])
+    # --- 2-3. Degrés de liberté a priori (grille séquentielle de DEqMS) ---
+    shift = -digamma(df_res / 2.0) + np.log(df_res / 2.0)
+    eg = log_var + shift
+    egpred = y_pred + shift
+    mean_myfct = float(np.nanmean((eg - egpred) ** 2 - polygamma(1, df_res / 2.0)))
+    df_prior = _deqms_prior_df(mean_myfct, int(valid.sum()))
 
-    if len(x_unique) >= 4:
-        # Spline lissé (équivalent loess)
-        n_smooth = max(3, int(len(x_unique) * (1 - loess_span)) + 3)
-        try:
-            spl = UnivariateSpline(x_unique, y_means, k=min(3, len(x_unique) - 1),
-                                   s=len(x_unique))
-            pred_log_var = spl(log_count)
-        except Exception:
-            # Fallback : régression linéaire log(var) ~ log2(count)
-            b = np.polyfit(x_fit, y_fit, 1)
-            pred_log_var = np.polyval(b, log_count)
-    else:
-        # Trop peu de niveaux de comptage → régression linéaire
-        b = np.polyfit(x_fit, y_fit, 1)
-        pred_log_var = np.polyval(b, log_count)
-
-    # Variance a priori prédite par le comptage
-    s2_prior = np.exp(pred_log_var)
-    s2_prior = np.where(np.isfinite(s2_prior) & (s2_prior > 0), s2_prior, np.nanmedian(s2[valid]))
-
-    # --- Estimation du df.prior (degrés de liberté a priori) ---
-    # DEqMS : basé sur la variance des résidus log(s²) - log(s²_prior) (méthode IBMT)
-    residuals = log_var[valid] - pred_log_var[valid]
-    var_resid = np.var(residuals, ddof=1)
-    trig_df = polygamma(1, df_res / 2.0)
-    excess = var_resid - trig_df
-    if excess <= 1e-4:
-        # Résidus quasi nuls : la variance est presque entièrement expliquée par le
-        # comptage. On borne df_prior à une valeur réaliste (DEqMS ne dépasse
-        # quasiment jamais quelques dizaines) pour éviter une sur-confiance.
-        df_prior = float(df_res * 4)   # plafond conservateur
-    else:
-        df_prior = 2.0 * _inverse_trigamma(excess)
-        df_prior = float(np.clip(df_prior, 0.1, df_res * 4))
-
-    # --- Variance postérieure DEqMS ---
+    # --- 4-5. Variance a priori par protéine et postérieure ---
+    s2_prior = np.exp(egpred + digamma(df_prior / 2.0) - np.log(df_prior / 2.0))
     df_total = df_res + df_prior
-    s2_post = (df_res * s2 + df_prior * s2_prior) / df_total
-    s2_post = np.maximum(s2_post, 1e-10)
+    s2_post = (df_prior * s2_prior + df_res * s2) / df_total
 
-    # --- t-statistiques et p-values modérées ---
-    t_stat  = np.zeros((n_proteins, n_contrasts))
-    p_value = np.full((n_proteins, n_contrasts), np.nan)
-    p_adj   = np.full((n_proteins, n_contrasts), np.nan)
-
-    for j in range(n_contrasts):
-        se_j = su[:, j] * np.sqrt(s2_post)
-        se_j = np.maximum(se_j, 1e-10)
-        t_j  = coef[:, j] / se_j
-        t_stat[:, j] = t_j
-        p_j = 2 * stats.t.sf(np.abs(t_j), df=df_total)
-        p_value[:, j] = p_j
-        if not fdr_global:
-            # BH par contraste sur les protéines valides uniquement
-            p_adj_col = np.full(n_proteins, np.nan)
-            p_adj_col[valid] = _bh_correction(p_j[valid])
-            p_adj[:, j] = p_adj_col
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = coef / (su * np.sqrt(s2_post)[:, None])
+    p_value = 2 * stats.t.sf(np.abs(t_stat), df=df_total)
+    t_stat[~valid, :] = np.nan
+    p_value[~valid, :] = np.nan
 
     if fdr_global:
-        # BH global sur toutes les p-values valides (protéines valides × contrastes)
-        flat = p_value.copy()
-        flat[~valid, :] = np.nan
-        flat = flat.flatten()
-        ok = ~np.isnan(flat)
-        adj_flat = np.full_like(flat, np.nan)
-        adj_flat[ok] = _bh_correction(flat[ok])
-        p_adj = adj_flat.reshape(p_value.shape)
-
-    # Invalider les protéines sans comptage exploitable
-    t_stat[~valid, :]  = np.nan
-    p_value[~valid, :] = np.nan
+        p_adj = _bh_correction(p_value.ravel()).reshape(p_value.shape)
+    else:
+        p_adj = np.column_stack([_bh_correction(p_value[:, j])
+                                 for j in range(n_contrasts)])
 
     fit_dq = fit.copy()
     fit_dq.update({
@@ -330,12 +263,88 @@ def spectra_count_ebayes(fit: dict, pep_count: np.ndarray,
         "p_adj":    p_adj,
         "s2_post":  s2_post,
         "s2_prior": s2_prior,
-        "df_prior": df_prior,
-        "df_total": df_total,
+        "df_prior": float(df_prior),
+        "df_total": float(df_total),
         "pep_count": pep_count,
         "count_valid": valid,
+        "loess_fit": y_pred,
+        "loess_engine": engine,
     })
     return fit_dq
+
+
+def _deqms_prior_df(mean_myfct: float, numgenes: int) -> float:
+    """Recherche de d0 de DEqMS : grille i/10 (i = 1..10 x numgenes), arrêt dès que
+    la fonction |mean_myfct - trigamma(d0/2)| remonte, minimum des valeurs vues
+    (premier en cas d'égalité), comme la boucle R d'origine."""
+    if not np.isfinite(mean_myfct):
+        raise ValueError("DEqMS prior df: non-finite variance residuals")
+    n_max = max(numgenes * 10, 3)
+    best_i, prev2, prev1 = None, None, None
+    vals = []
+    # parcours par blocs pour rester rapide sans changer la règle d'arrêt
+    start = 1
+    while start <= n_max:
+        stop = min(start + 4096, n_max + 1)
+        d0 = np.arange(start, stop) / 10.0
+        v = np.abs(mean_myfct - polygamma(1, d0 / 2.0))
+        for k, val in enumerate(v):
+            i = start + k
+            vals.append(val)
+            if i > 2 and vals[i - 3] < vals[i - 2]:      # priordf[i-2] < priordf[i-1]
+                arr = np.asarray(vals)
+                return float((int(np.argmin(arr)) + 1) / 10.0)
+        start = stop
+    arr = np.asarray(vals)
+    return float((int(np.argmin(arr)) + 1) / 10.0)
+
+
+def _loess_fit(x: np.ndarray, y: np.ndarray, span: float = 0.75):
+    """Valeurs ajustées de loess(y ~ x, span) avec les réglages par défaut de R.
+    Utilise scikit-misc (même implémentation Fortran que R : dloess de Cleveland,
+    Grosse et Shyu) ; à défaut, une loess directe (même modèle, sans
+    l'interpolation par arbre k-d : écarts faibles). Retourne (fitted, moteur)."""
+    try:
+        from skmisc.loess import loess as _skloess
+    except ImportError:
+        return _loess_direct(x, y, span=span), "direct loess (scikit-misc not installed)"
+    try:
+        m = _skloess(np.asarray(x, float), np.asarray(y, float), span=span, degree=2,
+                     family="gaussian", surface="interpolate", statistics="approximate")
+        m.fit()
+        return np.asarray(m.outputs.fitted_values, float), "R loess (scikit-misc)"
+    except Exception as e:
+        # Comptages très dégénérés (la plupart des protéines au même comptage) :
+        # R n'émet qu'un avertissement (pseudo-inverse), scikit-misc lève une
+        # erreur. On passe à la loess directe, finie dans tous les cas.
+        return (_loess_direct(x, y, span=span),
+                "direct loess (R loess degenerate on these peptide counts)")
+
+
+def _loess_direct(x: np.ndarray, y: np.ndarray, span: float = 0.75,
+                  degree: int = 2) -> np.ndarray:
+    """Loess locale quadratique pondérée tricube (surface « direct » de R) :
+    voisinage des q = floor(n x span) points les plus proches."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = len(x)
+    q = max(int(np.floor(n * span)), degree + 1)
+    out = np.empty(n)
+    ux, inv = np.unique(x, return_inverse=True)
+    fit_u = np.empty(len(ux))
+    for j, x0 in enumerate(ux):
+        d = np.abs(x - x0)
+        h = np.partition(d, q - 1)[q - 1]
+        if h <= 0:
+            h = max(np.min(d[d > 0]) if np.any(d > 0) else 1.0, 1e-12)
+        h = h * 1.0000001
+        w = np.clip(1 - (d / h) ** 3, 0, None) ** 3
+        A = np.vander(x - x0, degree + 1, increasing=True)
+        W = w[:, None]
+        beta, *_ = np.linalg.lstsq(A * np.sqrt(W), y * np.sqrt(w), rcond=None)
+        fit_u[j] = beta[0]
+    out[:] = fit_u[inv]
+    return out
 
 
 # ------------------------------------------------------------------------------
@@ -672,17 +681,49 @@ def _inverse_trigamma(x: float, max_iter: int = 50) -> float:
     return max(y, 1e-6)
 
 
-def _bh_correction(p_values: np.ndarray) -> np.ndarray:
-    """Correction Benjamini-Hochberg (FDR)."""
-    n = len(p_values)
-    order = np.argsort(p_values)
-    ranked = np.empty(n)
-    ranked[order] = np.arange(1, n + 1)
+def _fit_fdist(s2: np.ndarray, df1: float) -> "tuple[float, float]":
+    """limma::fitFDist (sans covariable, ddl égaux) : retourne (df2, scale) =
+    (d0, s0²). Variances nulles décalées à 1e-5 x médiane comme limma ; si plus
+    de la moitié sont nulles, la médiane est remplacée par 1 (limma avertit que
+    eBayes n'est alors pas fiable)."""
+    x = np.asarray(s2, float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n <= 1:
+        return np.nan, np.nan
+    x = np.maximum(x, 0.0)
+    m = float(np.median(x))
+    if m == 0:
+        print("  [WARN] More than half of residual variances are exactly zero: "
+              "eBayes unreliable")
+        m = 1.0
+    x = np.maximum(x, 1e-5 * m)
+    e = np.log(x) - digamma(df1 / 2.0) + np.log(df1 / 2.0)
+    emean = float(np.mean(e))
+    evar = float(np.sum((e - emean) ** 2) / (n - 1)) - float(polygamma(1, df1 / 2.0))
+    if evar > 0:
+        d0 = 2.0 * _inverse_trigamma(evar)
+        s0 = float(np.exp(emean + digamma(d0 / 2.0) - np.log(d0 / 2.0)))
+    else:
+        d0 = np.inf
+        s0 = float(np.mean(x))
+    return float(d0), s0
 
-    adj = p_values * n / ranked
-    # Monotonie décroissante depuis la fin
-    adj_sorted = adj[order]
-    for i in range(n - 2, -1, -1):
-        adj_sorted[i] = min(adj_sorted[i], adj_sorted[i + 1])
-    adj[order] = adj_sorted
-    return np.clip(adj, 0, 1)
+
+def _bh_correction(p_values: np.ndarray) -> np.ndarray:
+    """Correction Benjamini-Hochberg (FDR), identique à p.adjust(method = "BH") :
+    les NaN restent NaN et ne comptent pas dans le nombre de tests."""
+    p = np.asarray(p_values, dtype=float)
+    out = np.full(p.shape, np.nan)
+    ok = ~np.isnan(p)
+    n = int(ok.sum())
+    if n == 0:
+        return out
+    pv = p[ok]
+    order = np.argsort(pv)[::-1]                       # décroissant
+    i = np.arange(n, 0, -1)
+    adj = np.minimum.accumulate(n / i * pv[order])
+    res = np.empty(n)
+    res[order] = np.minimum(adj, 1.0)
+    out[ok] = res
+    return out

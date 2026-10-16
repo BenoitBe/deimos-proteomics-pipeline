@@ -664,6 +664,19 @@ function getVolcFilter(){
   const search=(document.getElementById('volcSearch').value||'').toLowerCase().trim();
   return {fc,ptype,thresh,rob,search};
 }
+function volcThreshY(c, ptype, thresh){
+  if(ptype!=='padj') return -Math.log10(Math.max(thresh,1e-300));
+  if(typeof VOLCANO_BH==='undefined'||!VOLCANO_BH.cuts||!VOLCANO_BH.cuts[c]){
+    // repli (ancien dashboard) : plus grande p brute parmi les points à p.adj <= seuil
+    let hi=null;(VOLCANO[c]||[]).forEach(p=>{const q=parseFloat(p.padj),pv=parseFloat(p.p);
+      if(!isNaN(q)&&q<=thresh&&!isNaN(pv)&&(hi===null||pv>hi))hi=pv;});
+    return hi===null?null:-Math.log10(Math.max(hi,1e-300));
+  }
+  const g=VOLCANO_BH.grid;let k=0,best=1e9;
+  for(let i=0;i<g.length;i++){const d=Math.abs(g[i]-thresh);if(d<best){best=d;k=i;}}
+  const cut=VOLCANO_BH.cuts[c][k];
+  return cut===null||cut===undefined?null:-Math.log10(cut);
+}
 function isSig(p, fc, ptype, thresh){
   const pv = ptype==='padj' ? parseFloat(p.padj) : parseFloat(p.p);
   return !isNaN(pv) && pv <= thresh && Math.abs(p.d) > fc;
@@ -700,8 +713,10 @@ function drawVolcano(){
   const xv=pts.map(p=>p.d),yv=pts.map(p=>p.lp);
   if(!xv.length)return;
   const xmin=Math.min(_minOf(xv),0)-0.4,xmax=Math.max(_maxOf(xv),0)+0.4;
-  const ythresh=-Math.log10(Math.max(thresh,1e-10));
-  const ymax=Math.max(_maxOf(yv),ythresh+1)+0.5;
+  // Ligne de seuil sur l'axe -log10(p brute) : en mode p.adj, p brute équivalente
+  // au seuil BH du contraste (VOLCANO_BH, toutes protéines) ; null = aucune protéine.
+  const ythresh=volcThreshY(activeContrast,ptype,thresh);
+  const ymax=Math.max(_maxOf(yv),(ythresh===null?0:ythresh)+1)+0.5;
   const sx=v=>(v-xmin)/(xmax-xmin)*pw+pad.l;
   const sy=v=>ph-(v/ymax)*ph+pad.t;
   ctx.fillStyle=THEME.bg2;ctx.fillRect(0,0,W,H);
@@ -709,7 +724,7 @@ function drawVolcano(){
   for(let i=0;i<=5;i++){const y=pad.t+i*ph/5;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();}
   ctx.strokeStyle=THEME.bd2;ctx.lineWidth=.8;ctx.setLineDash([4,4]);
   [fc,-fc].forEach(v=>{ctx.beginPath();ctx.moveTo(sx(v),pad.t);ctx.lineTo(sx(v),pad.t+ph);ctx.stroke();});
-  ctx.beginPath();ctx.moveTo(pad.l,sy(ythresh));ctx.lineTo(pad.l+pw,sy(ythresh));ctx.stroke();
+  if(ythresh!==null){ctx.beginPath();ctx.moveTo(pad.l,sy(ythresh));ctx.lineTo(pad.l+pw,sy(ythresh));ctx.stroke();}
   ctx.setLineDash([]);
   let su=0,sd=0;
   const outlineCol=document.documentElement.getAttribute('data-theme')==='light' ? 'rgba(31,35,40,.6)' : 'rgba(255,255,255,.6)';
@@ -737,7 +752,8 @@ function drawVolcano(){
   ctx.fillStyle='rgba(248,81,73,.9)';ctx.fillText('↓ '+sd,pad.l+pw-52,pad.t+32);
   // label ptype
   ctx.fillStyle=THEME.tx3;ctx.font='10px sans-serif';ctx.textAlign='right';
-  ctx.fillText('seuil '+ptype+' ≤ '+thresh,pad.l+pw-2,sy(ythresh)-4);
+  if(ythresh===null){ctx.fillText('aucune protéine à '+ptype+' ≤ '+thresh,pad.l+pw-2,pad.t+48);}
+  else{ctx.fillText('seuil '+ptype+' ≤ '+thresh+(ptype==='padj'?' (p ≈ '+Math.pow(10,-ythresh).toExponential(1)+')':''),pad.l+pw-2,sy(ythresh)-4);}
   ctx.fillStyle=THEME.tx3;ctx.font='11px sans-serif';ctx.textAlign='center';
   const parts=activeContrast.split('_vs_');
   const contrastLabel=invertActive
