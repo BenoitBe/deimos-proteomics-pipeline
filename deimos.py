@@ -10,6 +10,7 @@ import os
 import sys
 import warnings
 import re
+import time
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -1245,8 +1246,18 @@ def impute_knn(mat: pd.DataFrame, k: int = 10) -> pd.DataFrame:
     return pd.DataFrame(arr, index=mat.index, columns=mat.columns)
 
 
+def knn_component(mat: pd.DataFrame) -> "np.ndarray | None":
+    """Composante kNN (MAR) de l'imputation mixte, ou None si le kNN échoue.
+    Déterministe (ne dépend d'aucune graine) : calculable une seule fois pour
+    plusieurs tirages de la même matrice."""
+    try:
+        return impute_knn(mat).values
+    except Exception:                                                 # noqa: BLE001
+        return None
+
+
 def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None,
-                 legacy: bool = False) -> pd.DataFrame:
+                 legacy: bool = False, knn_full: "np.ndarray | None" = None) -> pd.DataFrame:
     """
     Imputation MIXTE (MNAR + MAR), approche Perseus/MSnbase :
       • Une protéine ABSENTE de TOUS les réplicats d'au moins une condition →
@@ -1263,6 +1274,11 @@ def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None,
 
     legacy=True : comportement d'origine (décision condition par condition),
     conservé pour reproduire d'anciennes analyses (impute_method: mixed_legacy).
+
+    knn_full : imputation kNN de `mat` déjà calculée (knn_component). Le kNN est
+    déterministe : seule la part QRILC change d'un tirage à l'autre, donc les
+    ré-imputations du score de robustesse le calculent une fois et le passent ici
+    (résultat identique, et le kNN représente ~99 % du temps d'une itération).
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -1272,9 +1288,9 @@ def impute_mixed(mat: pd.DataFrame, design: pd.DataFrame, rng=None,
 
     # 1) Pré-calcul des deux imputations complètes
     qrilc_full = impute_qrilc(mat, rng=rng).values
-    try:
-        knn_full = impute_knn(mat).values
-    except Exception:
+    if knn_full is None:
+        knn_full = knn_component(mat)
+    if knn_full is None:
         knn_full = qrilc_full  # repli si kNN échoue (peu de protéines)
 
     # 2) Pour chaque NaN, décider MNAR (QRILC) ou MAR (kNN)
@@ -1311,13 +1327,16 @@ AUTO_MIXED_MAR_PCT = 20.0
 
 
 def impute(mat: pd.DataFrame, method: str = "qrilc",
-           design: pd.DataFrame = None, rng=None) -> pd.DataFrame:
-    """Dispatcher d'imputation. method ∈ {'mixed', 'mixed_legacy', 'qrilc', 'minprob'}."""
+           design: pd.DataFrame = None, rng=None,
+           knn_full: "np.ndarray | None" = None) -> pd.DataFrame:
+    """Dispatcher d'imputation. method ∈ {'mixed', 'mixed_legacy', 'qrilc', 'minprob'}.
+    knn_full : composante kNN pré-calculée (knn_component), méthodes mixtes seulement."""
     if method in ("mixed", "mixed_legacy"):
         if design is None:
             print("  [WARN] Mixed imputation requires the design -> falling back to QRILC.")
             return impute_qrilc(mat, rng=rng)
-        return impute_mixed(mat, design, rng=rng, legacy=(method == "mixed_legacy"))
+        return impute_mixed(mat, design, rng=rng, legacy=(method == "mixed_legacy"),
+                            knn_full=knn_full)
     elif method == "minprob":
         return impute_minprob(mat, rng=rng)
     else:  # qrilc (défaut)
@@ -1540,7 +1559,7 @@ def diagnose_deqms_reliability(sigma2: np.ndarray, pep_count: np.ndarray,
         "plot": f,
     }
     print(f"  [STATS] DEqMS diagnostic: {pct_pseudocount:.0f}% pseudocomptées, "
-          f"R²={r2 if r2 is not None else 'N/A'} sur {n_informative} "
+          f"R²={f'{r2:.3f}' if r2 is not None else 'N/A'} sur {n_informative} "
           "protéines informatives")
     print(f"     -> {reco}")
     return metrics
@@ -1977,8 +1996,13 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         print(f"  [INFO] {_lbl} = DEqMS (variance ~ peptide count); "
               "limma kept in _limma columns.")
     else:
-        print(f"  [INFO] {_lbl} = limma eBayes (no peptide "
-              "count available for DEqMS).")
+        if deqms_diag is None:
+            _why = "no peptide count available for DEqMS"
+        elif not deqms_diag["reliable"] and not params.get("deqms_force", False):
+            _why = "DEqMS disabled by the diagnostic above"
+        else:
+            _why = "DEqMS fit failed"
+        print(f"  [INFO] {_lbl} = limma eBayes ({_why}).")
 
     # --- Robustness score (optionnel) ---
     # OPTIMISATION : une seule imputation sert pour TOUS les contrastes à chaque
@@ -1998,6 +2022,15 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
         # tirage de référence, reproductibles, sans collision).
         iter_seeds = [int(x) for x in np.random.SeedSequence(base_seed)
                       .generate_state(n_iter, dtype=np.uint32)]
+        # Imputation mixte : la composante kNN est déterministe (identique à chaque
+        # tirage) et coûte ~99 % d'une itération -> calculée une seule fois ; seule
+        # la part QRILC est re-tirée. Résultat identique au recalcul à chaque tirage.
+        knn_cache = None
+        if imp_method in ("mixed", "mixed_legacy"):
+            _t0 = time.time()
+            knn_cache = knn_component(mat_filt)
+            print(f"    kNN component computed once ({time.time() - _t0:.0f} s), "
+                  f"reused by the {n_iter} draws")
 
         def _one_iteration(seed):
             """Une imputation + fit → matrice (n_prot × n_contr) de succès 0/1.
@@ -2013,7 +2046,7 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
             # mesure la stabilité de la statistique affichée, pas celle d'une
             # autre imputation.
             mat_imp_tmp = impute(mat_filt, method=imp_method, design=design,
-                                 rng=rng)
+                                 rng=rng, knn_full=knn_cache)
             expr_tmp = mat_imp_tmp.values.astype(float)
             fit_tmp   = lm_fit(expr_tmp, design_mat)
             fit_tmp_c = contrasts_fit(fit_tmp, contrast_mat)
@@ -2416,6 +2449,97 @@ def pca_drivers(L: np.ndarray, coords: np.ndarray, conditions, n_total: int) -> 
     return out
 
 
+def _place_driver_labels(ax, L: np.ndarray, drivers: dict, labels, colors: dict,
+                         fontsize: float = 6.5, gap_px: float = 16.0) -> list:
+    """Étiquettes des protéines motrices placées hors du nuage de points, sans
+    chevauchement et sans dépendance (adjustText échoue quand les étiquettes sont
+    tassées contre le bord des axes) : PC1+ / PC1- en colonne à droite / à gauche,
+    PC2+ / PC2- en ligne au-dessus / en dessous (deux rangées décalées si la place
+    manque), chaque étiquette reliée à son point par un trait. Les étiquettes suivent
+    l'ordre des points, de sorte que les traits ne se croisent pas. Les limites des
+    axes sont élargies pour les contenir. Une protéine présente dans deux directions
+    n'est étiquetée qu'une fois (première direction). Retourne les objets annotation."""
+    fig = ax.figure
+    x0, x1 = float(np.min(L[:, 0])), float(np.max(L[:, 0]))
+    y0, y1 = float(np.min(L[:, 1])), float(np.max(L[:, 1]))
+    W, H = (x1 - x0) or 1.0, (y1 - y0) or 1.0
+    seen, grp = set(), {}
+    for d in ("PC1+", "PC1-", "PC2+", "PC2-"):
+        grp[d] = [int(i) for i in drivers.get(d, {}).get("idx", []) if int(i) not in seen]
+        seen.update(grp[d])
+    if not seen:
+        return []
+    rend = fig.canvas.get_renderer()
+    size = {}
+    for i in seen:
+        t = ax.text(0, 0, labels[i], fontsize=fontsize, fontweight="bold")
+        bb = t.get_window_extent(renderer=rend)
+        size[i] = (bb.width, bb.height)
+        t.remove()
+    abb = ax.get_window_extent(renderer=rend)
+    AW, AH = max(abb.width, 1.0), max(abb.height, 1.0)
+    h = max(s[1] for s in size.values())
+    pad = 4.0
+    mx, my = 0.03 * W, 0.04 * H                  # marge entre le nuage et les étiquettes
+
+    def _col_w(d):
+        return (max(size[i][0] for i in grp[d]) + gap_px + pad) if grp[d] else 0.0
+
+    def _limits(nrow_t, nrow_b):
+        ext_x = _col_w("PC1-") + _col_w("PC1+")
+        ext_y = sum((n * 1.35 * h + gap_px + pad) if n else 0.0 for n in (nrow_t, nrow_b))
+        rx = (W + 2 * mx) / max(1.0 - ext_x / AW, 0.35)      # plage x (données)
+        ry = (H + 2 * my) / max(1.0 - ext_y / AH, 0.35)
+        return rx / AW, ry / AH                               # données par pixel
+
+    def _rows(d, sx):          # 1 rangée si les étiquettes tiennent sur la largeur, sinon 2
+        if not grp[d]:
+            return 0
+        slot_px = (W / len(grp[d])) / sx
+        return 1 if max(size[i][0] for i in grp[d]) + 6 <= slot_px else 2
+
+    sx, sy = _limits(1 if grp["PC2+"] else 0, 1 if grp["PC2-"] else 0)
+    nt, nb = _rows("PC2+", sx), _rows("PC2-", sx)
+    sx, sy = _limits(nt, nb)
+    nt, nb = _rows("PC2+", sx), _rows("PC2-", sx)             # stable après 2 passes
+    sx, sy = _limits(nt, nb)
+    ax.set_xlim(x0 - mx - _col_w("PC1-") * sx, x1 + mx + _col_w("PC1+") * sx)
+    ax.set_ylim(y0 - my - ((nb * 1.35 * h + gap_px + pad) * sy if nb else 0.0),
+                y1 + my + ((nt * 1.35 * h + gap_px + pad) * sy if nt else 0.0))
+
+    arrow = dict(arrowstyle="-", color="grey", lw=0.4, shrinkA=0, shrinkB=2)
+    out = []
+
+    def _ann(i, tx, ty, ha, va):
+        out.append(ax.annotate(labels[i], xy=(L[i, 0], L[i, 1]), xytext=(tx, ty),
+                               textcoords="data", ha=ha, va=va, fontsize=fontsize,
+                               fontweight="bold", color=colors.get(i, "#333333"),
+                               arrowprops=arrow, zorder=5, annotation_clip=False))
+
+    dy = 1.45 * h * sy
+    for d, xt, ha in (("PC1+", x1 + mx + gap_px * sx, "left"),
+                      ("PC1-", x0 - mx - gap_px * sx, "right")):
+        idx = sorted(grp[d], key=lambda i: -L[i, 1])          # de haut en bas
+        if not idx:
+            continue
+        span = dy * (len(idx) - 1)
+        top_y = float(np.mean(L[idx, 1])) + span / 2
+        top_y = min(max(top_y, y0 + span), y1) if span <= H else y1
+        for k, i in enumerate(idx):
+            _ann(i, xt, top_y - k * dy, ha, "center")
+    for d, yt, va, sgn in (("PC2+", y1 + my + gap_px * sy, "bottom", 1),
+                           ("PC2-", y0 - my - gap_px * sy, "top", -1)):
+        idx = sorted(grp[d], key=lambda i: L[i, 0])           # de gauche à droite
+        if not idx:
+            continue
+        nrow = nt if d == "PC2+" else nb
+        slot = W / len(idx)
+        for k, i in enumerate(idx):
+            yk = yt + sgn * (k % 2 if nrow == 2 else 0) * 1.35 * h * sy
+            _ann(i, x0 + (k + 0.5) * slot, yk, "center", va)
+    return out
+
+
 def plot_pca_loadings(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.DataFrame,
                       df_results: pd.DataFrame, contrast_names: list,
                       cluster_mapping: list, params: dict, out_dir: str,
@@ -2445,14 +2569,20 @@ def plot_pca_loadings(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.Data
     coords, var_exp, L = fit["coords"], fit["var_exp"], fit["loadings"]
     if L.shape[1] < 2:
         return None, None, None
-    names = (meta["name"].astype(str).values if "name" in meta.columns
-             else np.asarray(mat_imp.index).astype(str))
-    genes = (meta["Genes"].astype(str).str.split(";").str[0].values
-             if "Genes" in meta.columns else names)
-    genes = np.where(pd.Series(genes).isin(["", "nan", "None"]).values, names, genes)
+    def _txt(s):
+        # Cellules vides -> "" : avec pandas >= 3, astype(str) garde les NaN (float)
+        # au lieu de les écrire "nan" ; fillna avant la conversion couvre les deux.
+        return (pd.Series(s).fillna("").astype(str).str.strip()
+                .replace({"nan": "", "None": "", "NaN": ""}).to_numpy(dtype=object))
+
+    names = (_txt(meta["name"]) if "name" in meta.columns
+             else np.asarray(mat_imp.index).astype(str).astype(object))
+    genes = _txt(meta["Genes"]) if "Genes" in meta.columns else names
+    genes = np.array([g.split(";")[0].strip() for g in genes], dtype=object)
+    genes = np.where(genes == "", names, genes)
     desc_col = next((c for c in ("First.Protein.Description", "Protein.Names")
                      if c in meta.columns), None)
-    descs = (meta[desc_col].astype(str).replace({"nan": ""}).values if desc_col
+    descs = (_txt(meta[desc_col]) if desc_col
              else np.full(len(names), "", dtype=object))
     if n_drivers is None:
         n_drivers = int(params.get("pca_n_drivers", 20) or 0)
@@ -2519,9 +2649,8 @@ def plot_pca_loadings(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.Data
         m = conditions == cond
         axA.scatter(coords[m, 0], coords[m, 1], color=cmap[cond], label=cond, s=55,
                     alpha=0.9, zorder=3)
-        for xi, yi, li in zip(coords[m, 0], coords[m, 1], labels[m]):
-            axA.annotate(li, (xi, yi), fontsize=6, alpha=0.7, xytext=(3, 3),
-                         textcoords="offset points")
+    s_txt = [axA.text(xi, yi, li, fontsize=6, alpha=0.75, zorder=4)
+             for xi, yi, li in zip(coords[:, 0], coords[:, 1], labels)]
     axA.axhline(0, color="grey", lw=0.5); axA.axvline(0, color="grey", lw=0.5)
     axA.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}% of variance)")
     axA.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}%)")
@@ -2545,14 +2674,6 @@ def plot_pca_loadings(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.Data
     if top:
         axB.scatter(L[top, 0], L[top, 1], s=34, facecolors="none", edgecolors="black",
                     linewidths=0.8, zorder=4, label=f"Driving proteins ({len(top)})")
-        texts = [axB.text(L[i, 0], L[i, 1], genes[i], fontsize=6.5, fontweight="bold",
-                          color=_dark(palette.get(group[i], "#555555")), zorder=5)
-                 for i in top]
-        try:
-            from adjustText import adjust_text
-            adjust_text(texts, ax=axB, arrowprops=dict(arrowstyle="-", color="grey", lw=0.4))
-        except ImportError:
-            pass
     axB.axhline(0, color="grey", lw=0.5); axB.axvline(0, color="grey", lw=0.5)
     axB.set_xlabel("Loading on PC1"); axB.set_ylabel("Loading on PC2")
     axB.set_title(f"B. Loading plot — proteins ({rule})", loc="left", fontweight="bold")
@@ -2581,6 +2702,19 @@ def plot_pca_loadings(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.Data
             fig.tight_layout(rect=[0, 0.02, 1, 1])
     except Exception:                                                 # noqa: BLE001
         pass
+    # après tight_layout : les placements sont calculés sur la taille finale des axes
+    try:                        # réplicats groupés : étiquettes d'échantillons écartées
+        from adjustText import adjust_text
+        adjust_text(s_txt, x=coords[:, 0], y=coords[:, 1], ax=axA,
+                    arrowprops=dict(arrowstyle="-", color="grey", lw=0.3))
+    except Exception:                                                 # noqa: BLE001
+        from matplotlib.transforms import ScaledTranslation
+        for t in s_txt:         # sans adjustText : décalage fixe de 3 pt, comme avant
+            t.set_transform(axA.transData
+                            + ScaledTranslation(3 / 72, 3 / 72, fig.dpi_scale_trans))
+    if top:
+        _place_driver_labels(axB, L, drivers, genes,
+                             {i: _dark(palette.get(group[i], "#555555")) for i in top})
     f = os.path.join(out_dir, "plot_pca_loadings.png")
     fig.savefig(f, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -3372,6 +3506,9 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_section("2. DATA PREPROCESSING")
     put_header()
     put_kv("Source", "DIA-NN pg_matrix", "LFQ intensities (label-free quantification)")
+    if params.get("id_mapping_summary"):
+        put_kv("Identifier mapping", "id_mapping (pg + pr_matrix)",
+               params["id_mapping_summary"])
     put_kv("Contaminants", "cRAP removal", "Filter on Protein.Group / Protein.Names")
     put_kv("Transformation", "log2", "log2(intensity), zeros -> NA")
     put_kv("Filtering", ">= (n_rep - 1) values",
@@ -4668,6 +4805,16 @@ def main():
     make_wgcna  = params["make_wgcna"]
     make_dash   = params["make_dashboard"]
     use_deqms   = params["use_deqms"]
+
+    # --- 0. Conversion des identifiants (optionnelle, clé YAML id_mapping) ---
+    # Remplace les identifiants du Protein.Group dans pg ET pr_matrix via une table
+    # de correspondance (ex. UPI UniParc -> locus tags reconnus par STRING), sans
+    # relancer DIA-NN. Matrices converties dans <out_dir>/id_mapping/ ; seules les
+    # variables locales changent : params["tsv_path"] reste le fichier d'origine
+    # (labels des runs, dossier des FASTA, last_config.yaml). Idempotent.
+    if params.get("id_mapping"):
+        from id_remap import apply_id_mapping
+        tsv_path, pr_path = apply_id_mapping(params, tsv_path, pr_path, out_dir)
 
     # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None.
     # Mode Perseverance (annotation par orthologie) : independant de gProfiler/go_organism,
