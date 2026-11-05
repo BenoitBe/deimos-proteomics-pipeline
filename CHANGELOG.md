@@ -272,6 +272,11 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **GO lollipop / dotplot layout**: with a single source the general title overlapped the
+  facet title (top margin as a fraction of a 2.4-inch figure); fixed 0.8-inch header now.
+  Dotplot: the colour bar and the Count legend have their own columns (the legend sat on
+  the colour bar), point areas scaled between the smallest and largest term (a 27-protein
+  term made a 750 pt² disc), legend with 2-3 values spread from min to max.
 - **STRING backend: Perseverance no longer proposed.** With `go_backend: string`
   (direct mode), the Perseverance question was asked after the statistics; its
   orthologues (UniProt accessions of another species) would then have been read as

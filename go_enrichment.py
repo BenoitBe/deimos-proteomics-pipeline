@@ -1572,6 +1572,32 @@ def _top_terms_per_source(tab: pd.DataFrame, n_per_source: int = 8) -> pd.DataFr
     return top
 
 
+def _facet_figure(n_src: int, right: float):
+    """Figure à facettes empilées (une par source) avec une marge haute FIXE en
+    pouces pour le titre général et le titre de la 1re facette : avec une marge
+    en fraction de la hauteur (top=0.90), une figure à une seule source n'avait
+    que ~0.25 pouce pour les deux titres, qui se chevauchaient."""
+    H = max(2.4, 2.2 * n_src) + 0.75
+    fig, axes = plt.subplots(n_src, 1, figsize=(9, H), squeeze=False)
+    fig.subplots_adjust(left=0.32, right=right, top=1 - 0.80 / H,
+                        bottom=0.55 / H, hspace=0.75)
+    return fig, axes.flatten(), H
+
+
+def _facet_colorbar(fig, axes, mappable, right: float, label: str):
+    """Barre de couleur dans sa propre colonne, sur la hauteur des facettes."""
+    y0 = min(a.get_position().y0 for a in axes if a.get_visible())
+    y1 = max(a.get_position().y1 for a in axes if a.get_visible())
+    cax = fig.add_axes([right + 0.03, y0, 0.016, y1 - y0])
+    cbar = fig.colorbar(mappable, cax=cax)
+    cbar.set_label(label, fontsize=9)
+    return cbar
+
+
+def _facet_suptitle(fig, text: str, H: float):
+    fig.suptitle(text, fontsize=13, fontweight="bold", y=1 - 0.12 / H, va="top")
+
+
 def plot_lollipop_faceted(tab: pd.DataFrame, contrast: str, out_dir: str) -> str | None:
     """Lollipop facetté par source, couleur = z-score (LFC moyen)."""
     if tab.empty:
@@ -1588,10 +1614,8 @@ def plot_lollipop_faceted(tab: pd.DataFrame, contrast: str, out_dir: str) -> str
         return None
 
     # Layout vertical (1 colonne) : évite tout chevauchement des labels longs.
-    fig, axes = plt.subplots(n_src, 1,
-                             figsize=(9, max(2.4, 2.2 * n_src)),
-                             squeeze=False)
-    axes = axes.flatten()
+    right = 0.84
+    fig, axes, H = _facet_figure(n_src, right)
 
     zmax = max(abs(top["z_score"]).max(), 1e-6)
     for idx, src in enumerate(sources):
@@ -1615,11 +1639,8 @@ def plot_lollipop_faceted(tab: pd.DataFrame, contrast: str, out_dir: str) -> str
 
     sm = plt.cm.ScalarMappable(cmap="RdBu_r",
                                norm=plt.Normalize(vmin=-zmax, vmax=zmax))
-    cbar = fig.colorbar(sm, ax=axes.tolist(), fraction=0.025, pad=0.04)
-    cbar.set_label("Z-score (LFC moyen)", fontsize=9)
-    fig.suptitle(f"Lollipop GO — {contrast.replace('_vs_', ' vs ')}",
-                 fontsize=13, fontweight="bold", y=1.0)
-    fig.subplots_adjust(left=0.32, right=0.86, hspace=0.55, top=0.90)
+    _facet_colorbar(fig, axes[:n_src], sm, right, "Z-score (LFC moyen)")
+    _facet_suptitle(fig, f"Lollipop GO — {contrast.replace('_vs_', ' vs ')}", H)
     f = os.path.join(out_dir, f"go_lollipop_{contrast}.png")
     fig.savefig(f, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1642,11 +1663,19 @@ def plot_dotplot_faceted(tab: pd.DataFrame, contrast: str, out_dir: str) -> str 
         return None
 
     # Layout vertical (1 colonne) : les noms de termes GO sont longs, empiler
-    # les sources évite tout chevauchement horizontal entre facettes.
-    fig, axes = plt.subplots(n_src, 1,
-                             figsize=(9, max(2.4, 2.2 * n_src)),
-                             squeeze=False)
-    axes = axes.flatten()
+    # les sources évite tout chevauchement horizontal entre facettes. À droite :
+    # une colonne pour la barre de couleur, une pour la légende des tailles.
+    right = 0.70
+    fig, axes, H = _facet_figure(n_src, right)
+    # Taille des points : aire proportionnelle à l'effectif, bornée (sinon un terme
+    # à 27 protéines faisait un disque de 750 pt² qui débordait des facettes)
+    cnt_all = (pd.to_numeric(top["intersection_size"], errors="coerce").fillna(1)
+               if "intersection_size" in top.columns else pd.Series([1.0]))
+    c_lo, c_hi = float(cnt_all.min()), float(cnt_all.max())
+
+    def _size(c):
+        c = np.asarray(c, float)
+        return 40 + 320 * ((c - c_lo) / (c_hi - c_lo) if c_hi > c_lo else 0.5)
 
     # Échelle de couleur commune à toutes les facettes
     all_logp = -np.log10(top["p_value"].clip(lower=1e-300))
@@ -1656,7 +1685,8 @@ def plot_dotplot_faceted(tab: pd.DataFrame, contrast: str, out_dir: str) -> str 
         ax = axes[idx]
         sub = top[top["source"] == src].sort_values("gene_ratio")
         ypos = np.arange(len(sub))
-        sizes = sub["intersection_size"].values * 28 if "intersection_size" in sub.columns else 60
+        sizes = (_size(pd.to_numeric(sub["intersection_size"], errors="coerce").fillna(1))
+                 if "intersection_size" in sub.columns else 60)
         sc = ax.scatter(sub["gene_ratio"], ypos, s=sizes,
                         c=-np.log10(sub["p_value"].clip(lower=1e-300)),
                         cmap="plasma", vmin=vmin, vmax=vmax,
@@ -1672,22 +1702,22 @@ def plot_dotplot_faceted(tab: pd.DataFrame, contrast: str, out_dir: str) -> str 
     for idx in range(n_src, len(axes)):
         axes[idx].set_visible(False)
 
-    # Colorbar unique partagée à droite, bien détachée des panneaux
+    # Barre de couleur unique, dans sa colonne
     if sc is not None:
-        cbar = fig.colorbar(sc, ax=axes.tolist(), fraction=0.025, pad=0.04)
-        cbar.set_label("-log10(p)", fontsize=9)
-    # Légende des tailles (Count) sur la 1re facette
+        _facet_colorbar(fig, axes[:n_src], sc, right, "-log10(p)")
+    # Légende des tailles (Count) dans la colonne suivante : 2-3 valeurs
+    # réparties entre le min et le max, espacées pour ne pas se chevaucher
     if "intersection_size" in top.columns:
-        for cnt in sorted(top["intersection_size"].unique())[:5]:
-            axes[0].scatter([], [], s=cnt * 28, c="grey",
-                            edgecolor="black", lw=0.4, label=str(int(cnt)))
-        axes[0].legend(title="Count", loc="upper left",
-                       bbox_to_anchor=(1.01, 1.0), fontsize=7,
-                       title_fontsize=8, framealpha=0.9)
+        vals = sorted({int(round(v)) for v in np.linspace(c_lo, c_hi, 3)})
+        handles = [plt.scatter([], [], s=float(_size(v)), c="grey", edgecolor="black",
+                               lw=0.4, label=str(v)) for v in vals]
+        y1 = axes[0].get_position().y1
+        fig.legend(handles=handles, title="Count", loc="upper left",
+                   bbox_to_anchor=(right + 0.13, y1), fontsize=8, title_fontsize=8,
+                   labelspacing=1.6, borderpad=0.9, handletextpad=1.2,
+                   framealpha=0.9)
 
-    fig.suptitle(f"Dotplot GO — {contrast.replace('_vs_', ' vs ')}",
-                 fontsize=13, fontweight="bold", y=1.0)
-    fig.subplots_adjust(left=0.32, right=0.86, hspace=0.55, top=0.90)
+    _facet_suptitle(fig, f"Dotplot GO — {contrast.replace('_vs_', ' vs ')}", H)
     f = os.path.join(out_dir, f"go_dotplot_{contrast}.png")
     fig.savefig(f, dpi=150, bbox_inches="tight")
     plt.close(fig)
