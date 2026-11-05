@@ -3506,6 +3506,9 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_section("2. DATA PREPROCESSING")
     put_header()
     put_kv("Source", "DIA-NN pg_matrix", "LFQ intensities (label-free quantification)")
+    if params.get("id_mapping_summary"):
+        put_kv("Identifier mapping", "id_mapping (pg + pr_matrix)",
+               params["id_mapping_summary"])
     put_kv("Contaminants", "cRAP removal", "Filter on Protein.Group / Protein.Names")
     put_kv("Transformation", "log2", "log2(intensity), zeros -> NA")
     put_kv("Filtering", ">= (n_rep - 1) values",
@@ -4808,6 +4811,16 @@ def main():
     make_wgcna  = params["make_wgcna"]
     make_dash   = params["make_dashboard"]
     use_deqms   = params["use_deqms"]
+
+    # --- 0. Conversion des identifiants (optionnelle, clé YAML id_mapping) ---
+    # Remplace les identifiants du Protein.Group dans pg ET pr_matrix via une table
+    # de correspondance (ex. UPI UniParc -> locus tags reconnus par STRING), sans
+    # relancer DIA-NN. Matrices converties dans <out_dir>/id_mapping/ ; seules les
+    # variables locales changent : params["tsv_path"] reste le fichier d'origine
+    # (labels des runs, dossier des FASTA, last_config.yaml). Idempotent.
+    if params.get("id_mapping"):
+        from id_remap import apply_id_mapping
+        tsv_path, pr_path = apply_id_mapping(params, tsv_path, pr_path, out_dir)
 
     # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None.
     # Mode Perseverance (annotation par orthologie) : independant de gProfiler/go_organism,

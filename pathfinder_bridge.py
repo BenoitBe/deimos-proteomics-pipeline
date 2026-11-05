@@ -249,7 +249,11 @@ def run_pathfinder_step(xlsx_path, design, params, out_dir, *, go_ran=True,
             log.write("$ " + " ".join(f'"{a}"' if " " in a else a for a in argv) + "\n\n")
             log.flush()
             try:
-                r = subprocess.run(argv, cwd=pf_out, stdin=subprocess.DEVNULL,
+                # stdin = tube vide et fermé (et non DEVNULL) : sous Windows, NUL est
+                # un périphérique caractère, isatty() y répond True et Pathfinder
+                # croirait pouvoir poser une question. Avec un tube : isatty()
+                # False et lecture = fin de fichier immédiate, sur tous les systèmes.
+                r = subprocess.run(argv, cwd=pf_out, input=b"",
                                    stdout=log, stderr=subprocess.STDOUT, env=env,
                                    timeout=timeout)
             except subprocess.TimeoutExpired:

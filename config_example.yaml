@@ -182,8 +182,28 @@ string_reference_taxid: null      # orthology mode: STRING organism to map to
 string_reference_fasta: null      # local STRING proteome (otherwise data folder, then download)
 string_caller_identity: Proteogen # caller identity sent to the STRING API
 
-# Rank-based GSEA (requires gseapy; Enrichr gene-set libraries)
+# Protein x sample matrices for other analyses (Mfuzz, MOFA+/MEFISTO,
+# multi-omics integration): folder <out_dir>/matrices/ with log2 + NA, log2
+# imputed, DPC abundances (+ standard errors, observed flags, condition means),
+# sample table and README.
+export_matrices:     true
+
+# Rank-based GSEA (requires gseapy). Ranking metric: -log10(p) x sign(log2FC) on
+# all tested proteins, gene symbols from the Genes column (upper case, so mouse
+# "Actb" matches human "ACTB").
 run_gsea:            false
+gsea_organism:       human        # human: Enrichr GO 2021 + KEGG 2021 + Reactome 2022
+                                  # mouse: MSigDB mouse MH, M2 CP:REACTOME, CP:WIKIPATHWAYS,
+                                  #        M5 GO:BP/MF/CC
+gsea_gene_sets:      null         # null = defaults of gsea_organism; or a list of
+                                  # local .gmt files (pinned version, no network),
+                                  # "msigdb:<collection>" (e.g. msigdb:m5.go.bp) or
+                                  # Enrichr library names
+gsea_msigdb_version: null         # null = 2025.1.Hs / 2025.1.Mm
+gsea_rank_p:         pvalue       # raw p (BH-adjusted p has plateaus that flatten the
+                                  # middle of the ranking); 'volcano' = previous rule
+gsea_fdr:            0.25         # Broad's exploratory threshold
+gsea_permutations:   1000
 
 
 # ── Perseverance — orthology for species poorly covered by gProfiler ─────────

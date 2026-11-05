@@ -102,6 +102,45 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **Identifier mapping** (`id_mapping`, module `id_remap.py`): converts the
+  Protein.Group identifiers of the pg and pr matrices (e.g. UniParc UPI -> UniProt
+  accession or locus tag) from the search FASTA (`AC=`, `GN=` fields) or a table, without
+  re-running DIA-NN; same mapping for both files, intensities unchanged, collisions keep
+  their original ID, idempotent; converted matrices in `<out_dir>/id_mapping/`, Methods
+  row. The call in `deimos.py`, lost once when the file was replaced, is now covered by a
+  test.
+
+- **Protein x sample matrices for other analyses** (`export_matrices: true`, default):
+  folder `<out_dir>/matrices/` with TSV files sharing the same rows (unique `protein`
+  ID, Protein.Group, Genes, Description) and the sample order of `samples.tsv`:
+  `log2_filtered_NA.tsv` (log2, NA kept, `num_NA`; for MOFA+/MEFISTO, which model
+  missing values), `log2_imputed.tsv` (as the Log2_Impute sheet; Mfuzz, WGCNA),
+  `dpc_abundance.tsv` / `dpc_standard_error.tsv` / `dpc_observed.tsv` (precursor-level
+  DPC quantification of the primary statistic: complete matrix with uncertainties) and
+  `condition_means_dpc.tsv` (Mfuzz on condition means), plus `samples.tsv` and a README
+  on normalisation (DIA-NN only), file choice and multi-omics integration. Methods row.
+
+- **GSEA gene sets by organism, local GMT files.** New keys (the previous behaviour
+  stays the default):
+  - `gsea_organism: human | mouse`. `human` = Enrichr GO 2021 + KEGG_2021_Human +
+    Reactome_2022 (unchanged); `mouse` = MSigDB mouse collections MH, M2
+    CP:REACTOME, CP:WIKIPATHWAYS, M5 GO:BP/MF/CC (`gsea_msigdb_version`, default
+    2025.1.Mm; MSigDB has no mouse KEGG).
+  - `gsea_gene_sets`: list of local `.gmt` files (pinned version, no network),
+    `msigdb:<collection>` or Enrichr library names. Gene sets are loaded once for all
+    contrasts, symbols upper-cased like the ranking (mouse `Actb` = human `ACTB`); an
+    unavailable source is reported and skipped.
+  - `gsea_fdr`, `gsea_permutations` exposed in the configuration.
+  - Log line: share of the ranked genes present in the gene sets.
+  - Interactive mode: after "Also run GSEA?", question "Gene sets [1/2]" (human /
+    mouse), saved in last_config.yaml as `gsea_organism`.
+- **GSEA ranking on the raw p-value** (`gsea_rank_p: pvalue`, default). The ranking used
+  the volcano p, i.e. the BH-adjusted p with `volcano_use_padj: true`, whose plateaus
+  (many proteins with the same value) flatten the middle of the ranking, where GSEA
+  picks up coordinated small shifts. `gsea_rank_p: volcano` restores the previous rule.
+- `check_gsea.py`: no longer reports a missing GSEA call for the current deimos.py
+  (`(go_params or {}).get("run_gsea")`).
+
 - **PCA loading plot.** Score plot (samples) and loading plot (proteins) side by side, from
   the same PCA as `plot_pca` (same axes, same signs): a protein on the right of B is more
   abundant in the samples on the right of A. ANOVA-significant proteins are coloured by
@@ -114,6 +153,17 @@ and dashboard improvements accumulated since the previous public version.
     between PC1+, PC1-, PC2+ and PC2-, are circled and labelled, and listed under the
     figure with their description and the conditions lying on that side of the score
     plot (column `driver` in PCA_Loadings). Sample scores in sheet `PCA_Scores`.
+  - **Driver labels placed outside the cloud** (no overlap): PC1+ / PC1- in a column
+    right / left, PC2+ / PC2- in a row above / below (two staggered rows when space is
+    short), each linked to its point, in the order of the points so leader lines do not
+    cross; axis limits widened to fit. Replaces adjustText for these labels, which left
+    them stacked when the extreme proteins sit against the edge of the axes (8-condition
+    run: 4 PC1- labels on top of each other). Sample labels of the score plot are spread
+    with adjustText (replicates often overlap), with a fixed offset as fallback.
+  - **Empty gene names / descriptions** no longer crash the loading plot
+    (`TypeError: object of type 'float' has no len()`): with pandas >= 3, `astype(str)`
+    keeps missing values as NaN instead of writing "nan". Empty cells are now read as
+    empty strings; a protein without gene name is labelled with its accession.
   - **Dashboard** (QC / PCA tab): the same score plot + loading plot, read from
     PCA_Scores / PCA_Loadings (same PCA, axes and signs as the Excel figure), with the
     driver table; hover for gene, description, group and loadings, click a protein (in
@@ -222,6 +272,18 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **STRING backend: Perseverance no longer proposed.** With `go_backend: string`
+  (direct mode), the Perseverance question was asked after the statistics; its
+  orthologues (UniProt accessions of another species) would then have been read as
+  STRING identifiers. Perseverance belongs to the gProfiler route and is now skipped
+  (`run_perseverance: true` reported as ignored).
+- **STRING backend: low direct coverage -> orthology to the same species.** The direct
+  mode was kept as soon as 30 % of the accessions were indexed in STRING (naked
+  mole-rat, UniProt UP000694906: 16/50), so most proteins never reached the
+  enrichment. Below 60 % (`STRING_DIRECT_MIN_COVERAGE`), when DIAMOND is available,
+  Deimos now maps the proteins by RBH to the STRING proteome of the same species
+  (identities ~100 %); without DIAMOND the direct mode is kept with a warning.
+
 - **Methods sheet.** The GO section reported the measured species (`bnapus`) when the
   enrichment ran on the reference species through Perseverance orthologues; the row now
   names the reference organism and the translation (RBH, number of orthologues). Selected
@@ -269,6 +331,13 @@ and dashboard improvements accumulated since the previous public version.
 - **Robustness score under DEqMS.** The robustness loop now recomputes DEqMS
   (not limma) when DEqMS is the primary statistic, so the score reflects the same
   statistic shown in the `_p.val` / `_p.adj` columns.
+
+- **Faster imputation robustness with the mixed imputation.** The kNN part of the
+  mixed imputation does not depend on the random draw: it is now computed once and
+  reused by the 100 re-imputations, only the QRILC part being redrawn. Results are
+  identical (test `tests/test_knn_cache.py`); on 9,300 proteins × 180 samples a kNN
+  call takes about 70 s against 0.6 s for the rest of an iteration, so the step goes
+  from 100 kNN calls to one.
 
 - **Scatter plots (dashboard).** Empty/deformed scatter fixed: intensity columns
   were not matched to contrasts for digit-prefixed conditions (missing `X`

@@ -84,17 +84,32 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     estimated on the dataset, absorbs identification failures and individual presence/absence
   Results go to three sheets (Sensitivity_Summary, Sensitivity_DPC, Differential_Detection)
 - FDR correction per contrast or globally (BH)
-- Visualisations: volcano plots, PCA (score plot + protein loading plot on the same axes, driving proteins labelled per direction; interactive in the dashboard), UMAP (skipped below 5 samples), heatmaps, UpSet, scatter plots
+- Visualisations:
+  - **volcano plots** with −log10(raw p) on the Y axis (limma convention), colours from the
+    volcano rule (p.adj by default) and a dashed line at the raw p equivalent to the p.adj
+    threshold; `volcano_y_axis: padj` plots the adjusted p instead
+  - **PCA**: score plot + protein **loading plot** on the same axes; the `pca_n_drivers`
+    (default 20) most extreme proteins per direction (PC1±, PC2±) are labelled outside the
+    point cloud and listed with their description (sheets PCA_Loadings, PCA_Scores;
+    interactive in the dashboard)
+  - UMAP (skipped below 5 samples), heatmaps, UpSet, scatter plots
 - Co-expression: **WGCNA** (modules, hub scores, trait correlation)
 - **Functional enrichment** (GO / KEGG / Reactome), two backends:
   - **gProfiler** (`go_backend: gprofiler`, default), with an automatic **coverage diagnostic**
     (g:Convert). If the organism is poorly indexed, Deimos offers **Perseverance** (bundled):
     orthologues in a well-annotated reference species are found by Reciprocal Best Hit (DIAMOND),
-    gProfiler is queried on that species, and results are mapped back to your protein IDs
+    gProfiler is queried on that species, and results are mapped back to your protein IDs.
+    The reference FASTA and `perseverance_reference_organism` must name the same species
+    (e.g. Arabidopsis proteome + `athaliana`; rice + `osativa` for grasses); identity and
+    coverage filters: `perseverance_min_identity`, `perseverance_min_coverage`
   - **STRING** (`go_backend: string`) — recommended for bacteria and non-model organisms. The
     species is identified by NCBI taxid, detected automatically from UniProt accessions
     (`go_species_taxid: auto`). If the strain itself is not indexed in STRING, Deimos switches to
     an **orthology mode** (RBH with DIAMOND against the STRING proteome of the parent species).
+    The same mode is used when fewer than 60 % of the accessions are indexed in STRING for the
+    species (e.g. a recent UniProt proteome): the proteins are then mapped by sequence to the
+    STRING proteome of the same species, so that all of them reach the enrichment. Perseverance
+    belongs to the gProfiler route and is not proposed with STRING
   - **statistical universe = quantified proteins** by default (`enrichment_background:
     quantified`), for gProfiler (custom background restricted to annotated genes,
     `domain_scope='custom_annotated'`), STRING and the ANOVA-cluster enrichment: only
@@ -102,7 +117,16 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     categories of abundant proteins. `enrichment_background: genome` restores the previous
     behaviour
   - ORA per ANOVA heatmap cluster (`Cluster_Enrich_N` sheets)
-  - optional rank-based **GSEA** (`run_gsea: true`, `gseapy`, Enrichr gene-set libraries)
+  - optional rank-based **GSEA** (`run_gsea: true`, `gseapy`): all tested proteins ranked by
+    −log10(raw p) × sign(log2FC), matched to the gene sets by gene symbol. Gene sets: human
+    Enrichr libraries (GO 2021, KEGG 2021, Reactome 2022, default), mouse MSigDB collections
+    (`gsea_organism: mouse`: hallmarks, Reactome, WikiPathways, GO), or local `.gmt` files
+    (`gsea_gene_sets`, pinned version, no network). The log reports the share of ranked genes
+    found in the gene sets
+- **Protein × sample matrices for other analyses** (`export_matrices: true`, default), folder
+  `matrices/`: log2 with missing values kept (MOFA+ / MEFISTO), log2 imputed (Mfuzz, WGCNA),
+  DPC abundances with standard errors and observed flags, DPC condition means, sample table and
+  a README on normalisation (DIA-NN only) and multi-omics integration
 - Multi-sheet Excel export + interactive HTML dashboard, with a **light/dark theme toggle**
 - **Pathfinder synthesis** as an optional last step (`make_pathfinder: true` / `--pathfinder`):
   core protein signature across contrasts, Meta-GO, WGCNA cross-reading, PCA × design factors.
@@ -121,9 +145,10 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
 | ------------------------ | -------- | ----------------------------------------------------- |
 | `report.pg_matrix.tsv`   | ✅        | Protein × sample matrix (DIA-NN ≥ 2.5)               |
 | `ExperimentalDesign.csv` | ✅        | Columns: `label;condition;replicate` (separator `;`), optionally `subject` and a batch column |
-| `report.pr_matrix.tsv`   | ⬜        | Precursor matrix (enables DEqMS)                     |
+| `report.pr_matrix.tsv`   | ⬜ (recommended) | Precursor matrix: DPC primary statistic (precursor level) and DEqMS |
 | Two FASTA files          | ⬜        | Your search FASTA + a reference proteome — only for Perseverance |
 | Search FASTA             | ⬜        | STRING orthology mode: query sequences (otherwise fetched from UniProt) |
+| `id_mapping` source      | ⬜        | Search FASTA or table to convert Protein.Group IDs (e.g. UniParc UPI -> UniProt / locus tag) before the analysis, see `id_remap.py` |
 
 `label` must match exactly the sample name read from each DIA-NN column: the `Sple-…` token of
 the run name (from `Sple-` up to the next `_`), or the full column name if there is none.
@@ -150,10 +175,12 @@ Optional:
 ```bash
 pip install gseapy                  # rank-based GSEA (run_gsea: true)
 sudo apt install diamond-aligner    # or: conda install -c bioconda diamond
+                                    # Windows: diamond.exe next to deimos.py or in the PATH
                                     # needed by Perseverance and by the STRING orthology mode
 ```
 
-Enrichment needs network access to the gProfiler, STRING and UniProt APIs.
+Enrichment needs network access to the gProfiler, STRING and UniProt APIs; GSEA to Enrichr or
+MSigDB (data.broadinstitute.org), unless local `.gmt` files are given.
 
 **Dashboard offline** — place `chart.umd.min.js` and `xlsx.full.min.js` alongside `build_dashboardv7.py`:
 
@@ -191,10 +218,16 @@ signature uses `p.adj < 0.05` without a fold-change criterion, deliberately stri
 volcano thresholds: the two counts are not meant to agree, and both rules are written in its
 summary.
 
-**Unattended runs** (scheduler, cluster, no terminal): two options still ask a question at runtime
-when left on `"__auto__"`, and the run stops with `EOFError` if nobody can answer —
-`run_perseverance` (asked at every run) and `contrasts` (asked above 30 contrasts). Set both
-explicitly in the YAML (`config_example.yaml` sets `run_perseverance: false`).
+**Unattended runs** (scheduler, cluster, no terminal): some options still ask a question at
+runtime when left unset, and the run stops with `EOFError` if nobody can answer —
+`run_perseverance` (gProfiler backend, asked at every run when `"__auto__"`), `contrasts` (asked
+above 30 contrasts) and `species_split` (asked when several `_TAG` organism suffixes are found,
+e.g. a FASTA with contaminants). Set them explicitly in the YAML (`config_example.yaml` sets
+`run_perseverance: false`).
+
+**Contrast names**: conditions starting with a digit get an `X` prefix (R convention:
+`102T0Light` → `X102T0Light`); patterns such as `*T0Light_vs_TronT0Light` or
+`{g}T3Dark_vs_{g}T3Light` match either way, but the Excel and dashboard names carry the `X`.
 
 Check a paired design before running: `python check_paired.py ExperimentalDesign.csv`.
 
@@ -236,7 +269,10 @@ values after filtering), a non-model marine invertebrate (P3, 23 %), a marine sp
 
 Fold-changes (slope of estimated vs true, 1 = exact): DPC 0.87-0.90, QRILC 1.08-1.19, MIXED
 0.88-0.95. The DPC fold-changes are slightly compressed (shrinkage of weakly observed values).
-The Python implementation gives the same significant calls as limpa 1.5.2 (R) on two datasets.
+The Python implementation gives the same significant calls as limpa 1.5.2 (R) on three datasets;
+on the last one (B. napus embryos, 24 samples, 78,495 precursors, 16 contrasts) the precursor
+DPC is identical, |Δ log2FC| ≤ 0.01, |Δ log10 p| ≤ 0.03 and the calls are identical in all 16
+contrasts.
 
 **limma and DEqMS engine** (`limma_ebayes.py`) against R limma 3.58.1, DEqMS 1.31.0 and InMoose
 0.9.1, on 7 simulated designs (two groups, four groups with six contrasts, paired, exactly zero
@@ -260,7 +296,9 @@ proteins often miss: the test then stays silent rather than wrong).
 ## Reproducibility
 
 - The DPC primary statistic involves no random draw: same input, same results.
-- `seed` fixes the reference imputation draw and the robustness iterations.
+- `seed` fixes the reference imputation draw and the robustness iterations. With the MIXED
+  imputation, the kNN part (deterministic) is computed once and reused by the robustness
+  draws: same results, the step no longer grows with a kNN per iteration on large designs.
 - The Methods sheet records the imputation method (and why `auto` chose it), the seed, the design
   matrix, the selected contrasts and the design checks.
 - `last_config.yaml` in the output folder reloads the exact configuration of the last run.
@@ -285,16 +323,20 @@ deimos-proteomics-pipeline/
 ├── diagnostic_dashboard.py       # Dashboard diagnostic utility
 ├── check_paired.py               # Pre-flight check of a paired design
 ├── check_gsea.py                 # GSEA integration diagnostic
+├── diag_go.py                    # GO via orthologues: ID format, gProfiler coverage, backgrounds
 ├── perseverance.py               # Orthology search CLI (RBH via DIAMOND)
 ├── rbh.py / transfer.py          # Perseverance internals
 ├── deimos_to_perseverance.py     # Deimos <-> Perseverance bridge (FASTA, ID mapping)
+├── id_remap.py                   # id_mapping: Protein.Group ID conversion in pg + pr matrices
 ├── README_PERSEVERANCE.md        # Perseverance documentation
 ├── README_INTEGRATION.md         # Perseverance <-> Deimos integration notes
 ├── deimos_mark.svg / deimos_icon.svg
 ├── CHANGELOG.md
 ├── requirements.txt
 ├── LICENSE
-├── tests/                        # pytest: manifest contract, Pathfinder launch, DPC analyses
+├── tests/                        # pytest: limma/DEqMS vs R, DPC, volcanos, PCA, GSEA, STRING plan,
+│                                 #   matrices, manifest contract, Pathfinder launch
+├── toy_data/                     # Toy FASTA files for Perseverance (README_PERSEVERANCE)
 └── example_data/                 # Minimal synthetic dataset (smoke test, no biological signal)
     ├── report.pg_matrix.tsv
     └── ExperimentalDesign.csv
@@ -309,7 +351,9 @@ proteomics_output/
 ├── ProteomicAnalysis_Results.xlsx   # Full multi-sheet report
 ├── ProteomicAnalysis_QC.xlsx        # QC-only mode (instead of the above)
 ├── proteogen_dashboard.html         # Interactive dashboard (light/dark toggle)
+├── matrices/                        # export_matrices: protein x sample TSV matrices + README
 ├── string_orthologs/                # STRING orthology mode: proteome cache + DIAMOND files
+├── perseverance/                    # Perseverance: DIAMOND outputs, orthologue table
 ├── pathfinder/                      # make_pathfinder: report, synthesis workbook, summary,
 │                                    #   design used, full log
 └── last_config.yaml                 # Last run config (reloadable)
@@ -333,6 +377,12 @@ Copy `config_example.yaml` and adapt; every key is documented there. The keys th
 change between projects:
 
 ```yaml
+volcano_use_padj:     true        # volcano rule on p.adj (true) or raw p (false)
+volcano_p_thresh:     0.05
+volcano_ratio_min:    2.0
+volcano_y_axis:       pvalue      # Y axis: raw p (default) | padj
+pca_n_drivers:        20          # proteins labelled on the loading plot (PC1±, PC2±)
+
 primary_statistic:    dpc         # dpc (no imputation, precursors) | imputation
 impute_method:        auto        # auto | qrilc | mixed | mixed_legacy
 seed:                 42          # reproducible imputation
@@ -349,7 +399,12 @@ go_organism:          null        # gProfiler species code (e.g. "bnapus"), null
 go_backend:           gprofiler   # gprofiler | string
 go_species_taxid:     null        # STRING: "auto" or an NCBI taxid
 enrichment_background: quantified # ORA universe: quantified (tested proteins) | genome
-run_perseverance:     "__auto__"  # "__auto__" (asks at runtime), true/false
+run_perseverance:     "__auto__"  # "__auto__" (asks at runtime), true/false (gProfiler only)
+perseverance_reference_organism: null  # gProfiler code of the reference FASTA (e.g. athaliana)
+run_gsea:             false
+gsea_organism:        human       # human (Enrichr) | mouse (MSigDB)
+gsea_gene_sets:       null        # null = defaults; or .gmt files / "msigdb:<collection>"
+export_matrices:      true        # matrices/ for Mfuzz, MOFA+/MEFISTO, multi-omics
 
 qc_only:              false
 make_wgcna:           false

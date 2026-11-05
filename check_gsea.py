@@ -66,7 +66,8 @@ if os.path.isfile(dp):
         dsrc = f.read()
     checks = {
         "import gsea_enrichment": "from gsea_enrichment import run_gsea" in dsrc,
-        "condition run_gsea":     'go_params.get("run_gsea")' in dsrc,
+        "condition run_gsea":     ('go_params.get("run_gsea")' in dsrc
+                                   or '(go_params or {}).get("run_gsea")' in dsrc),
         "appel run_gsea(":        "run_gsea(" in dsrc,
         "export_gsea_sheets(":    "export_gsea_sheets(" in dsrc,
     }
