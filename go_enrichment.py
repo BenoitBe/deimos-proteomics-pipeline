@@ -178,15 +178,23 @@ def ask_go_params() -> dict | None:
     print("\n  --- GSEA (rank-based, optional) ---")
     print("  Complements ORA: ranks ALL proteins by -log10(p) x sign(LFC) and")
     print("  detects coordinated pathway shifts (even below the DEP threshold).")
-    print("  [!] Requires 'gseapy' installed and internet access to Enrichr.")
-    print("  [!] Gene sets are human-centric (Enrichr): most informative for")
-    print("      human/mouse data mapped by gene symbol.")
+    print("  [!] Requires 'gseapy' installed and internet access (Enrichr / MSigDB),")
+    print("      or local .gmt files (config key gsea_gene_sets).")
+    print("  [!] Proteins are matched to the gene sets by gene symbol (Genes column):")
+    print("      mammals and species named after human/mouse genes.")
     if params.get("backend") == "string":
-        print("  [!] Independent of the STRING backend: for bacteria or other")
-        print("      non-model species, Enrichr libraries do not apply — answer N.")
+        print("  [!] Independent of the STRING backend: for bacteria or plants,")
+        print("      these gene sets do not apply — answer N.")
     rep_gsea = input("  Also run GSEA? (y/N) -> ").strip().lower()
     if rep_gsea in ("o", "oui", "y", "yes"):
         params["run_gsea"] = True
+        print("  Gene sets:")
+        print("     [1] human — Enrichr: GO 2021, KEGG 2021, Reactome 2022 (default)")
+        print("     [2] mouse — MSigDB mouse: hallmarks, Reactome, WikiPathways, GO")
+        rep_org = input("  Gene sets [1/2] (default 1) -> ").strip().lower()
+        params["gsea_organism"] = ("mouse" if rep_org in ("2", "mouse", "m", "souris",
+                                                          "mmusculus", "mus musculus")
+                                   else "human")
 
     return params
 
@@ -788,6 +796,37 @@ def _diamond_available() -> bool:
             or os.path.exists("diamond.exe") or os.path.exists("diamond"))
 
 
+# Part minimale des accessions indexées dans STRING pour rester en mode direct.
+# En dessous, une partie des protéines (souvent la majorité) n'atteindrait pas
+# l'enrichissement : on passe par l'orthologie RBH vers le protéome STRING de la
+# MÊME espèce (identités ~100 %), qui relie les protéines par leur séquence.
+STRING_DIRECT_MIN_COVERAGE = 0.60
+
+
+def _prefer_string_orthology(coverage, taxid, name=None) -> bool:
+    """True si la couverture directe STRING est trop faible et que DIAMOND est
+    disponible : le mode orthologie (même espèce) remplace alors le mode direct.
+    Sans DIAMOND : mode direct conservé, avec un avertissement."""
+    try:
+        cov = float(coverage)
+    except (TypeError, ValueError):
+        return False
+    if cov >= STRING_DIRECT_MIN_COVERAGE:
+        return False
+    lbl = f"{name} (taxid {taxid})" if name else f"taxid {taxid}"
+    if _diamond_available():
+        print(f"  [PLAN] Only {cov:.0%} of the accessions are indexed in STRING for {lbl} "
+              f"(< {STRING_DIRECT_MIN_COVERAGE:.0%}): orthology (RBH DIAMOND) to the STRING "
+              f"proteome of the same species after the statistics, so that all proteins "
+              f"reach the enrichment.")
+        return True
+    print(f"  [WARN] Only {cov:.0%} of the accessions are indexed in STRING for {lbl}: "
+          f"the enrichment will only see that share of the proteins. Install DIAMOND "
+          f"(diamond.exe next to deimos.py, or in the PATH) to map all of them by "
+          f"sequence to the STRING proteome of the same species.")
+    return False
+
+
 def plan_string_mapping(protein_ids: list, species_taxid,
                         caller_identity: str = DEFAULT_STRING_CALLER,
                         gene_names=None, reference_taxid=None,
@@ -816,6 +855,8 @@ def plan_string_mapping(protein_ids: list, species_taxid,
         diag = diagnose_string_coverage(protein_ids, T, caller_identity)
         print(f"  [DIAG] {diag['recommendation']}")
         if diag.get("reliable"):
+            if _prefer_string_orthology(diag.get("coverage"), T):
+                return {**out, "mode": "ortholog", "taxid": T}
             return {**out, "mode": "direct", "taxid": T}
         if diag.get("unreachable"):
             print("  [WARN] STRING injoignable — taxid conservé, non vérifié.")
@@ -828,7 +869,10 @@ def plan_string_mapping(protein_ids: list, species_taxid,
         if det["reliable"]:
             print(f"  [AUTO] go_species_taxid = {det['taxid']}"
                   + (f" ({det['name']})" if det["name"] else ""))
-            return {**out, "mode": "direct", "taxid": det["taxid"], "name": det["name"],
+            mode = ("ortholog" if _prefer_string_orthology(det.get("share"), det["taxid"],
+                                                           det.get("name"))
+                    else "direct")
+            return {**out, "mode": mode, "taxid": det["taxid"], "name": det["name"],
                     "strain_taxid": det.get("strain_taxid"), "strain_name": det["name"]}
         if det.get("unreachable") and det.get("taxid"):
             print(f"  [AUTO] go_species_taxid = {det['taxid']} (non vérifié dans STRING).")

@@ -75,7 +75,15 @@ _DEFAULTS = {
     "perseverance_fasta_b": None,
     "perseverance_min_identity": 25.0,
     "perseverance_min_coverage": 50.0,
+    "export_matrices":     True,     # matrices/ : log2 NA, imputée, DPC (Mfuzz, MOFA+...)
     "run_gsea":            False,    # GSEA rank-based (optionnel, complément ORA)
+    "gsea_organism":       "human",  # jeux de gènes : human (Enrichr) | mouse (MSigDB souris)
+    "gsea_gene_sets":      None,     # None = défaut de l'organisme ; liste de .gmt locaux,
+                                     # "msigdb:<collection>" ou noms Enrichr
+    "gsea_msigdb_version": None,     # None = 2025.1.Hs / 2025.1.Mm
+    "gsea_rank_p":         "pvalue", # classement sur la p brute | volcano (ancien : p du volcano)
+    "gsea_fdr":            0.25,
+    "gsea_permutations":   1000,
     "qc_only":             False,   # True = données brutes + M&M + figures QC seulement (auto si aucun réplicat)
     "make_wgcna":          False,
     "make_dashboard":      True,
@@ -196,11 +204,31 @@ def _validate(params: dict) -> list[str]:
     if str(params.get("primary_statistic", "dpc")).lower() not in ("dpc", "imputation"):
         errors.append(f"  primary_statistic doit être 'dpc' ou 'imputation' "
                       f"(valeur : {params.get('primary_statistic')!r})")
-    for k in ("dpc_sensitivity", "differential_detection"):
+    for k in ("dpc_sensitivity", "differential_detection", "export_matrices"):
         if not isinstance(params.get(k, True), bool):
             errors.append(f"  {k} doit être true ou false (valeur : {params.get(k)!r})")
     if str(params.get("dpc_level", "auto")).lower() not in ("auto", "precursor", "protein"):
         errors.append(f"  dpc_level doit être 'auto', 'precursor' ou 'protein'")
+    if str(params.get("gsea_organism", "human")).lower() not in ("human", "mouse"):
+        errors.append(f"  gsea_organism doit être 'human' ou 'mouse' "
+                      f"(valeur : {params.get('gsea_organism')!r})")
+    if str(params.get("gsea_rank_p", "pvalue")).lower() not in ("pvalue", "volcano"):
+        errors.append(f"  gsea_rank_p doit être 'pvalue' ou 'volcano'")
+    _gs = params.get("gsea_gene_sets")
+    if _gs is not None and not (isinstance(_gs, str) or (
+            isinstance(_gs, list) and all(isinstance(x, str) for x in _gs))):
+        errors.append(f"  gsea_gene_sets : liste de .gmt, 'msigdb:<collection>' ou "
+                      f"noms Enrichr attendue (valeur : {_gs!r})")
+    try:
+        if not 0 < float(params.get("gsea_fdr", 0.25)) <= 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append(f"  gsea_fdr doit être dans ]0, 1]")
+    try:
+        if int(params.get("gsea_permutations", 1000)) < 100:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append(f"  gsea_permutations doit être un entier >= 100")
     from pathfinder_bridge import validate_pathfinder_params
     errors += validate_pathfinder_params(params)
     return errors
@@ -320,6 +348,14 @@ def print_config_summary(params: dict) -> None:
              "kept as secondary" if _ps == "dpc" else "imputation + limma/DEqMS"))
     print(f"     Imputation          -> {imp_txt}")
     print(f"     GO enrichment       -> {go_txt}")
+    if params.get("run_gsea"):
+        _gorg = str(params.get("gsea_organism") or "human").lower()
+        _gsets = params.get("gsea_gene_sets")
+        _rk = ("raw p" if str(params.get("gsea_rank_p", "pvalue")).lower() == "pvalue"
+               else "volcano p")
+        print(f"     GSEA                -> {_gorg} gene sets"
+              + (f" ({len(_gsets) if isinstance(_gsets, list) else 1} custom source(s))"
+                 if _gsets else " (defaults)") + f", ranked on {_rk}")
     if params.get("qc_only"):
         print(f"     Mode                -> QC ONLY (raw data + M&M + QC figures)")
     print(f"     WGCNA               -> {wgcna_txt}")
@@ -535,6 +571,8 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if go_result:
             params["go_organism"] = go_result.get("organism")
             params["run_gsea"] = bool(go_result.get("run_gsea", False))
+            if go_result.get("gsea_organism"):
+                params["gsea_organism"] = go_result["gsea_organism"]
             params["go_backend"] = go_result.get("backend", "gprofiler")
             params["go_species_taxid"] = go_result.get("species_taxid")
             params["string_caller_identity"] = (go_result.get("caller_identity")
@@ -643,6 +681,14 @@ go_backend:          gprofiler     # 'gprofiler' ou 'string' (bactéries / non-m
 go_species_taxid:    auto          # si go_backend = string : auto, ou taxid de SOUCHE (ex: 511145 = E. coli K-12 MG1655)
 enrichment_background: quantified  # univers de l'ORA : 'quantified' (protéines testées) ou 'genome'
 string_background:   null          # null = suit enrichment_background ; 'genome' ou 'quantified' pour forcer STRING
+export_matrices:     true          # dossier matrices/ : log2 avec NA, imputée, DPC (Mfuzz, MOFA+/MEFISTO, multi-omique)
+run_gsea:            false         # GSEA pré-classée (gseapy), complément de l'ORA
+gsea_organism:       human         # human (Enrichr) | mouse (MSigDB souris : MH, M2 Reactome/WikiPathways, M5 GO)
+gsea_gene_sets:      null          # null = défaut de l'organisme ; ou liste : fichiers .gmt locaux, "msigdb:m5.go.bp", noms Enrichr
+gsea_msigdb_version: null          # null = 2025.1.Hs / 2025.1.Mm
+gsea_rank_p:         pvalue        # classement -log10(p brute) x signe(LFC) ; 'volcano' = ancienne règle
+gsea_fdr:            0.25
+gsea_permutations:   1000
 make_wgcna:          false
 make_dashboard:      true
 dpc_sensitivity:     true          # analyse différentielle sans imputation (ajoutée)

@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 
 # Gene sets Enrichr par défaut (couvrent GO + pathways, cohérent avec l'ORA).
-# Modifiable via go_params['gsea_gene_sets'] si besoin.
+# Jeux humains : défaut de gsea_organism: human (comportement d'origine).
 DEFAULT_GENE_SETS = [
     "GO_Biological_Process_2021",
     "GO_Molecular_Function_2021",
@@ -38,17 +38,118 @@ DEFAULT_GENE_SETS = [
     "Reactome_2022",
 ]
 
+# gsea_organism: mouse — collections MSigDB souris (symboles murins). Pas de KEGG
+# dans MSigDB souris : Reactome + WikiPathways pour les voies.
+DEFAULT_GENE_SETS_MOUSE = [
+    "msigdb:mh.all",
+    "msigdb:m2.cp.reactome",
+    "msigdb:m2.cp.wikipathways",
+    "msigdb:m5.go.bp",
+    "msigdb:m5.go.mf",
+    "msigdb:m5.go.cc",
+]
+DEFAULT_MSIGDB_VERSION = {"human": "2025.1.Hs", "mouse": "2025.1.Mm"}
+GSEA_ORGANISMS = ("human", "mouse")
+
+
+def gsea_settings(params, go_params=None) -> dict:
+    """Réglages GSEA lus dans la configuration (clés gsea_*), avec repli sur
+    go_params (ancien passage par go_params['gsea_gene_sets'])."""
+    gp = go_params or {}
+    org = str(params.get("gsea_organism") or gp.get("gsea_organism") or "human").lower()
+    if org not in GSEA_ORGANISMS:
+        org = "human"
+    sets = params.get("gsea_gene_sets") or gp.get("gsea_gene_sets")
+    if isinstance(sets, str):
+        sets = [sets]
+    if not sets:
+        sets = list(DEFAULT_GENE_SETS_MOUSE if org == "mouse" else DEFAULT_GENE_SETS)
+    return {
+        "organism": org,
+        "gene_sets": list(sets),
+        "msigdb_version": str(params.get("gsea_msigdb_version")
+                              or DEFAULT_MSIGDB_VERSION[org]),
+        "fdr": float(params.get("gsea_fdr", gp.get("gsea_fdr", 0.25))),
+        "permutations": int(params.get("gsea_permutations",
+                                       gp.get("gsea_permutations", 1000))),
+        "rank_p": str(params.get("gsea_rank_p", "pvalue")).lower(),
+    }
+
+
+def read_gmt(path: str) -> dict:
+    """Fichier GMT (nom <tab> description <tab> gènes...) -> {nom: [gènes]}."""
+    out = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            row = line.rstrip("\n\r").split("\t")
+            if len(row) >= 3 and row[0]:
+                out[row[0]] = [g for g in row[2:] if g]
+    return out
+
+
+def load_gene_sets(specs, organism: str = "human",
+                   msigdb_version: "str | None" = None, verbose: bool = True) -> dict:
+    """Charge les jeux de gènes UNE fois pour tous les contrastes.
+
+    specs : liste de
+      - chemins de fichiers .gmt locaux (version figée, sans réseau) ;
+      - "msigdb:<collection>" (ex. msigdb:m5.go.bp, msigdb:mh.all), version
+        msigdb_version (ex. 2025.1.Mm) ;
+      - noms de bibliothèques Enrichr (ex. GO_Biological_Process_2021).
+    Retourne {"<source>__<terme>": [SYMBOLES EN MAJUSCULES]} : même convention de
+    nommage que gseapy avec plusieurs bibliothèques ; symboles en majuscules comme
+    le classement (_ranking_metric), donc Actb (souris) = ACTB (humain).
+    Une source introuvable est signalée et ignorée."""
+    import gseapy
+    version = msigdb_version or DEFAULT_MSIGDB_VERSION.get(organism, "2025.1.Hs")
+    sets = {}
+    for spec in specs:
+        spec = str(spec).strip()
+        try:
+            if os.path.isfile(spec):
+                src = os.path.splitext(os.path.basename(spec))[0]
+                lib = read_gmt(spec)
+            elif spec.lower().startswith("msigdb:"):
+                cat = spec.split(":", 1)[1]
+                src = cat
+                lib = gseapy.Msigdb.get_gmt(category=cat, dbver=version)
+                if not lib:
+                    raise ValueError(f"MSigDB {cat} v{version} not found")
+            else:
+                src = spec
+                lib = gseapy.get_library(name=spec, organism=organism.capitalize())
+        except Exception as e:                                        # noqa: BLE001
+            if verbose:
+                print(f"  [WARN] GSEA gene sets '{spec}' unavailable "
+                      f"({type(e).__name__}: {str(e)[:80]}) — skipped. Offline: give "
+                      f"a local .gmt file in gsea_gene_sets.")
+            continue
+        n0 = len(sets)
+        for term, genes in lib.items():
+            g = list(dict.fromkeys(str(x).strip().upper() for x in genes if str(x).strip()))
+            if g:
+                sets[f"{src}__{term}"] = g
+        if verbose:
+            print(f"     {src}: {len(sets) - n0} gene sets")
+    return sets
+
 
 def _ranking_metric(df_comparaison, contrast, params):
     """Construit le vecteur de ranking signé pour un contraste.
 
     Métrique = -log10(p) * sign(LFC), sur TOUTES les protéines (pas seulement
-    les DEP). Utilise le choix volcano (p.val ou p.adj) pour rester cohérent
-    avec le pipeline. Mapping accession -> symbole de gène via la colonne 'Genes'.
+    les DEP). Mapping accession -> symbole de gène via la colonne 'Genes'.
+    p : p brute par défaut (gsea_rank_p: pvalue). La p.adj BH forme des paliers
+    (beaucoup de protéines à la même valeur) qui écrasent l'ordre du milieu du
+    classement, là où la GSEA détecte les effets coordonnés ; gsea_rank_p: volcano
+    reprend l'ancien comportement (p.adj si volcano_use_padj).
 
     Retourne une pd.Series {gene_symbol: score} triée décroissante, ou None.
     """
-    suffixe_p = "_p.adj" if params.get("volcano_use_padj") else "_p.val"
+    if str(params.get("gsea_rank_p", "pvalue")).lower() == "volcano":
+        suffixe_p = "_p.adj" if params.get("volcano_use_padj") else "_p.val"
+    else:
+        suffixe_p = "_p.val"
     col_p    = f"{contrast}{suffixe_p}"
     col_diff = f"{contrast}_diff"
     if col_p not in df_comparaison.columns or col_diff not in df_comparaison.columns:
@@ -129,18 +230,37 @@ def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir):
               "(pip install gseapy).")
         return None
 
-    gene_sets = go_params.get("gsea_gene_sets", DEFAULT_GENE_SETS)
-    fdr_max   = go_params.get("gsea_fdr", 0.25)
-    n_perm    = go_params.get("gsea_permutations", 1000)
+    cfg       = gsea_settings(params, go_params)
+    fdr_max   = cfg["fdr"]
+    n_perm    = cfg["permutations"]
+    p_lbl = ("p.adj" if cfg["rank_p"] == "volcano" and params.get("volcano_use_padj")
+             else "p.value")
 
-    print(f"\n[GSEA] Pre-ranked GSEA — metric: -log10(p) x sign(LFC)")
+    print(f"\n[GSEA] Pre-ranked GSEA — metric: -log10({p_lbl}) x sign(LFC) — "
+          f"{cfg['organism']} gene sets"
+          + (f" (MSigDB {cfg['msigdb_version']})"
+             if any(str(s).lower().startswith("msigdb:") for s in cfg["gene_sets"]) else ""))
+    gene_sets = load_gene_sets(cfg["gene_sets"], cfg["organism"], cfg["msigdb_version"])
+    if not gene_sets:
+        print("  [WARN] GSEA skipped: no gene set could be loaded.")
+        return None
+    universe = {g for v in gene_sets.values() for g in v}
     results = {}
+    coverage_done = False
     for contrast in contrast_names:
         try:
             rnk = _ranking_metric(df_comparaison, contrast, params)
             if rnk is None:
                 print(f"  [SKIP] {contrast}: not enough ranked genes.")
                 continue
+            if not coverage_done:
+                n_in = int(rnk.index.isin(list(universe)).sum())
+                print(f"  [GSEA] {n_in}/{len(rnk)} ranked genes found in the gene sets "
+                      f"({100 * n_in / len(rnk):.0f} %)"
+                      + ("  [WARN] low (expected only for a small custom collection): "
+                         "check the Genes column / gsea_organism"
+                         if n_in < 0.4 * len(rnk) else ""))
+                coverage_done = True
 
             print(f"  [GSEA] {contrast}: {len(rnk)} ranked genes -> prerank...")
             pre = gseapy.prerank(

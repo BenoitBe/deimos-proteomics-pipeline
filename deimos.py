@@ -3506,9 +3506,6 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     put_section("2. DATA PREPROCESSING")
     put_header()
     put_kv("Source", "DIA-NN pg_matrix", "LFQ intensities (label-free quantification)")
-    if params.get("id_mapping_summary"):
-        put_kv("Identifier mapping", "id_mapping (pg + pr_matrix)",
-               params["id_mapping_summary"])
     put_kv("Contaminants", "cRAP removal", "Filter on Protein.Group / Protein.Names")
     put_kv("Transformation", "log2", "log2(intensity), zeros -> NA")
     put_kv("Filtering", ">= (n_rep - 1) values",
@@ -3727,6 +3724,12 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
            "where they are most abundant, as in the score plot (one contrast: volcano rule). "
            f"Driving proteins: the {int(params.get('pca_n_drivers', 20) or 0)} most extreme "
            "loadings, split between PC1+, PC1-, PC2+ and PC2- (column 'driver')")
+    if params.get("export_matrices", True):
+        put_kv("Matrices (other analyses)", "folder matrices/ (TSV)",
+               "Protein x sample matrices for Mfuzz, MOFA+/MEFISTO or multi-omics "
+               "integration: log2 with NA (no imputation), log2 imputed, DPC abundances "
+               "with standard errors and observed flags, DPC condition means, sample "
+               "table; no normalisation beyond DIA-NN (see README_matrices.txt)")
     put_kv("UMAP", "n_neighbors=5, min_dist=0.1",
            "Non-linear projection, seed=42 (reproducible)")
     put_kv("Correlation", "Pearson between samples",
@@ -4806,16 +4809,6 @@ def main():
     make_dash   = params["make_dashboard"]
     use_deqms   = params["use_deqms"]
 
-    # --- 0. Conversion des identifiants (optionnelle, clé YAML id_mapping) ---
-    # Remplace les identifiants du Protein.Group dans pg ET pr_matrix via une table
-    # de correspondance (ex. UPI UniParc -> locus tags reconnus par STRING), sans
-    # relancer DIA-NN. Matrices converties dans <out_dir>/id_mapping/ ; seules les
-    # variables locales changent : params["tsv_path"] reste le fichier d'origine
-    # (labels des runs, dossier des FASTA, last_config.yaml). Idempotent.
-    if params.get("id_mapping"):
-        from id_remap import apply_id_mapping
-        tsv_path, pr_path = apply_id_mapping(params, tsv_path, pr_path, out_dir)
-
     # go_params : dict {"organism": "bnapus"} attendu par run_go_enrichment, ou None.
     # Mode Perseverance (annotation par orthologie) : independant de gProfiler/go_organism,
     # active des que perseverance_annotation_path est fourni.
@@ -5296,6 +5289,152 @@ def condition_means(expr: np.ndarray, conditions) -> dict:
     return out
 
 
+MATRICES_README = """\
+Deimos — protein x sample matrices for other analyses
+======================================================
+Time courses / clustering (Mfuzz), factor models (MOFA+, MEFISTO), integration
+with transcriptomics / methylation (MOFA+, DIABLO / mixOmics, ...).
+
+Normalisation
+  Intensities = DIA-NN protein-group quantities (MaxLFQ), with DIA-NN's
+  RT-dependent cross-run normalisation. Deimos adds no further normalisation:
+  log2, 0 -> NA, cRAP contaminants removed. Residual normalisation check: RLE
+  plot in the QC sheet of the workbook.
+  Proteins kept: {filter_rule} ({n_prot} proteins, {n_samp} samples).
+
+Files (rows = proteins, same order in every file; first columns = annotation:
+protein (unique ID), Protein.Group, Genes, Description; then one column per
+sample, in the order of samples.tsv)
+  log2_filtered_NA.tsv    log2, missing values kept as NA (no imputation).
+                          -> MOFA+ / MEFISTO: they model missing values; an
+                             imputed value would be read as a measurement.
+  log2_imputed.tsv        same matrix, imputed ({imp_method}, seed {seed}) — as
+                          the Log2_Impute sheet; used by Deimos for PCA, ANOVA,
+                          heatmaps, WGCNA.
+                          -> methods that need a complete matrix (Mfuzz, WGCNA...).
+                             Imputed low values (MNAR) pull profiles down: keep
+                             proteins with few NA (num_NA column of
+                             log2_filtered_NA) or use the DPC matrix.
+{dpc_block}  samples.tsv             sample metadata (label, condition, replicate...).
+                          Add the numeric covariates (time, stage) needed by
+                          MEFISTO; the label column must match the sample IDs of
+                          the other omics.
+
+Integration with other omics
+  - same sample IDs in every view; same biological samples (or same conditions
+    if the integration is done on condition means);
+  - feature names unique across views: prefix them (e.g. "prot_" + protein);
+  - one value per gene is not required: protein groups are features of their own
+    (Genes column to match with transcripts);
+  - remove known batch effects before integration, and select variable features
+    so that the views stay balanced (e.g. same order of magnitude of features).
+
+R
+  x  <- read.delim("log2_filtered_NA.tsv", check.names = FALSE)
+  s  <- read.delim("samples.tsv", check.names = FALSE)
+  M  <- as.matrix(x[, s$label]); rownames(M) <- x$protein
+"""
+
+_DPC_README_BLOCK = """\
+  dpc_abundance.tsv       protein abundances estimated from the precursors under
+                          the detection probability curve (limpa method, the
+                          primary statistic of the differential analysis):
+                          complete matrix, no random draw; an unobserved value is
+                          the posterior estimate, not a measurement. Scale of the
+                          precursor intensities (not MaxLFQ): use it for profiles
+                          across samples, not to compare abundances between
+                          proteins with the LFQ values.
+  dpc_standard_error.tsv  standard error of each value (precision weights).
+  dpc_observed.tsv        1 = at least one precursor observed in the sample,
+                          0 = estimated without observation. To give MOFA+ the DPC
+                          values without the unobserved ones, set them to NA.
+  condition_means_dpc.tsv mean DPC abundance per condition (column order of
+                          samples.tsv) -> Mfuzz on condition means.
+"""
+
+
+def export_matrices(out_dir: str, mat_filt: pd.DataFrame, mat_imp: pd.DataFrame,
+                    meta: pd.DataFrame, design: pd.DataFrame,
+                    dpc_primary: "dict | None" = None, params: "dict | None" = None
+                    ) -> "str | None":
+    """Écrit dans <out_dir>/matrices/ les matrices protéines × échantillons pour
+    d'autres analyses que les contrastes (Mfuzz, MOFA+/MEFISTO, intégration
+    multi-omique) : log2 filtrée avec NA, log2 imputée, abondances DPC (+ erreurs
+    standard, observé oui/non, moyennes par condition), métadonnées des
+    échantillons et README. Mêmes lignes, même ordre dans tous les fichiers.
+    Ne lève jamais (retourne None en cas d'échec)."""
+    params = params or {}
+    try:
+        d = os.path.join(out_dir, "matrices")
+        _makedirs(d)
+        samples = [str(c) for c in mat_filt.columns]
+        n = len(mat_filt)
+        meta = meta.reset_index(drop=True)
+
+        def _col(c):
+            return (meta[c].fillna("").astype(str).to_numpy()
+                    if c in meta.columns and len(meta) == n else np.full(n, "", dtype=object))
+        pid = _col("name")
+        pid = np.where(pid == "", _col("Protein.Group"), pid)
+        pid = np.where(pid == "", [f"protein_{i + 1}" for i in range(n)], pid)
+        s = pd.Series(pid)
+        dup = s.duplicated(keep=False)
+        if dup.any():                       # identifiants uniques (MOFA, rownames R)
+            s[dup] = s[dup] + "_" + (s[dup].groupby(s[dup]).cumcount() + 1).astype(str)
+        ann = pd.DataFrame({"protein": s.to_numpy(), "Protein.Group": _col("Protein.Group"),
+                            "Genes": _col("Genes"),
+                            "Description": _col("First.Protein.Description")})
+
+        def _write(name, M, digits=4, extra=None):
+            body = (pd.DataFrame(np.asarray(M, int), columns=samples) if digits == 0
+                    else pd.DataFrame(np.round(np.asarray(M, float), digits), columns=samples))
+            parts = [ann] + ([extra] if extra is not None else []) + [body]
+            pd.concat(parts, axis=1).to_csv(os.path.join(d, name), sep="\t",
+                                            index=False, na_rep="NA")
+
+        des = design.copy()                 # métadonnées dans l'ordre des colonnes
+        des["label"] = des["label"].astype(str)
+        des = des.set_index("label").reindex(samples).reset_index()
+        na = mat_filt.isna().to_numpy()
+        _write("log2_filtered_NA.tsv", mat_filt.to_numpy(),
+               extra=pd.DataFrame({"num_NA": na.sum(axis=1)}))
+        files = ["log2_filtered_NA.tsv"]
+        if mat_imp is not None:
+            _write("log2_imputed.tsv", mat_imp.to_numpy())
+            files.append("log2_imputed.tsv")
+        dpc_block = ""
+        if dpc_primary is not None and dpc_primary.get("E") is not None:
+            E = np.asarray(dpc_primary["E"], float)
+            if E.shape == mat_filt.shape:
+                _write("dpc_abundance.tsv", E)
+                _write("dpc_standard_error.tsv", dpc_primary["SE"])
+                obs = (~np.asarray(dpc_primary["imputed"], bool)).astype(int)
+                _write("dpc_observed.tsv", obs, digits=0)
+                conds = list(dict.fromkeys(des["condition"].astype(str)))
+                cv = des["condition"].astype(str).to_numpy()
+                means = pd.DataFrame({c: np.round(E[:, cv == c].mean(axis=1), 4)
+                                      for c in conds})
+                pd.concat([ann, means], axis=1).to_csv(
+                    os.path.join(d, "condition_means_dpc.tsv"), sep="\t", index=False,
+                    na_rep="NA")
+                files += ["dpc_abundance.tsv", "dpc_standard_error.tsv",
+                          "dpc_observed.tsv", "condition_means_dpc.tsv"]
+                dpc_block = _DPC_README_BLOCK
+        des.to_csv(os.path.join(d, "samples.tsv"), sep="\t", index=False, na_rep="NA")
+        files.append("samples.tsv")
+        with open(os.path.join(d, "README_matrices.txt"), "w", encoding="utf-8") as fh:
+            fh.write(MATRICES_README.format(
+                filter_rule="detected in all but one replicate of at least one condition",
+                n_prot=n, n_samp=len(samples),
+                imp_method=str(params.get("impute_method", "")).upper() or "see Methods",
+                seed=params.get("seed", 42), dpc_block=dpc_block))
+        print(f"  [OK] Matrices for other analyses: {d} ({', '.join(files)})")
+        return d
+    except Exception as e:                                            # noqa: BLE001
+        print(f"  [WARN] Matrices export skipped ({type(e).__name__}: {e})")
+        return None
+
+
 def apply_dpc_primary(df_results: pd.DataFrame, primary: dict,
                       contrast_names: list) -> pd.DataFrame:
     """Met la statistique DPC dans les colonnes principales lues par tout l'aval
@@ -5677,6 +5816,12 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
             pass
         ws.add_image(XLImage(str(path)), anchor)
 
+    # --- Matrices protéines × échantillons pour d'autres analyses (Mfuzz,
+    #     MOFA+/MEFISTO, intégration multi-omique) : dossier matrices/ ---
+    if params.get("export_matrices", True):
+        export_matrices(out_dir, mat_filt, mat_imp, meta_filt, design_filt,
+                        dpc_primary=dpc_primary, params=params)
+
     export_excel(
         tsv=tsv, df_results=df_results, df_anova=df_anova,
         df_intersections=df_intersections, mat_zscore=mat_zscore,
@@ -5726,6 +5871,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         correspondence_df, persev_override = run_string_ortholog_step(
             df_results, params, local_go_params, out_dir)
         _orth_sheet = "Orthologues_STRING"
+    elif local_go_params and local_go_params.get("backend") == "string":
+        # Backend STRING (mode direct) : Perseverance appartient à la voie gProfiler
+        # (orthologues vers une espèce de référence). Ses identifiants (UniProt
+        # d'une autre espèce) seraient pris pour des identifiants STRING.
+        if params.get("run_perseverance") not in (False, None, "__auto__"):
+            print("\n  [INFO] run_perseverance ignored: GO backend = STRING (mapping to "
+                  "STRING is handled by the STRING step).")
+        correspondence_df, persev_override = None, None
+        _orth_sheet = "Orthologues_Perseverance"
     else:
         correspondence_df, persev_override = run_perseverance_step(df_results, params, out_dir)
         _orth_sheet = "Orthologues_Perseverance"
