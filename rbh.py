@@ -13,6 +13,7 @@ proches — cf. le cas AT2G_KINASE1/AT4G_KINASE2 dans les données de test).
 """
 from __future__ import annotations
 import subprocess
+import time
 import os
 import pandas as pd
 
@@ -34,25 +35,43 @@ BLAST_COLUMNS = ["qseqid", "sseqid", "pident", "length", "mismatch",
                  "evalue", "bitscore", "qlen", "slen"]
 
 
-def _run(cmd: list, description: str) -> None:
+def _run(cmd: list, description: str, verbose: bool = False) -> None:
+    """DIAMOND tourne en silence (--quiet, sortie capturée) : en mode verbeux, une
+    ligne avant et après chaque étape, avec la durée, pour qu'un run long ne
+    ressemble pas à un blocage."""
+    t0 = time.time()
+    if verbose:
+        print(f"    [DIAMOND] {description}...", flush=True)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"[ERREUR] {description} a échoué :\n{result.stderr}")
+    if verbose:
+        print(f"    [DIAMOND]   ok ({time.time() - t0:.0f} s)", flush=True)
 
 
-def build_diamond_db(fasta_path: str, db_path: str) -> None:
+def _n_seqs(fasta_path: str) -> int:
+    try:
+        with open(fasta_path, encoding="utf-8", errors="replace") as fh:
+            return sum(1 for line in fh if line.startswith(">"))
+    except OSError:
+        return 0
+
+
+def build_diamond_db(fasta_path: str, db_path: str, verbose: bool = False) -> None:
     _run(["diamond", "makedb", "--in", fasta_path, "-d", db_path],
-         f"Construction de la base DIAMOND ({fasta_path})")
+         f"Construction de la base DIAMOND ({os.path.basename(fasta_path)})", verbose)
 
 
 def run_blastp(query_fasta: str, db_path: str, out_tsv: str,
-               evalue: float = 1e-5, threads: int = 4) -> pd.DataFrame:
+               evalue: float = 1e-5, threads: int = 4,
+               verbose: bool = False) -> pd.DataFrame:
     _run(["diamond", "blastp",
           "--query", query_fasta, "--db", db_path,
           "--out", out_tsv, "--outfmt", "6"] + BLAST_COLUMNS +
          ["--evalue", str(evalue), "--max-target-seqs", "1",
           "--threads", str(threads), "--quiet"],
-         f"Recherche DIAMOND blastp ({query_fasta} vs {db_path})")
+         f"blastp {os.path.basename(query_fasta)} ({_n_seqs(query_fasta)} séquences) -> "
+         f"{os.path.basename(db_path)}, {threads} threads", verbose)
     if os.path.getsize(out_tsv) == 0:
         return pd.DataFrame(columns=BLAST_COLUMNS)
     return pd.read_csv(out_tsv, sep="\t", names=BLAST_COLUMNS)
@@ -68,7 +87,8 @@ def _best_hit_per_query(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_rbh(query_fasta: str, reference_fasta: str, workdir: str,
                 evalue: float = 1e-5, min_identity: float = 25.0,
-                min_coverage: float = 50.0, threads: int = 4) -> pd.DataFrame:
+                min_coverage: float = 50.0, threads: int = 4,
+                verbose: bool = False) -> pd.DataFrame:
     """
     Pipeline RBH complet.
 
@@ -89,13 +109,17 @@ def compute_rbh(query_fasta: str, reference_fasta: str, workdir: str,
     os.makedirs(workdir, exist_ok=True)
     db_query = os.path.join(workdir, "query_db")
     db_ref = os.path.join(workdir, "reference_db")
-    build_diamond_db(query_fasta, db_query)
-    build_diamond_db(reference_fasta, db_ref)
+    if verbose:
+        print(f"    [DIAMOND] RBH : {_n_seqs(query_fasta)} séquences de la recherche <-> "
+              f"{_n_seqs(reference_fasta)} séquences de référence (4 étapes ; fichiers dans "
+              f"{workdir})", flush=True)
+    build_diamond_db(query_fasta, db_query, verbose)
+    build_diamond_db(reference_fasta, db_ref, verbose)
 
     fwd = run_blastp(query_fasta, db_ref,
-                     os.path.join(workdir, "fwd.tsv"), evalue, threads)
+                     os.path.join(workdir, "fwd.tsv"), evalue, threads, verbose)
     rev = run_blastp(reference_fasta, db_query,
-                     os.path.join(workdir, "rev.tsv"), evalue, threads)
+                     os.path.join(workdir, "rev.tsv"), evalue, threads, verbose)
 
     fwd_best = _best_hit_per_query(fwd)
     rev_best = _best_hit_per_query(rev)

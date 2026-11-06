@@ -67,6 +67,8 @@ _DEFAULTS = {
     "string_reference_fasta": None,  # protéome STRING local (sinon dossier des données, puis téléchargement)
     "string_categories":   None,    # None = GO:BP/MF/CC + KEGG + Reactome ; ex: [Process, KEGG, Keyword, Pfam]
     "perseverance_annotation_path": None,  # TSV Perseverance (protein_id, GO, KEGG, Pfam) -> ORA local, independant de go_organism
+    "perseverance_threads": None,          # threads DIAMOND (RBH) ; None = tous les cœurs - 1
+    "perseverance_go_terms_path": None,    # TSV GO, name, namespace (annotation_import.py --terms-out) -> termes nommés, BP/CC/MF
     "control_condition":   "__auto__",  # "__auto__"=detection par synonymes, str=explicite, False=desactive
     "control_synonyms":    None,     # None = liste par defaut (ctl, ctrl, control, wt, mock...)
     "run_perseverance":    "__auto__",  # "__auto__"=demande, True/False=explicite
@@ -100,6 +102,11 @@ _DEFAULTS = {
     "pathfinder_publications": False,  # True = axe Publications (STRING PMID, réseau)
     "pathfinder_options":  {},      # ex: {pthr: 0.05, jaccard: 0.5, no_umap: true}
     "pathfinder_timeout":  1800,    # secondes
+    # InSight (lecture biologique : figures + page récit, après Pathfinder, processus séparé)
+    "make_insight":        False,   # True = lancer InSight en toute fin de run
+    "insight_path":        None,    # clone InSight ; None = $INSIGHT_HOME puis ../InSight
+    "insight_options":     {},      # ex: {k: 6, max_volcanos: 4, categorical: false, title: "..."}
+    "insight_timeout":     900,     # secondes
     "use_deqms":           False,
     "deqms_min_r2":        0.10,   # R2 min variance~comptage (sous-ensemble count>1)
     "deqms_max_pseudocount_pct": 50.0,  # % max de proteines a count<=1 tolere
@@ -231,6 +238,8 @@ def _validate(params: dict) -> list[str]:
         errors.append(f"  gsea_permutations doit être un entier >= 100")
     from pathfinder_bridge import validate_pathfinder_params
     errors += validate_pathfinder_params(params)
+    from insight_bridge import validate_insight_params
+    errors += validate_insight_params(params)
     return errors
 
 
@@ -326,6 +335,7 @@ def print_config_summary(params: dict) -> None:
     pf_txt    = ("yes" + (" (+ Publications, online)" if params.get("pathfinder_publications")
                           else " (offline)")) if params.get("make_pathfinder") else "no"
     deqms_txt = "yes" if params.get("use_deqms") else "no"
+    ins_txt   = "yes" if params.get("make_insight") else "no"
 
     print("\n  [OK] Parameters:")
     print(f"     Volcanos/Robustness -> {v_stat} < {params['volcano_p_thresh']}"
@@ -364,6 +374,7 @@ def print_config_summary(params: dict) -> None:
           + ("(comparison with the imputed analysis)" if _ps == "dpc"
              else "(added to the imputed analysis)"))
     print(f"     Pathfinder          -> {pf_txt}")
+    print(f"     InSight             -> {ins_txt}")
     print(f"     DEqMS               -> {deqms_txt}")
 
 
@@ -424,6 +435,13 @@ def parse_cli_args() -> argparse.Namespace:
         action="store_true",
         help=("Lancer la synthèse Pathfinder en fin de run (make_pathfinder: true), "
               "dans un processus séparé ; sorties dans <out_dir>/pathfinder/."),
+    )
+    parser.add_argument(
+        "--insight",
+        action="store_true",
+        help=("Lancer InSight en toute fin de run (make_insight: true) : figures de "
+              "lecture biologique + page récit, processus séparé ; sorties dans "
+              "<out_dir>/insight/."),
     )
     parser.add_argument(
         "--batch-column",
@@ -517,6 +535,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.batch_column: params["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): params["qc_only"] = True
         if getattr(args, "pathfinder", False): params["make_pathfinder"] = True
+        if getattr(args, "insight", False): params["make_insight"] = True
 
         # Les flags optionnels liés à la présence de fichiers/modules
         # peuvent ne pas être dans la config — on les complète
@@ -547,6 +566,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.batch_column: reloaded["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): reloaded["qc_only"] = True
         if getattr(args, "pathfinder", False): reloaded["make_pathfinder"] = True
+        if getattr(args, "insight", False): reloaded["make_insight"] = True
         return reloaded
 
     # ── C. Questions interactives ──────────────────────────────────────────────
@@ -604,6 +624,18 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
             rep = input(f"\n  Run the Pathfinder multi-contrast synthesis at the end?\n"
                         f"  ({_pf}) (y/N) -> ").strip().lower()
             params["make_pathfinder"] = rep in ("o", "oui", "y", "yes")
+
+    # InSight — question posée seulement si un clone est trouvé
+    if getattr(args, "insight", False):
+        params["make_insight"] = True
+    else:
+        from insight_bridge import locate_insight
+        params["make_insight"] = False
+        _ins = locate_insight(params)
+        if _ins:
+            rep = input(f"\n  Run InSight (biological-reading figures + report) at the end?\n"
+                        f"  ({_ins}) (y/N) -> ").strip().lower()
+            params["make_insight"] = rep in ("o", "oui", "y", "yes")
 
     # DEqMS
     params["use_deqms"] = False
@@ -696,6 +728,8 @@ differential_detection: true       # protéines on/off : test de détection (ajo
 dpc_level:           auto          # auto (précurseurs si pr_matrix), precursor ou protein
 make_pathfinder:     false         # true = synthèse Pathfinder en fin de run (--pathfinder)
 pathfinder_path:     null          # clone Pathfinder ; null = $PATHFINDER_HOME puis ../Pathfinder
+make_insight:        false         # true = figures de lecture biologique InSight en fin de run (--insight)
+insight_path:        null          # clone InSight ; null = $INSIGHT_HOME puis ../InSight
 use_deqms:           false
 
 # ── Chemins (optionnel — surchargeables aussi via CLI) ───────────────────────

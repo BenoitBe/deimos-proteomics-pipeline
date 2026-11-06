@@ -102,6 +102,44 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **RBH progress** (Perseverance and STRING orthology): DIAMOND runs quietly, so Deimos now prints
+  each of the four steps (two databases, two blastp searches) with sequence counts, threads and
+  duration — a long reverse search no longer looks like a freeze. DIAMOND uses all cores minus one
+  by default (was 4); `perseverance_threads` sets it.
+
+- **Collaborator annotations** (`annotation_import.py`): converts an annotation delivered as a
+  table (Excel Trinotate / Blast2GO, CSV, TSV, topGO background `ID <tab> GO,GO`) into the
+  Perseverance / Deimos format (`protein_id, GO, KEGG, Pfam`) and a term table
+  (`GO, name, namespace`). GO found in any cell format, hits filtered on e-value (default
+  1e-5), species KEGG pathways mapped to generic maps, IDs normalised (Trinity / AUGUSTUS forms,
+  typos) and rewritten as in a reference FASTA; optional OBO: obsolete terms removed, alt_id
+  replaced, propagation (is_a + same-namespace part_of + logical definitions), names. Warns when
+  propagated and direct annotations are mixed without an OBO.
+- **Named local GO** (`perseverance_go_terms_path`): the local ORA (`perseverance_annotation_path`)
+  names the terms and splits them into GO:BP / GO:CC / GO:MF instead of GO IDs under a single
+  `GO:PERSEVERANCE` source. Unchanged without the key.
+- Local ORA: a protein group whose leader has no annotation takes the GO of its other annotated
+  members (RefSeq isoforms, raw Perseverance output); nothing is removed.
+
+- **Same proteins downstream** (manifest schema 1.2): the volcano rule is also written as
+  structured keys (`volcano_p_column`, `volcano_p_thresh`, `volcano_ratio_min`) next to the
+  `volcano_rule` text, so Pathfinder ≥ 1.2 and InSight select exactly the Deimos proteins
+  (`p < thr & |log2FC| >= log2(ratio)`, as in `volcano_status`). New
+  `pathfinder_options.min_ratio` (with `pthr`, an explicit override). The Methods row of the
+  Pathfinder step now states the rule the installed Pathfinder applies (volcano rule for ≥ 1.2,
+  `p.adj < pthr` without fold-change criterion for older versions).
+
+- **InSight step** (optional, very last, after Pathfinder): `make_insight: true` / `--insight`
+  runs the separate InSight module on the saved workbook and `matrices/` — response programmes,
+  functional themes, condition map, themed volcanos, spotlight proteins (PNG + SVG) and a
+  self-contained narrative report in `<out_dir>/insight/`. New `insight_bridge.py` (standard
+  library only, same contract as `pathfinder_bridge.py`: separate process, empty stdin, timeout
+  `insight_timeout`, full log, a failure never stops Deimos). Keys `make_insight`,
+  `insight_path` (then `$INSIGHT_HOME`, then `../InSight`), `insight_options`
+  (`k`, `max_volcanos`, `volcanos`, `categorical`, `order_regex`, `reference_fasta`, `title`,
+  validated), `insight_timeout`; interactive question only when a clone is found (default no);
+  Methods row "Biological reading"; skipped in QC-only mode. Nothing existing is changed.
+
 - **Identifier mapping** (`id_mapping`, module `id_remap.py`): converts the
   Protein.Group identifiers of the pg and pr matrices (e.g. UniParc UPI -> UniProt
   accession or locus tag) from the search FASTA (`AC=`, `GN=` fields) or a table, without

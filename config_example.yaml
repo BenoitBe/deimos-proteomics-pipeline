@@ -221,6 +221,12 @@ perseverance_min_coverage: 50.0   # % coverage for a Reciprocal Best Hit
 # If set, replaces the gProfiler call by a LOCAL enrichment test
 # (hypergeometric + BH, no network), independently of go_organism.
 perseverance_annotation_path: null  # e.g. "perseverance_annotation_protein_group.tsv"
+# Names and namespaces of the GO terms of that annotation (TSV GO, name, namespace, e.g.
+# written by annotation_import.py --terms-out): terms named and split into GO:BP / GO:CC /
+# GO:MF in the GO sheets, dashboard, Pathfinder and InSight (otherwise: GO IDs, one source).
+# Protein groups whose leader is not annotated take the annotation of another member.
+perseverance_go_terms_path: null    # e.g. "ostrea_go_terms.tsv"
+perseverance_threads:       null    # DIAMOND threads for the RBH; null = all cores minus one
 
 
 # ── Optional modules ──────────────────────────────────────────────────────────
@@ -246,8 +252,19 @@ dpc_level:               auto    # auto: from precursors when pr_path exists, el
 make_pathfinder:         false   # true = run Pathfinder after the Excel and the dashboard
 pathfinder_path:         null    # Pathfinder clone; null = $PATHFINDER_HOME, then ../Pathfinder
 pathfinder_publications: false   # true = Publications axis (STRING PMID, needs network)
-pathfinder_options:      {}      # e.g. {pthr: 0.05, jaccard: 0.5, no_umap: true}
+pathfinder_options:      {}      # e.g. {jaccard: 0.5, no_umap: true}; proteins follow the volcano
+                                 # rule above by default (pthr / min_ratio override it)
 pathfinder_timeout:      1800    # seconds
+
+# InSight — biological-reading figures + narrative report at the very end (also: --insight)
+# Separate process on the saved workbook and matrices/, after Pathfinder: no question, no
+# recomputation, never stops Deimos. Works for any design (time course or not).
+# Outputs in <out_dir>/insight/ (PNG + SVG figures, insight_report.html, insight_log.txt).
+make_insight:            false   # true = run InSight at the end
+insight_path:            null    # InSight clone; null = $INSIGHT_HOME, then ../InSight
+insight_options:         {}      # e.g. {k: 6, max_volcanos: 4, categorical: false,
+                                 #       volcanos: [A_vs_B], order_regex: 'T(\d+)', title: "My project"}
+insight_timeout:         900     # seconds
 
 
 # ── Input file paths ──────────────────────────────────────────────────────────

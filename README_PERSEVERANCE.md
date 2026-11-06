@@ -53,6 +53,30 @@ Sortie (`annotation_transferee.tsv`) : `protein_id, GO, KEGG, Pfam, source
 coverage` — directement utilisable comme annotation custom dans topGO,
 clusterProfiler, ou `go_enrichment.py`.
 
+### Annotation livrée par un collaborateur (Excel, background topGO)
+
+`annotation_import.py` convertit un tableau d'annotation (Excel Trinotate / Blast2GO, CSV,
+TSV, fichier « background » `ID <tab> GO,GO,...`) en table `--ref-annotations` :
+GO repérés dans n'importe quel format de cellule, lignes filtrées sur la e-value du hit
+(`--evalue-max`, défaut 1e-5), KEGG ramené aux cartes génériques (`hsa00270` → `map00270`),
+Pfam, identifiants normalisés (`TRINITY_scaffold1_g1_i1` ≈ `scaffold1.g1.t1`) puis réécrits
+comme dans le FASTA de référence (`--fasta`). Avec `--obo go-basic.obo` : termes obsolètes
+retirés, `alt_id` remplacés, propagation aux ancêtres (is_a, part_of de même espace) et noms
+de tous les termes. `--terms-out` écrit la table `GO, name, namespace` lue par Deimos
+(`perseverance_go_terms_path`).
+
+```bash
+python annotation_import.py --table Annotation.xlsx --table background.txt \
+    --fasta proteines_collaborateur.faa --obo go-basic.obo \
+    --out ref_annotation.tsv --terms-out go_terms.tsv
+python perseverance.py --query recherche.faa --reference proteines_collaborateur.faa \
+    --ref-annotations ref_annotation.tsv --out annotation.tsv --min-identity 90 --min-coverage 70
+```
+
+Même espèce, autre annotation : seuils RBH élevés (≥ 90 % d'identité). L'annotation doit
+porter sur les séquences du FASTA de référence : sans ce FASTA, aucun lien n'est possible
+avec les identifiants de la recherche DIA-NN.
+
 ### Combiner avec une annotation directe partielle
 
 Si gProfiler couvre déjà une partie de votre espèce, passez

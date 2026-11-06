@@ -109,7 +109,16 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     The same mode is used when fewer than 60 % of the accessions are indexed in STRING for the
     species (e.g. a recent UniProt proteome): the proteins are then mapped by sequence to the
     STRING proteome of the same species, so that all of them reach the enrichment. Perseverance
-    belongs to the gProfiler route and is not proposed with STRING
+    belongs to the gProfiler route and is not proposed with STRING. With RefSeq / NCBI accessions
+    (XP_…), which STRING cannot place, set `string_reference_taxid` to a related species indexed
+    in STRING: the orthology mode is then used directly
+  - **Your own annotation** (`perseverance_annotation_path`): local enrichment (hypergeometric +
+    BH, no network) on a `protein_id, GO` table. An annotation delivered by a collaborator (Excel
+    Trinotate/Blast2GO, topGO background file) is converted by `annotation_import.py` and, when it
+    is keyed on another gene model set, transferred to your search IDs with `perseverance.py`
+    (see `README_PERSEVERANCE.md`). `perseverance_go_terms_path` (table `GO, name, namespace`,
+    written by `annotation_import.py --terms-out`) names the terms and splits them into
+    GO:BP / GO:CC / GO:MF
   - **statistical universe = quantified proteins** by default (`enrichment_background:
     quantified`), for gProfiler (custom background restricted to annotated genes,
     `domain_scope='custom_annotated'`), STRING and the ANOVA-cluster enrichment: only
@@ -132,9 +141,15 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
   core protein signature across contrasts, Meta-GO, WGCNA cross-reading, PCA × design factors.
   Pathfinder runs in a separate process on the saved workbook (no recomputation, no question);
   a failure is logged in `pathfinder/pathfinder_log.txt` and never stops Deimos
+- **InSight biological reading** as an optional very last step (`make_insight: true` /
+  `--insight`): response programmes (proteins that move together), functional themes (terms
+  merged by shared proteins), condition map, themed volcanos and spotlight proteins, as PNG + SVG
+  and a self-contained narrative report. Any design: trajectories for time courses, labelled maps
+  and bar profiles when there is no order. Separate process, no recomputation, never stops Deimos
 - **Machine-readable manifest**: a hidden `_manifest` sheet (schema `deimos-results` 1.0) lists
   the contrasts, the GO sheet → contrast mapping, the organism, the p-value adjustment and the
-  volcano rule, so downstream tools read the workbook without guessing from sheet names
+  volcano rule (also as structured keys since schema 1.2), so downstream tools read the workbook
+  without guessing from sheet names and select the same proteins
 - Reusable YAML configuration
 
 ---
@@ -208,15 +223,26 @@ python deimos.py --config project.yaml --tsv /data/run2/report.pg_matrix.tsv --o
 python deimos.py --config project.yaml --batch-column batch
 python deimos.py --config project.yaml --qc-only
 python deimos.py --config project.yaml --pathfinder     # + Pathfinder synthesis at the end
+python deimos.py --config project.yaml --insight        # + InSight figures and report at the end
 ```
+
+**InSight** is looked for in `insight_path`, then `$INSIGHT_HOME`, then an `InSight` folder next
+to the Deimos folder. It runs after Pathfinder with the same Python interpreter and reads the saved
+workbook and `matrices/` (keep `export_matrices: true` for the abundance figures). Options go in
+`insight_options` (`k`, `max_volcanos`, `volcanos`, `categorical`, `order_regex`,
+`reference_fasta`, `title`); full output in `insight/insight_log.txt`. It is skipped in QC-only mode.
 
 **Pathfinder** is looked for in `pathfinder_path`, then `$PATHFINDER_HOME`, then a `Pathfinder`
 folder next to the Deimos folder (`git clone https://github.com/BenoitBe/Pathfinder` beside it).
 It runs with the same Python interpreter; its dependencies are already Deimos' (plus `requests`
-for the optional Publications axis). It is skipped in QC-only mode (no p-values). Its protein
-signature uses `p.adj < 0.05` without a fold-change criterion, deliberately stricter than the
-volcano thresholds: the two counts are not meant to agree, and both rules are written in its
-summary.
+for the optional Publications axis). It is skipped in QC-only mode (no p-values). Pathfinder ≥ 1.2
+and InSight select **the same proteins as Deimos**: they apply the volcano rule written in the
+`_manifest` (statistic, threshold and ratio; structured keys since schema 1.2), so their counts
+match the volcanos, UpSet and dashboard, and they read GO / pathway terms at q < 0.05 (gProfiler /
+STRING). `pathfinder_options: {pthr, min_ratio}` overrides the Pathfinder protein rule (the
+Methods sheet and its summary then say the counts differ). Pathfinder < 1.2 used `p.adj < 0.05`
+without a fold-change criterion; the Methods sheet states whichever rule the installed version
+applies.
 
 **Unattended runs** (scheduler, cluster, no terminal): some options still ask a question at
 runtime when left unset, and the run stops with `EOFError` if nobody can answer —
@@ -317,6 +343,7 @@ deimos-proteomics-pipeline/
 ├── gsea_enrichment.py            # Rank-based GSEA
 ├── dashboard_integration.py      # Excel -> dashboard bridge
 ├── pathfinder_bridge.py          # _manifest sheet + Pathfinder launch (separate process)
+├── insight_bridge.py             # InSight launch (separate process, after Pathfinder)
 ├── dpc_sensitivity.py            # DPC (limpa method): primary statistic, sensitivity, detection
 ├── build_dashboardv7.py          # HTML dashboard generator
 ├── dashboard_template.html       # Dashboard template (light/dark theme)
@@ -325,6 +352,7 @@ deimos-proteomics-pipeline/
 ├── check_gsea.py                 # GSEA integration diagnostic
 ├── diag_go.py                    # GO via orthologues: ID format, gProfiler coverage, backgrounds
 ├── perseverance.py               # Orthology search CLI (RBH via DIAMOND)
+├── annotation_import.py          # Collaborator annotation (Excel/topGO) -> Perseverance/Deimos TSV
 ├── rbh.py / transfer.py          # Perseverance internals
 ├── deimos_to_perseverance.py     # Deimos <-> Perseverance bridge (FASTA, ID mapping)
 ├── id_remap.py                   # id_mapping: Protein.Group ID conversion in pg + pr matrices
@@ -356,6 +384,8 @@ proteomics_output/
 ├── perseverance/                    # Perseverance: DIAMOND outputs, orthologue table
 ├── pathfinder/                      # make_pathfinder: report, synthesis workbook, summary,
 │                                    #   design used, full log
+├── insight/                         # make_insight: figures 01-06 (PNG + SVG),
+│                                    #   insight_report.html, insight_log.txt
 └── last_config.yaml                 # Last run config (reloadable)
 ```
 
@@ -413,6 +443,7 @@ dpc_sensitivity:      true        # DPC vs imputed comparison sheets
 differential_detection: true      # on/off proteins, detection test (DPC)
 dpc_level:            auto        # auto (precursors if pr_matrix) | precursor | protein
 make_pathfinder:      false       # true = Pathfinder synthesis at the end (needs a clone)
+make_insight:         false       # true = InSight biological-reading figures at the end (needs a clone)
 ```
 
 Any extra YAML key is passed through to the pipeline even if not listed in `config.py`'s
@@ -428,6 +459,7 @@ flip side: a misspelt key is ignored without error.
 | **Deimos** (this repo) | Full DIA quantitative pipeline |
 | [Phobos](https://github.com/BenoitBe/phobos-peptidomics-pipeline) | DDA/PEAKS peptidomics + PTM pipeline |
 | [Pathfinder](https://github.com/BenoitBe/Pathfinder) | Cross-contrast synthesis of one Deimos/Phobos workbook (core signature, meta-GO, WGCNA cross-reading), no recomputation. Can run as Deimos' last step: `make_pathfinder: true` |
+| InSight | Biological reading of a finished Deimos run (response programmes, functional themes, condition map, themed volcanos, spotlight), any design, no recomputation. Can run as Deimos' very last step: `make_insight: true` |
 | **Perseverance** | Orthology search (RBH/DIAMOND) for non-model organisms — bundled directly in this repository, see `README_PERSEVERANCE.md` |
 
 ---

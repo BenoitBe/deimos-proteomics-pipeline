@@ -23,8 +23,9 @@ import time
 
 MANIFEST_SHEET = "_manifest"
 SCHEMA_NAME = "deimos-results"
-SCHEMA_VERSION = "1.1"   # majeure +1 si un onglet/une colonne lu en aval est renommé ;
-                         # mineure +1 pour un ajout (1.1 : section 'sensitivity')
+SCHEMA_VERSION = "1.2"   # majeure +1 si un onglet/une colonne lu en aval est renommé ;
+                         # mineure +1 pour un ajout (1.1 : section 'sensitivity' ;
+                         # 1.2 : règle volcano structurée, volcano_p_column/_thresh/_ratio_min)
 
 STATS_SHEET = "Differential_Expression"
 MATRIX_SHEET = "Log2_Impute"
@@ -33,7 +34,7 @@ MATRIX_SHEET = "Log2_Impute"
 _NOT_FACTORS = {"label", "condition", "replicate", "rep", "replicat"}
 
 # Options Pathfinder transmissibles via le YAML (pathfinder_options)
-_PF_OPTIONS = {"pthr", "jaccard", "no_umap"}
+_PF_OPTIONS = {"pthr", "min_ratio", "jaccard", "no_umap"}
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -73,6 +74,27 @@ def pathfinder_version(pf_dir):
 
 
 # ── Organisme réellement analysé ──────────────────────────────────────────────
+
+def pathfinder_selection_text(params, pf_dir):
+    """Règle de sélection des protéines appliquée par Pathfinder, pour la feuille Methods.
+    Pathfinder >= 1.2 applique la règle volcano du manifeste (mêmes protéines que les
+    volcanos) sauf surcharge pthr / min_ratio ; les versions antérieures, p.adj < pthr
+    sans critère de fold-change."""
+    opts = params.get("pathfinder_options") or {}
+    ver = pathfinder_version(pf_dir) if pf_dir else ""
+    m = re.match(r"(\d+)\.(\d+)", ver or "")
+    modern = bool(m) and (int(m.group(1)), int(m.group(2))) >= (1, 2)
+    if not modern:
+        return (f"Protein signature = p.adj < {opts.get('pthr', 0.05)} without fold-change "
+                "criterion (independent of the volcano thresholds above)")
+    if "pthr" in opts or "min_ratio" in opts:
+        return ("Protein selection = volcano rule above, overridden by pathfinder_options "
+                f"({', '.join(f'{k}={opts[k]}' for k in ('pthr', 'min_ratio') if k in opts)}): "
+                "counts differ from the volcanos. GO / pathway terms: q < 0.05 as computed "
+                "above")
+    return ("Protein selection = the volcano rule above (same proteins as the volcanos, "
+            "UpSet and dashboard); GO / pathway terms: q < 0.05 as computed above")
+
 
 def analysed_organism(params, perseverance=False):
     """('taxid', '1304') en backend STRING, ('gprofiler', 'bnapus') sinon,
@@ -116,6 +138,11 @@ def manifest_rows(params, contrast_names, go_sheet_map, design, *,
             ("stats", "volcano_rule",
              f"{p_col} < {params.get('volcano_p_thresh', 0.05)} & ratio >= "
              f"{params.get('volcano_ratio_min', 1.5)}"),
+            # même règle, structurée (schéma 1.2) : les lecteurs (Pathfinder, InSight)
+            # sélectionnent exactement les protéines des volcanos de Deimos
+            ("stats", "volcano_p_column", "p.adj" if params.get("volcano_use_padj") else "p.val"),
+            ("stats", "volcano_p_thresh", str(params.get("volcano_p_thresh", 0.05))),
+            ("stats", "volcano_ratio_min", str(params.get("volcano_ratio_min", 1.5))),
             ("matrix", "sheet", MATRIX_SHEET),
             ("matrix", "imputed", "true"),
             ("matrix", "imputation",
@@ -205,6 +232,8 @@ def build_pathfinder_argv(pf_dir, xlsx_path, design_csv, pf_out, params, *,
     opts = params.get("pathfinder_options") or {}
     if "pthr" in opts:
         argv += ["--pthr", str(float(opts["pthr"]))]
+    if "min_ratio" in opts:
+        argv += ["--min-ratio", str(float(opts["min_ratio"]))]
     if "jaccard" in opts:
         argv += ["--jaccard", str(float(opts["jaccard"]))]
     if opts.get("no_umap"):
@@ -285,6 +314,13 @@ def validate_pathfinder_params(params):
         if unknown:
             errors.append(f"  pathfinder_options : clé(s) inconnue(s) {unknown} "
                           f"(attendu : {sorted(_PF_OPTIONS)})")
+        if "min_ratio" in opts:
+            try:
+                if float(opts["min_ratio"]) < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append("  pathfinder_options.min_ratio doit être >= 1 (1 = sans critère "
+                              "de fold-change)")
         for k in ("pthr", "jaccard"):
             if k in opts:
                 try:

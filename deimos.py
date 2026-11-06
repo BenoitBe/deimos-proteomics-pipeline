@@ -95,7 +95,9 @@ except ImportError:
     _DPC_AVAILABLE = False
 
 from pathfinder_bridge import (write_manifest, run_pathfinder_step,
-                               locate_pathfinder, pathfinder_version)
+                               locate_pathfinder, pathfinder_version,
+                               pathfinder_selection_text)
+from insight_bridge import run_insight_step, locate_insight, insight_version
 
 
 # ==============================================================================
@@ -566,6 +568,17 @@ def ask_reference_organism() -> str:
     return input("  Organisme de référence -> ").strip()
 
 
+def _diamond_threads(params: dict) -> int:
+    """perseverance_threads, sinon tous les cœurs moins un (DIAMOND était limité à 4)."""
+    n = params.get("perseverance_threads")
+    try:
+        if n:
+            return max(1, int(n))
+    except (TypeError, ValueError):
+        pass
+    return max(1, (os.cpu_count() or 4) - 1)
+
+
 def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
                           ) -> "tuple[pd.DataFrame | None, dict | None]":
     """
@@ -669,7 +682,8 @@ def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
     min_coverage = params.get("perseverance_min_coverage", 50.0)
     try:
         rbh_df = compute_rbh(query_fasta, reference_fasta, persev_dir,
-                             min_identity=min_identity, min_coverage=min_coverage)
+                             min_identity=min_identity, min_coverage=min_coverage,
+                             threads=_diamond_threads(params), verbose=True)
     except (RuntimeError, OSError) as e:   # OSError : DIAMOND introuvable (WinError 2)
         print(f"  [ERREUR] Perseverance/DIAMOND a échoué ({e}) — étape ignorée, "
               f"le pipeline continue sans orthologues.")
@@ -791,7 +805,8 @@ def run_string_ortholog_step(df_results: pd.DataFrame, params: dict,
     try:
         rbh = compute_rbh(query_fasta, ref, work,
                           min_identity=params.get("perseverance_min_identity", 25.0),
-                          min_coverage=params.get("perseverance_min_coverage", 50.0))
+                          min_coverage=params.get("perseverance_min_coverage", 50.0),
+                          threads=_diamond_threads(params), verbose=True)
     except (RuntimeError, OSError) as e:
         print(f"  [ERREUR] DIAMOND a échoué ({e}) — GO STRING ignoré.")
         return None, None
@@ -3898,9 +3913,19 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
         _pthr = (params.get("pathfinder_options") or {}).get("pthr", 0.05)
         put_kv("Downstream synthesis", f"Pathfinder {pathfinder_version(_pf_dir)}",
                "Reads this workbook after it is saved, no recomputation; outputs in "
-               "pathfinder/ (report, synthesis workbook, summary, log). Protein "
-               f"signature = p.adj < {_pthr} without fold-change criterion "
-               "(independent of the volcano thresholds above)")
+               "pathfinder/ (report, synthesis workbook, summary, log). "
+               + pathfinder_selection_text(params, _pf_dir))
+    _ins_dir = locate_insight(params) if params.get("make_insight") else None
+    if _ins_dir:
+        if not _pf_dir:
+            put_section(f"{_next_sec}. DOWNSTREAM SYNTHESIS")
+            put_header()
+        put_kv("Biological reading", f"InSight {insight_version(_ins_dir)}",
+               "Reads this workbook and matrices/ after they are saved, no recomputation; "
+               "outputs in insight/ (figures PNG + SVG, insight_report.html, log). Response "
+               "programmes = k-means on z-scored condition means of the proteins significant "
+               "in at least one contrast (volcano rule above); themes = enrichment terms "
+               "merged by shared proteins (Jaccard >= 0.35)")
 
     # ===== LARGEURS DE COLONNES =====
     ws.column_dimensions["A"].width = 26
@@ -4838,6 +4863,18 @@ def main():
                     "custom_annotation": _perseverance_annot, "background": None}
         print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "
               f"({len(_perseverance_annot)} proteines annotees)")
+        # Noms et espaces (BP/CC/MF) des termes : table GO, name, namespace
+        _terms_path = params.get("perseverance_go_terms_path")
+        if _terms_path:
+            try:
+                from go_enrichment import load_go_terms
+                go_params["go_terms"] = load_go_terms(_terms_path)
+                _nn = sum(1 for v in go_params["go_terms"].values() if v[0] and
+                          not str(v[0]).startswith("GO:"))
+                print(f"[GO] Noms des termes GO : {_terms_path} ({_nn} termes nommés)")
+            except Exception as _e:                       # noqa: BLE001
+                print(f"[WARN] perseverance_go_terms_path illisible ({type(_e).__name__}: "
+                      f"{_e}) — termes GO non nommés.")
     elif _GO_AVAILABLE and _go_target:
         _bg_mode = params.get("enrichment_background", "quantified")
         go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
@@ -5638,6 +5675,8 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         run_qc_only(tsv, mat_log2, meta, design_filt, params, qc_files, out_dir)
         if params.get("make_pathfinder"):
             print("  [SKIP] Pathfinder: QC-only mode, no p-values to synthesise.")
+        if params.get("make_insight"):
+            print("  [SKIP] InSight: QC-only mode, no differential results to read.")
         return
 
     # --- 4. Filtration + Imputation ---
@@ -5991,6 +6030,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                                       perseverance=_persev_go)
         if pf_html:
             print(f"  [OK] Pathfinder report: {pf_html}")
+
+    # --- 15ter. InSight (optionnel, processus séparé, non bloquant) ---
+    # Lecture biologique (figures + page récit) du classeur et de matrices/ tels
+    # que livrés. Sorties dans insight/ : le nettoyage (16) ne touche pas ce dossier.
+    if params.get("make_insight"):
+        print("\n[STEP] InSight — biological reading (figures + report)...")
+        ins_html = run_insight_step(output_name, params, out_dir)
+        if ins_html:
+            print(f"  [OK] InSight report: {ins_html}")
 
     # --- 16. Nettoyage des figures temporaires ---
     # Toutes les figures sont déjà intégrées dans l'Excel (et le dashboard les

@@ -216,10 +216,65 @@ def _benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     return adj
 
 
+_NAMESPACE_SOURCE = {"biological_process": "GO:BP", "cellular_component": "GO:CC",
+                     "molecular_function": "GO:MF", "bp": "GO:BP", "cc": "GO:CC",
+                     "mf": "GO:MF", "go:bp": "GO:BP", "go:cc": "GO:CC", "go:mf": "GO:MF"}
+
+
+def load_go_terms(path: str) -> dict:
+    """Table GO, name, namespace (annotation_import.py --terms-out, ou toute table
+    équivalente) -> {GO: (nom, source GO:BP/CC/MF ou None)}. Colonnes reconnues
+    sans tenir compte de la casse ; namespace optionnel."""
+    t = pd.read_csv(path, sep="\t", dtype=str).fillna("")
+    cols = {c.lower(): c for c in t.columns}
+    gcol = cols.get("go") or cols.get("term_id") or cols.get("go_id") or t.columns[0]
+    ncol = cols.get("name") or cols.get("term_name")
+    scol = cols.get("namespace") or cols.get("source") or cols.get("aspect")
+    out = {}
+    for _, r in t.iterrows():
+        g = str(r[gcol]).strip()
+        if g:
+            src = _NAMESPACE_SOURCE.get(str(r[scol]).strip().lower()) if scol else None
+            out[g] = ((str(r[ncol]).strip() if ncol else "") or g, src)
+    return out
+
+
+def annotation_to_group_leaders(annotation: pd.DataFrame, df: pd.DataFrame,
+                                id_col: str = "name") -> pd.DataFrame:
+    """L'ORA local apparie sur la protéine de tête de chaque groupe (1er accession
+    de Protein.Group). Une annotation indexée par accession individuelle (sortie
+    brute de Perseverance, isoformes RefSeq...) est ajoutée aux têtes de groupe à
+    partir des autres membres annotés : union des GO, rien n'est retiré. Sans
+    colonne Protein.Group, l'annotation est rendue telle quelle."""
+    if annotation is None or "Protein.Group" not in df.columns or annotation.empty:
+        return annotation
+    ann = annotation.dropna(subset=["GO"])
+    by_id = {}
+    for pid, go in zip(ann["protein_id"].astype(str), ann["GO"].astype(str)):
+        by_id.setdefault(pid.strip(), set()).update(
+            g.strip() for g in go.split(";") if g.strip())
+    leaders = (df[id_col] if id_col in df.columns else df["Protein.Group"]).astype(str) \
+        .str.split(";").str[0].str.strip()
+    add = []
+    for lead, grp in zip(leaders, df["Protein.Group"].astype(str)):
+        if lead in by_id:
+            continue
+        gos = set()
+        for m in grp.split(";")[1:]:
+            gos |= by_id.get(m.strip(), set())
+        if gos:
+            add.append({"protein_id": lead, "GO": ";".join(sorted(gos))})
+    if not add:
+        return annotation
+    print(f"    [INFO] {len(add)} protein groups annotated from another member of the group "
+          f"(leader without annotation).")
+    return pd.concat([annotation, pd.DataFrame(add)], ignore_index=True)
+
+
 def run_local_ora(query: list[str], background: list[str],
                   annotation_long: pd.DataFrame,
-                  min_term_size: int = 3, source_label: str = "GO:PERSEVERANCE"
-                  ) -> pd.DataFrame | None:
+                  min_term_size: int = 3, source_label: str = "GO:PERSEVERANCE",
+                  term_info: dict | None = None) -> pd.DataFrame | None:
     """
     Remplace run_gost() par un test d'enrichissement local (hypergéométrique
     + BH), SANS appel réseau, à partir d'une annotation fournie par
@@ -247,6 +302,9 @@ def run_local_ora(query: list[str], background: list[str],
     source_label    : valeur de la colonne 'source' en sortie (permet de
                       distinguer visuellement des sources gProfiler dans
                       les mêmes graphiques/exports)
+    term_info       : {GO: (nom, source)} (load_go_terms) : termes nommés et
+                      répartis en GO:BP / GO:CC / GO:MF ; sans table, le nom
+                      est l'identifiant et la source source_label
 
     Returns
     -------
@@ -290,10 +348,11 @@ def run_local_ora(query: list[str], background: list[str],
         if k == 0:
             continue
         pval = hypergeom.sf(k - 1, N, K, n)
+        nm, src = (term_info or {}).get(go_id, (go_id, None))
         rows.append({
-            "native": go_id, "name": go_id, "p_value": pval,
+            "native": go_id, "name": nm or go_id, "p_value": pval,
             "term_size": K, "query_size": n, "intersection_size": k,
-            "source": source_label, "intersections": sorted(inter),
+            "source": src or source_label, "intersections": sorted(inter),
         })
 
     if not rows:
@@ -1847,6 +1906,9 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
                                       .str.split(";").str[0].str.strip()))
         if background is None and custom_annotation is not None:
             background = universe
+        if custom_annotation is not None:
+            custom_annotation = annotation_to_group_leaders(custom_annotation, df_comparaison,
+                                                            id_col)
 
         use_local = custom_annotation is not None
         use_ortholog = (ortholog_map is not None) and not use_local
@@ -1916,7 +1978,8 @@ def run_go_enrichment(df_comparaison: pd.DataFrame, contrast_names: list[str],
 
                 if use_local:
                     print(f"  [GO] {contrast}: {len(prots)} proteins -> ORA local (Perseverance)...")
-                    gost_df = run_local_ora(prots, background, custom_annotation)
+                    gost_df = run_local_ora(prots, background, custom_annotation,
+                                            term_info=go_params.get("go_terms"))
                 elif use_string_orth:
                     gost_df = _string_enrich_query(
                         prots, string_maps, int(species_taxid), string_caller,

@@ -58,7 +58,8 @@ def main():
     print("[1/3] Calcul des Reciprocal Best Hits (DIAMOND)...")
     rbh_df = compute_rbh(args.query, args.reference, args.workdir,
                          evalue=args.evalue, min_identity=args.min_identity,
-                         min_coverage=args.min_coverage, threads=args.threads)
+                         min_coverage=args.min_coverage, threads=args.threads,
+                         verbose=True)
     print(f"  [OK] {len(rbh_df)} orthologue(s) identifie(s) par RBH.")
     if args.rbh_out:
         rbh_df.to_csv(args.rbh_out, sep="\t", index=False)
