@@ -9,7 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import config                                          # noqa: E402
+import insight_bridge as ib                            # noqa: E402
 import pathfinder_bridge as pb                         # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_insight_clone(monkeypatch):
+    """Un clone InSight voisin (../InSight) ajouterait sa propre question : ces
+    tests ne portent que sur Pathfinder (InSight : tests/test_config_insight.py)."""
+    monkeypatch.delenv("INSIGHT_HOME", raising=False)
+    monkeypatch.setattr(ib, "insight_search_paths", lambda params: [])
 
 
 def _resolve(monkeypatch, argv, answers=()):
