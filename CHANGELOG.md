@@ -316,8 +316,11 @@ and dashboard improvements accumulated since the previous public version.
   captured, and waits forever at 0 % CPU — the run stopped at "Construction de la base
   DIAMOND (reference.fasta)..." with no message. Now (`rbh.py`):
   - both FASTA are checked before DIAMOND (`check_protein_fasta`): nucleotide content,
-    UTF-16 or UTF-8 BOM encoding, CR-only line endings, empty sequences, not a FASTA —
-    clear message, Deimos continues without orthologues;
+    UTF-16 or UTF-8 BOM encoding, CR-only line endings, empty sequences, not a FASTA,
+    characters other than letters, `*` and `-` in a sequence line (DIAMOND 2.2.8 also hangs
+    on a space or a `.`), and an interrupted UniProt download — the stream ends with
+    "Error encountered when streaming data. Please try again later." (real case: mouse
+    reference cut at 40,000 sequences) — clear message, Deimos continues without orthologues;
   - each DIAMOND call is watched: killed after 3 min without CPU time (`IDLE_KILL_S`) or
     5 s after an `Error:` line, with the last DIAMOND step and a hint in the message;
   - DIAMOND output goes to one log per step (`perseverance/diamond_<step>.log`, with the

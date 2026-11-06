@@ -132,6 +132,9 @@ annotation.
    avant DIAMOND et surveille chaque appel (arrêt après 3 min sans CPU) ; la sortie de
    DIAMOND est dans `perseverance/diamond_<étape>.log`. Le FASTA de référence doit être
    un **protéome** (UniProt *reference proteome*, RefSeq `protein.faa`), pas des CDS.
+   DIAMOND se bloque de même sur une espace ou un `.` dans une séquence : c'est le cas
+   d'un téléchargement UniProt interrompu, qui se termine par « Error encountered when
+   streaming data. Please try again later. » — préférer le fichier `.fasta.gz` du FTP.
 
 ## Architecture
 

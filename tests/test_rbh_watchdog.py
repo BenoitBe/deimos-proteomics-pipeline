@@ -56,6 +56,23 @@ def test_check_protein_fasta(tmp_path):
     assert "'>'" in rbh.check_protein_fasta(str(notfa))[0]
 
 
+def test_truncated_uniprot_download_and_bad_characters(tmp_path):
+    """Cas réel (référence souris, 06/11) : flux UniProt coupé à 40 000 séquences, le
+    fichier se termine par le message d'erreur du serveur -> DIAMOND 2.2.8 bloqué."""
+    cut = tmp_path / "ref.fa"
+    cut.write_text(_fasta_text([PROT] * 12) + "MKVLA\n\n"
+                   "Error encountered when streaming data. Please try again later.\n")
+    msg = rbh.check_protein_fasta(str(cut))
+    assert len(msg) == 1 and "UniProt interrompu" in msg[0] and "12 séquences" in msg[0]
+    dot = tmp_path / "dot.fa"
+    dot.write_text(_fasta_text([PROT] * 3) + ">x\nMKV.LA\n>y\nMK VL\n")
+    msg = rbh.check_protein_fasta(str(dot))
+    assert len(msg) == 1 and "2 ligne(s)" in msg[0] and "'.'" in msg[0] and "(x)" in msg[0]
+    ok = tmp_path / "ok.fa"                         # '*' et '-' sont admis par DIAMOND
+    ok.write_text(_fasta_text([PROT + "*", "MKV-LA" * 20]))
+    assert rbh.check_protein_fasta(str(ok)) == []
+
+
 def _fasta_text(seqs, prefix="s"):
     return "".join(f">{prefix}{i}\n{s}\n" for i, s in enumerate(seqs))
 

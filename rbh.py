@@ -42,6 +42,12 @@ NT_FRACTION_MAX = 0.90
 NT_CHECK_FIRST_SEQS = 10
 NT_CHECK_RESIDUES = 2_000_000
 _NT = (b"A", b"C", b"G", b"T", b"U", b"N")
+# Caractères admis dans une ligne de séquence : lettres, '*' (stop), '-' (gap).
+# DIAMOND 2.2.8 se bloque aussi sur une espace ou un '.' dans une séquence (un chiffre
+# donne une erreur franche) : c'est le cas d'un téléchargement UniProt interrompu, qui
+# se termine par « Error encountered when streaming data. Please try again later. »
+_SEQ_OK = bytes(range(65, 91)) + bytes(range(97, 123)) + b"*-"
+_UNIPROT_STREAM_ERR = b"Error encountered when streaming data"
 
 
 def clean_seqid(seqid: str) -> str:
@@ -226,7 +232,9 @@ def check_protein_fasta(fasta_path: str) -> list[str]:
     """Contrôle d'un FASTA avant DIAMOND. Renvoie les problèmes bloquants (liste vide
     = utilisable) : encodage UTF-16 ou BOM UTF-8, fins de ligne CR seules (ancien
     Mac), première ligne sans '>', aucune séquence, séquences vides, contenu
-    nucléotidique (DIAMOND 2.2 se bloque dessus). Lecture binaire en flux."""
+    nucléotidique, caractères hors séquence (espace, '.', chiffre…) dont le message
+    de fin d'un téléchargement UniProt interrompu (DIAMOND 2.2 se bloque sur ces
+    deux derniers cas). Lecture binaire en flux."""
     name = os.path.basename(fasta_path)
     try:
         fh = open(fasta_path, "rb")
@@ -249,15 +257,19 @@ def check_protein_fasta(fasta_path: str) -> list[str]:
         nt_all = let_all = nt_cur = let_cur = 0
         head_nt = []                     # 10 premières séquences : nucléotidique ?
         first = True
+        n_line, n_bad, bad_ex, stream_err = 0, 0, [], None
 
         def _close_seq():
             if n_seq and len(head_nt) < NT_CHECK_FIRST_SEQS and n_seq <= NT_CHECK_FIRST_SEQS:
                 head_nt.append(let_cur > 0 and nt_cur / let_cur >= NT_FRACTION_MAX)
 
         for raw in fh:
+            n_line += 1
             line = raw.strip()
             if not line:
                 continue
+            if _UNIPROT_STREAM_ERR in line and stream_err is None:
+                stream_err = n_line
             if first:
                 first = False
                 if not line.startswith(b">"):
@@ -275,6 +287,13 @@ def check_protein_fasta(fasta_path: str) -> list[str]:
                     if len(line) > 1 else "?"
                 continue
             cur_len += len(line)
+            bad = line.translate(None, _SEQ_OK)
+            if bad:
+                n_bad += 1
+                if len(bad_ex) < 3:
+                    shown = "".join(sorted({repr(chr(c)) for c in set(bad)}))
+                    bad_ex.append(f"ligne {n_line} ({cur_id}) : {shown} dans "
+                                  f"« {line[:60].decode('utf-8', 'replace')} »")
             if let_all < NT_CHECK_RESIDUES or n_seq <= NT_CHECK_FIRST_SEQS:
                 up = line.upper()
                 k = sum(up.count(c) for c in _NT)
@@ -301,6 +320,16 @@ def check_protein_fasta(fasta_path: str) -> list[str]:
             f"{name} : séquences nucléotidiques ({100 * frac:.0f} % de A/C/G/T/U/N) — "
             f"Perseverance attend des PROTÉINES (protéome UniProt, RefSeq protein .faa), "
             f"pas des CDS ni des transcrits. DIAMOND 2.2 se bloquerait sur ce fichier.")
+    if stream_err is not None:
+        problems.append(
+            f"{name} : téléchargement UniProt interrompu — le fichier se termine par "
+            f"« Error encountered when streaming data » (ligne {stream_err}) : il est tronqué "
+            f"({n_seq} séquences lues) et DIAMOND 2.2 se bloque dessus. Le retélécharger, "
+            f"de préférence depuis le FTP UniProt (fichier .fasta.gz statique).")
+    elif n_bad:
+        problems.append(f"{name} : {n_bad} ligne(s) de séquence avec des caractères non "
+                        f"admis — " + " ; ".join(bad_ex)
+                        + ". DIAMOND 2.2 se bloque sur une espace ou un '.'.")
     if n_empty:
         problems.append(f"{name} : {n_empty} séquence(s) vide(s) (ex. {', '.join(empty_ids[:3])})"
                         f" — DIAMOND s'arrête dessus.")
