@@ -156,6 +156,11 @@ def prepare_dashboard_files(main_xlsx: str, design: pd.DataFrame,
                     df = df.merge(intensity_df[new_cols], on="name", how="left")
             elif s == "Zscore_Heatmap":
                 df = _rename_sample_columns(df, label_map)
+            elif s == "Log2_Impute":
+                # Matrice des tests (log2 normalisée, imputée) : le dashboard en tire
+                # les moyennes par condition des scatter / MA plots, comme les
+                # scatter plots de l'Excel (et non des LFQ brutes à valeurs manquantes).
+                df = _rename_sample_columns(df, label_map)
             elif s == "UpSet_Intersections":
                 # Enrich with Genes + description if missing (the dashboard reads them)
                 if meta_map is not None and "Protein.Group" in df.columns:
@@ -265,6 +270,11 @@ def run_dashboard(main_xlsx: str, design: pd.DataFrame, out_html: str,
                         "anova_use_padj":    bool(params.get("anova_use_padj", False)),
                         "anova_p_thresh":    float(params.get("anova_p_thresh", 0.05)),
                         "n_heatmap_clusters": int(params.get("n_heatmap_clusters", 3)),
+                        # Robustness_Score = compte 0..n_iter (curseurs et couleurs)
+                        "n_iter_robustness": int(params.get("n_iter_robustness", 0) or 0),
+                        # 'Condition_Replicate' -> libellé d'origine (exports, PCA)
+                        "sample_labels": {v: k for k, v in
+                                          _build_label_mapping(design).items()},
                     }, _f)
             except Exception:
                 pass

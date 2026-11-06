@@ -76,6 +76,45 @@ NON_SAMPLE = {'name', 'Protein.Group', 'Protein.Names', 'Genes',
 
 IMG_LABELS = ['lollipop', 'dotplot']  # ordre d'insertion dans les sheets GO
 
+# Audit du 06/11/2026 — données transmises par Deimos (dashboard_params.json / _manifest)
+_GO_MANIFEST = {}      # onglet GO_* -> contraste, d'après le _manifest (prioritaire sur le nom)
+SAMPLE_LABELS = {}     # 'Condition_Replicate' -> libellé d'origine de l'échantillon
+N_ITER_ROB = 0         # Robustness_Score = compte 0..N_ITER_ROB (0 = robustesse non calculée)
+
+
+def _sig4(x):
+    """p-value à 4 chiffres significatifs (un arrondi absolu à 6 décimales mettait à 0
+    toute p < 5e-7)."""
+    return float('%.4g' % x)
+
+
+def read_manifest_go(path):
+    """{onglet GO_*: contraste} depuis l'onglet _manifest du classeur Deimos ({} sinon)."""
+    try:
+        m = pd.read_excel(path, sheet_name='_manifest', header=None)
+    except Exception:
+        return {}
+    out = {}
+    for row in m.itertuples(index=False):
+        vals = list(row)[:3]
+        if len(vals) == 3 and str(vals[0]).strip() == 'go_sheet' and pd.notna(vals[2]):
+            out[str(vals[1]).strip()] = str(vals[2]).strip()
+    return out
+
+
+def read_analysis_matrix(path):
+    """Onglet Log2_Impute (matrice des tests, colonnes renommées en Condition_Replicate
+    par dashboard_integration), indexé par Protein.Group ; None si absent."""
+    try:
+        df = pd.read_excel(path, sheet_name='Log2_Impute')
+    except Exception:
+        return None
+    if 'Protein.Group' not in df.columns:
+        return None
+    df = df.drop_duplicates('Protein.Group').set_index('Protein.Group')
+    num = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return df[num] if num else None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Détection des fichiers (par contenu, conformément au skill)
@@ -360,7 +399,26 @@ def build_conditions(sample_cols):
 # PROTEOME_DATA — structure unifiée remplaçant VOLCANO + SCATTER_DATA + MA_DATA
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_proteome_data(df_comp, contrasts, cond_map):
+def _round_or_none(v, nd=3):
+    v = float(v) if v is not None else float('nan')
+    return round(v, nd) if np.isfinite(v) else None
+
+
+def _condition_means(df_comp, cond, cols, imp, cond_map):
+    """Moyenne log2 par protéine pour une condition : matrice des tests (Log2_Impute)
+    si fournie, sinon intensités du classeur SANS compter les manquants comme 0."""
+    if imp is not None and cond and 'Protein.Group' in df_comp.columns:
+        icols = [c for c in find_cond_cols(cond, cond_map) if c in imp.columns]
+        if icols:
+            m = imp[icols].mean(axis=1, skipna=True)
+            return pd.Series(m.reindex(df_comp['Protein.Group'].astype(str)).values,
+                             index=df_comp.index)
+    if not cols:
+        return pd.Series([np.nan] * len(df_comp), index=df_comp.index)
+    return df_comp[cols].mean(axis=1, skipna=True)
+
+
+def build_proteome_data(df_comp, contrasts, cond_map, imp=None):
     """Structure unifiée par contraste : un seul point par protéine contenant
     tous les champs nécessaires aux volcanos, scatter et MA plots.
     Champs : name, g (gène), desc, d (LFC), p, padj, r, pi, s, x (moy condA), y (moy condB)
@@ -383,8 +441,8 @@ def build_proteome_data(df_comp, contrasts, cond_map):
         if pcol not in df_comp.columns or dcol not in df_comp.columns:
             continue
 
-        mean_a = df_comp[cols_a].fillna(0).mean(axis=1) if cols_a else pd.Series([0.0]*len(df_comp))
-        mean_b = df_comp[cols_b].fillna(0).mean(axis=1) if cols_b else pd.Series([0.0]*len(df_comp))
+        mean_a, mean_b = _condition_means(df_comp, parts[0], cols_a, imp, cond_map), \
+            _condition_means(df_comp, parts[1] if len(parts) > 1 else '', cols_b, imp, cond_map)
 
         pts = []
         for _, row in df_comp.iterrows():
@@ -401,15 +459,15 @@ def build_proteome_data(df_comp, contrasts, cond_map):
             if ps < P_THRESH and dv >  LFC_THRESH: s = 'U'
             if ps < P_THRESH and dv < -LFC_THRESH: s = 'D'
             keep = s != 'N' or (pv < KEEP_P and abs(dv) > KEEP_LFC)
-            xa = round(float(mean_a[row.name]), 3)
-            xb = round(float(mean_b[row.name]), 3)
+            xa = _round_or_none(mean_a[row.name])
+            xb = _round_or_none(mean_b[row.name])
             pt = {
                 'name': safe_str(row.get('name')),
                 'g':    safe_str(row.get('Genes')),
                 'desc': safe_str(row.get('First.Protein.Description'), 70),
                 'd':    round(dv, 4),
-                'p':    round(pv, 6),
-                'padj': round(padj, 6) if padj is not None else None,
+                'p':    _sig4(pv),
+                'padj': _sig4(padj) if padj is not None else None,
                 'r':    r,
                 'pi':   round(pi, 4) if pi is not None else None,
                 'lp':   round(float(-np.log10(max(pv, 1e-300))), 4),
@@ -539,8 +597,8 @@ def build_volcano(df_comp, contrasts):
                 sub[need] = default
         sub['lp'] = np.round(-np.log10(sub['p'].clip(lower=1e-300)), 4)
         sub['d'] = sub['d'].round(4)
-        sub['p'] = sub['p'].round(6)
-        sub['padj'] = sub['padj'].round(6)
+        sub['p'] = sub['p'].map(lambda v: _sig4(v) if pd.notna(v) else v)
+        sub['padj'] = sub['padj'].map(lambda v: _sig4(v) if pd.notna(v) else v)
         sub['pi'] = sub['pi'].round(4)
         sub['r'] = sub['r'].fillna(0).round().astype(int)
         sub['desc'] = sub['desc'].fillna('').astype(str).str.slice(0, 70)
@@ -557,6 +615,52 @@ def build_volcano(df_comp, contrasts):
         ].where(pd.notna, None)
         volcano[c] = json.loads(out.to_json(orient='records'))
     return volcano
+
+
+def build_full_de(df_comp, contrasts):
+    """Toutes les protéines, en colonnes compactes : sources des comptes, du tableau
+    DEP, de la recherche et des exports (le nuage du volcano reste échantillonné).
+    {'n': noms, 'g': gènes, 'desc': descriptions, 'c': {contraste: {d, p, q, pi, r}}}"""
+    def col(name):
+        return df_comp[name] if name in df_comp.columns else None
+
+    def vals(series, fn):
+        if series is None:
+            return None
+        return [fn(float(v)) if pd.notna(v) else None
+                for v in pd.to_numeric(series, errors='coerce')]
+    out = {'n': [safe_str(v) for v in df_comp.get('name', pd.Series([''] * len(df_comp)))],
+           'g': [safe_str(v) for v in df_comp.get('Genes', pd.Series([''] * len(df_comp)))],
+           'desc': [safe_str(v, 70) for v in df_comp.get('First.Protein.Description',
+                                                       pd.Series([''] * len(df_comp)))],
+           'c': {}}
+    for c in contrasts:
+        d, p = col(c + '_diff'), col(c + '_p.val')
+        if d is None or p is None:
+            continue
+        out['c'][c] = {'d': vals(d, lambda v: round(v, 4)), 'p': vals(p, _sig4),
+                       'q': vals(col(c + '_p.adj'), _sig4),
+                       'pi': vals(col('Pi_Score_' + c), lambda v: round(v, 4)),
+                       'r': vals(col('Robustness_Score_' + c), lambda v: int(round(v)))}
+    return out
+
+
+def build_scatter_r(df_comp, contrasts, cond_map, imp=None):
+    """r de Pearson des scatters, sur TOUTES les protéines (les points embarqués sont
+    enrichis en protéines différentielles, ce qui faussait r)."""
+    out = {}
+    for c in contrasts:
+        parts = c.split('_vs_')
+        if len(parts) != 2:
+            continue
+        ca = [x for x in find_cond_cols(parts[0], cond_map) if x in df_comp.columns]
+        cb = [x for x in find_cond_cols(parts[1], cond_map) if x in df_comp.columns]
+        a = _condition_means(df_comp, parts[0], ca, imp, cond_map)
+        b = _condition_means(df_comp, parts[1], cb, imp, cond_map)
+        ok = np.isfinite(a.values) & np.isfinite(b.values)
+        if ok.sum() > 2:
+            out[c] = round(float(np.corrcoef(a.values[ok], b.values[ok])[0, 1]), 4)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -600,6 +704,9 @@ def build_heatmap(df_z, df_anova, sample_cols):
     # Cas 2 conditions : df_z peut être vide ou sans colonnes d'échantillons
     if df_z.empty or not any(c in df_z.columns for c in sample_cols):
         return []
+    df_anova = df_anova.copy()
+    if 'qvalue' not in df_anova.columns and 'p.adj' in df_anova.columns:
+        df_anova['qvalue'] = df_anova['p.adj']     # Deimos : p.adj de l'ANOVA (BH)
     keep = [c for c in ['Protein.Group', 'Cluster_ID', 'qvalue', 'significant']
             if c in df_anova.columns]
     df_z_m = df_z.merge(df_anova[keep], on='Protein.Group', how='left') \
@@ -794,7 +901,36 @@ def build_intersections(df_inter, contrasts):
 # ──────────────────────────────────────────────────────────────────────────────
 # PCA (projection de visualisation — colonnes d'intensité log2 LFQ, toutes protéines)
 # ──────────────────────────────────────────────────────────────────────────────
-def build_pca(df_comp, sample_cols, cond_map_inv):
+def build_pca(df_comp, sample_cols, cond_map_inv, stats_path=None, imp=None):
+    """Panneau PCA de la page QC. 1) La PCA de Deimos (onglet PCA_Scores : mêmes axes
+    que la figure de l'Excel et que le score plot plus bas) ; 2) repli : SVD de la
+    matrice des tests (Log2_Impute), sinon des intensités en ne gardant que les
+    protéines sans valeur manquante (les manquants ne sont plus mis à 0)."""
+    if stats_path:
+        try:
+            sc = pd.read_excel(stats_path, sheet_name='PCA_Scores')
+        except Exception:
+            sc = None
+        if sc is not None and {'label', 'PC1', 'PC2'} <= set(sc.columns):
+            inv = {v: k for k, v in SAMPLE_LABELS.items()}       # libellé -> Cond_Rep
+            pts = []
+            for _, r in sc.iterrows():
+                lab = str(r['label'])
+                samp = inv.get(lab, lab)
+                pts.append({
+                    'sample': samp, 'label': lab,
+                    'cond': cond_map_inv.get(samp, str(r.get('condition', samp))),
+                    'pc1': round(float(r['PC1']), 3), 'pc2': round(float(r['PC2']), 3),
+                    'pc3': round(float(r['PC3']), 3) if 'PC3' in sc.columns and pd.notna(r['PC3']) else 0.0,
+                })
+            var = [round(float(sc[f'PC{k}_var_pct'].iloc[0]), 2) if f'PC{k}_var_pct' in sc.columns
+                   else 0.0 for k in (1, 2, 3)]
+            return {'points': pts, 'var_exp': var, 'source': 'Deimos (PCA_Scores)'}
+    if imp is not None:
+        icols = [c for c in sample_cols if c in imp.columns]
+        if len(icols) >= 2:
+            mat = imp[icols].dropna().values.T
+            return _svd_points(mat, icols, cond_map_inv, 'Log2_Impute')
     # Colonnes d'intensité présentes dans Comparaison (priorité aux noms SAMPLE_COLS)
     pca_cols = [c for c in sample_cols if c in df_comp.columns]
     if len(pca_cols) < 2:
@@ -810,7 +946,13 @@ def build_pca(df_comp, sample_cols, cond_map_inv):
     if len(pca_cols) < 2:
         return {'points': [], 'var_exp': []}
 
-    mat = df_comp[pca_cols].fillna(0).values.T          # samples × proteins
+    mat = df_comp[pca_cols].dropna().values.T           # samples × protéines complètes
+    return _svd_points(mat, pca_cols, cond_map_inv, 'intensities (complete proteins)')
+
+
+def _svd_points(mat, pca_cols, cond_map_inv, source):
+    if mat.shape[1] < 2:
+        return {'points': [], 'var_exp': [], 'source': source}
     mat_c = mat - mat.mean(axis=0)                       # centrage par protéine
     U, S, Vt = np.linalg.svd(mat_c, full_matrices=False)
     scores = U * S
@@ -825,7 +967,7 @@ def build_pca(df_comp, sample_cols, cond_map_inv):
             'pc2': round(float(scores[i, 1]), 3) if scores.shape[1] > 1 else 0.0,
             'pc3': round(float(scores[i, 2]), 3) if scores.shape[1] > 2 else 0.0,
         })
-    return {'points': points, 'var_exp': var_exp[:3].tolist()}
+    return {'points': points, 'var_exp': var_exp[:3].tolist(), 'source': source}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -894,6 +1036,10 @@ def map_go_sheet(sheet, contrasts):
     sur ce préfixe. Repli sur la plus longue sous-chaîne commune seulement si
     aucune correspondance exacte n'est trouvée.
     """
+    # 0) Le _manifest de Deimos fait foi (le nom tronqué peut coller à un autre
+    #    contraste : GO_KOvWT -> KO_vs_WT_stress au lieu de KO_vs_WT).
+    if _GO_MANIFEST.get(sheet) in contrasts:
+        return _GO_MANIFEST[sheet]
     s = sheet[3:] if sheet.startswith('GO_') else sheet  # retire 'GO_'
 
     # Les noms d'onglets sont désormais construits à partir des conditions
@@ -1852,8 +1998,8 @@ def build_ranked_abundance(df_comp, sample_cols):
     Structure conservée : {points:[{r,v,g?,n?}], vmin, vmax}
     """
     N_RANKED = 600   # suffisant pour une courbe lisse (~9945 → 600)
-    intens = df_comp[sample_cols].fillna(0)
-    mean_intens = intens.mean(axis=1)
+    intens = df_comp[[c for c in sample_cols if c in df_comp.columns]]
+    mean_intens = intens.mean(axis=1, skipna=True).fillna(0)   # 0 = jamais détectée
 
     df_r = pd.DataFrame({
         'v': mean_intens,
@@ -1903,8 +2049,10 @@ def build_cv_plot(df_comp, sample_cols, cond_map):
             continue
         sub = df_comp[cols].replace(0, np.nan)
         mean_c = sub.mean(axis=1)
-        std_c  = sub.std(axis=1)
-        cv     = (std_c / mean_c * 100).round(2)
+        # CV sur les intensités LINÉAIRES (2^log2) : un CV calculé sur des log2 vaut
+        # quelques % et n'est pas comparable aux CV usuels (10-20 %).
+        lin = np.power(2.0, sub)
+        cv     = (lin.std(axis=1) / lin.mean(axis=1) * 100).round(2)
 
         df_cv = pd.DataFrame({
             'x': mean_c.round(3),
@@ -6230,6 +6378,10 @@ def inject(template_html, data):
         "const VOLCANO_BH="       + json.dumps({'grid': BH_GRID, 'cuts': data.get('volcano_bh', {})}, ensure_ascii=False) + ";\n"
         "const PCA_LOAD="         + json.dumps(data.get('pca_load'), ensure_ascii=False) + ";\n"
         "const QC_REPORT="        + json.dumps(data['qc_report'], ensure_ascii=False)     + ";\n"
+        "const FULL_DE="          + json.dumps(data.get('full_de', {'n': [], 'c': {}}), ensure_ascii=False) + ";\n"
+        "const DEP_RULE="         + json.dumps(data.get('dep_rule', {}), ensure_ascii=False) + ";\n"
+        "const SAMPLE_LABELS="    + json.dumps(SAMPLE_LABELS, ensure_ascii=False) + ";\n"
+        "const SCATTER_R="        + json.dumps(data.get('scatter_r', {}), ensure_ascii=False) + ";\n"
         # PROTEOME_DATA contient lp précalculé — VOLCANO et SCATTER_DATA sont des vues dérivées.
         # Les points dessinés sont SOUS-ÉCHANTILLONNÉS (max ~1500/contraste) pour
         # éviter de figer le navigateur au rendu de l'onglet QC/PCA.
@@ -6239,9 +6391,9 @@ def inject(template_html, data):
         "for(var i=0;i<arr.length;i+=step)out.push(arr[i]);return out;}\n"
         "const MA_DATA=(function(){"
         "var r={};Object.keys(PROTEOME_DATA).forEach(function(c){"
-        "var pts=_subsample(PROTEOME_DATA[c]).map(function(p){"
+        "var pts=_subsample(PROTEOME_DATA[c].filter(function(p){return p.x!=null&&p.y!=null;})).map(function(p){"
         "return {a:Math.round((p.x+p.y)/2*1000)/1000,m:p.d,s:p.s,g:p.g,n:p.name,p:p.p,pa:p.padj};});"
-        "r[c]={pts:pts,lfc_thresh:0.26,"
+        "r[c]={pts:pts,lfc_thresh:(DEP_RULE.lfc!=null?DEP_RULE.lfc:0.26),"
         "label_a:c.split('_vs_')[0].replace(/_/g,' '),"
         "label_b:(c.split('_vs_')[1]||'').replace(/_/g,' ')};"
         "});return r;})();\n"
@@ -6258,7 +6410,7 @@ def inject(template_html, data):
         # r calculé sur TOUS les points ; seuls les points DESSINÉS sont échantillonnés
         "var mapped=_subsample(pts).map(function(p){"
         "return {x:p.x,y:p.y,s:p.s,g:p.g,n:p.name,d:p.desc,lfc:p.d,pv:p.p,pa:p.padj};});"
-        "r[c]={pts:mapped,r:Math.round(rr*10000)/10000,"
+        "r[c]={pts:mapped,r:(SCATTER_R[c]!=null?SCATTER_R[c]:Math.round(rr*10000)/10000),"
         "label_a:c.split('_vs_')[0].replace(/_/g,' '),"
         "label_b:(c.split('_vs_')[1]||'').replace(/_/g,' ')};"
         "});return r;})();\n"
@@ -6271,6 +6423,325 @@ def inject(template_html, data):
     # de fermer prématurément la balise <script>. '<\/' reste valide en JS.
     block = block.replace('</', '<\\/')
     return template_html.replace('__DATA_INJECTION__', block)
+
+
+AUDIT_FIX_JS = r"""<script>
+/* ── Audit du 06/11/2026 : filtres et exports alignés sur le classeur Deimos ──
+   Règle de sélection = celle du run (DEP_RULE) ; comptes, tableau DEP, recherche et
+   exports sur TOUTES les protéines (FULL_DE) ; seul le nuage du volcano reste
+   échantillonné. Les définitions ci-dessous remplacent celles du modèle. */
+(function(){
+  var R = (typeof DEP_RULE !== 'undefined' && DEP_RULE) || {};
+  var RULE = {ptype: R.ptype || 'p', p: (R.p != null ? R.p : 0.05),
+              lfc: (R.lfc != null ? R.lfc : 0.26), n_iter: R.n_iter || 0, text: R.text || ''};
+  window.DEIMOS_RULE = RULE;
+  function geneOf(p){ return (p && (p.g || p.Genes)) || ''; }
+  window.geneOf = geneOf;
+  // Règle de Deimos (volcano_status) : statistique < seuil ET |log2FC| >= seuil
+  window.isSig = function(p, fc, ptype, thresh){
+    var pv = ptype === 'padj' ? parseFloat(p.padj) : parseFloat(p.p);
+    return !isNaN(pv) && pv < thresh && Math.abs(parseFloat(p.d)) >= fc;
+  };
+  var _rows = {};
+  window.fullRows = function(c){
+    if(_rows[c]) return _rows[c];
+    var F = (typeof FULL_DE !== 'undefined') ? FULL_DE : null, col = F && F.c ? F.c[c] : null;
+    if(!col) return (VOLCANO[c] || []);
+    var out = [];
+    for(var i = 0; i < F.n.length; i++){
+      if(col.d[i] === null || col.p[i] === null) continue;
+      out.push({name: F.n[i], g: F.g[i], desc: F.desc[i], d: col.d[i], p: col.p[i],
+                padj: col.q ? col.q[i] : null, pi: col.pi ? col.pi[i] : null,
+                r: (col.r && col.r[i] != null) ? col.r[i] : 0,
+                lp: -Math.log10(Math.max(col.p[i], 1e-300))});
+    }
+    return (_rows[c] = out);
+  };
+  window.fullView = function(){ var o = {}; CONTRASTS.forEach(function(c){ o[c] = fullRows(c); }); return o; };
+  window.fullCounts = function(c, fc, ptype, thresh, rob){
+    var u = 0, d = 0;
+    fullRows(c).forEach(function(p){ if((p.r || 0) >= rob && isSig(p, fc, ptype, thresh)){ if(p.d > 0) u++; else d++; } });
+    return {u: u, d: d};
+  };
+  function num(v){ var x = parseFloat(v); return isNaN(x) ? '' : x; }
+  function rowOut(p, status){
+    return {'Protein': p.name, 'Gene': geneOf(p), 'Description': p.desc || '', 'Status': status,
+            'LFC': num(p.d), 'p.val': num(p.p), 'p.adj': num(p.padj), 'Pi score': num(p.pi),
+            'Robustness': (p.r == null ? '' : p.r)};
+  }
+  window.depRow = function(p){ return rowOut(p, parseFloat(p.d) > 0 ? 'Up' : 'Down'); };
+  function byP(a, b){ return parseFloat(a.p) - parseFloat(b.p); }
+  function fmtP(v){ var x = parseFloat(v); return isNaN(x) ? '—' : x.toExponential(2); }
+
+  // Classeurs : noms de feuilles valides et uniques (31 caractères au plus)
+  window.makeWb = function(sheets){
+    var wb = XLSX.utils.book_new(), used = {};
+    sheets.forEach(function(s){
+      var ws = XLSX.utils.json_to_sheet(s.data);
+      if(s.data.length){
+        ws['!cols'] = Object.keys(s.data[0]).map(function(k){
+          var w = k.length;
+          s.data.slice(0, 50).forEach(function(r){ w = Math.max(w, String(r[k] == null ? '' : r[k]).length); });
+          return {wch: Math.min(45, w)};
+        });
+      }
+      var base = String(s.name).replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 31), name = base, k = 2;
+      while(used[name.toLowerCase()]){ var suf = '~' + (k++); name = base.slice(0, 31 - suf.length) + suf; }
+      used[name.toLowerCase()] = 1;
+      XLSX.utils.book_append_sheet(wb, ws, name);
+    });
+    return wb;
+  };
+
+  // ── Volcano ──
+  window.exportVolcAll = function(){
+    var c = activeContrast;
+    var data = fullRows(c).slice().sort(byP).map(function(p){
+      return rowOut(p, isSig(p, RULE.lfc, RULE.ptype, RULE.p) ? (p.d > 0 ? 'Up' : 'Down') : 'NS');
+    });
+    xls(makeWb([{name: 'All', data: data}]), 'proteogen_all_' + c.slice(0, 25) + '.xlsx');
+  };
+  window.exportVolcSig = function(){
+    var f = getVolcFilter(), c = activeContrast;
+    var data = fullRows(c).filter(function(p){ return (p.r || 0) >= f.rob && isSig(p, f.fc, f.ptype, f.thresh); })
+      .slice().sort(byP).map(depRow);
+    xls(makeWb([{name: 'DEP', data: data}]), 'proteogen_DEP_' + c.slice(0, 25) + '.xlsx');
+  };
+  window.exportAllDEP = function(){
+    var sum = [], sheets = [];
+    CONTRASTS.forEach(function(c){
+      var rows = fullRows(c).filter(function(p){ return isSig(p, RULE.lfc, RULE.ptype, RULE.p); }).slice().sort(byP);
+      var up = rows.filter(function(p){ return p.d > 0; }).length;
+      sum.push({'Contrast': c, 'Up': up, 'Down': rows.length - up, 'Total': rows.length, 'Rule': RULE.text});
+      sheets.push({name: c, data: rows.map(depRow)});
+    });
+    xls(makeWb([{name: 'Summary', data: sum}].concat(sheets)), 'proteogen_DEP_tous_contrastes.xlsx');
+  };
+
+  // ── Tableau DEP : même filtre pour l'affichage et l'export ──
+  window.protFilter = function(){
+    var c = document.getElementById('protContrast').value;
+    var dir = document.getElementById('protDir').value;
+    var rob = parseInt(document.getElementById('protRob').value) || 0;
+    var pt = document.querySelector('input[name="ptypeProt"]:checked');
+    var ptype = pt ? pt.value : RULE.ptype;
+    var thresh = parseFloat(document.getElementById('protPThresh').value);
+    var le = document.getElementById('protLFC');
+    var fc = le ? parseFloat(le.value) : RULE.lfc;
+    var q = (document.getElementById('protSearch').value || '').toLowerCase().trim();
+    var rows = fullRows(c).filter(function(p){
+      if(!isSig(p, fc, ptype, thresh)) return false;
+      if(dir === 'U' && !(p.d > 0)) return false;
+      if(dir === 'D' && !(p.d < 0)) return false;
+      if((p.r || 0) < rob) return false;
+      if(q && geneOf(p).toLowerCase().indexOf(q) < 0 && (p.name || '').toLowerCase().indexOf(q) < 0 &&
+         (p.desc || '').toLowerCase().indexOf(q) < 0) return false;
+      return true;
+    });
+    return {c: c, rows: rows, fc: fc, ptype: ptype, thresh: thresh};
+  };
+  window.renderProtTable = function(){
+    var f = protFilter(), col = window._protSortCol || 'p', asc = window._protSortAsc !== false;
+    var key = {lfc: function(p){ return Math.abs(parseFloat(p.d)); }, padj: function(p){ return parseFloat(p.padj); },
+               pi: function(p){ return parseFloat(p.pi) || 0; }, rob: function(p){ return parseInt(p.r) || 0; }}[col]
+              || function(p){ return parseFloat(p.p); };
+    var pts = f.rows.slice().sort(function(a, b){ var va = key(a), vb = key(b); return asc ? (va - vb) : (vb - va); });
+    var tbody = document.getElementById('protBody'); tbody.innerHTML = '';
+    var nIt = RULE.n_iter;
+    pts.slice(0, 300).forEach(function(p){
+      var isU = p.d > 0, ds = p.desc || '', rr = p.r || 0, rf = nIt > 0 ? rr / nIt : 0;
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td class="mono">' + p.name + '</td>' +
+        '<td style="color:' + THEME.tx + ';font-weight:600;">' + (geneOf(p) || '—') + '</td>' +
+        '<td style="font-size:11px;color:var(--tx2);" title="' + ds.replace(/"/g, '&quot;') + '">' +
+          ds.slice(0, 40) + (ds.length > 40 ? '…' : '') + '</td>' +
+        '<td>' + (isU ? '<span class="badge bu">↑ Up</span>' : '<span class="badge bd2c">↓ Down</span>') + '</td>' +
+        '<td style="color:' + (isU ? '#3fb950' : '#f85149') + ';font-weight:600;">' + parseFloat(p.d).toFixed(3) + '</td>' +
+        '<td style="color:var(--tx2);">' + fmtP(p.p) + '</td>' +
+        '<td style="color:var(--tx2);">' + fmtP(p.padj) + '</td>' +
+        '<td style="color:var(--bl);">' + (p.pi == null ? '—' : parseFloat(p.pi).toFixed(3)) + '</td>' +
+        '<td><span style="color:' + (rf >= 0.75 ? '#3fb950' : rf >= 0.4 ? '#d29922' : THEME.tx2) + '">' +
+          rr + (nIt > 0 ? '/' + nIt : '') + '</span></td>';
+      tbody.appendChild(tr);
+    });
+    var cnt = document.getElementById('protCount');
+    if(cnt) cnt.textContent = f.rows.length + ' DEP proteins (' + (f.ptype === 'padj' ? 'p.adj' : 'p.value') +
+      ' < ' + f.thresh + ' & |log2FC| ≥ ' + (+f.fc).toFixed(3) + ')' +
+      (f.rows.length > 300 ? ' — first 300 shown; the export contains all of them' : '');
+  };
+  window.exportProtFiltered = function(){
+    var f = protFilter();
+    xls(makeWb([{name: 'DEP_filtered', data: f.rows.slice().sort(byP).map(depRow)}]),
+        'proteogen_table_DEP_' + f.c.slice(0, 25) + '.xlsx');
+  };
+
+  // ── Intersections : une colonne par contraste, avec son nom ──
+  function interRow(r){
+    var o = {'Protein': r.pg, 'Gene': r.g, 'Description': r.desc || '', 'N conditions': r.nb};
+    CONTRASTS.forEach(function(c, i){ o[c] = r['c' + (i + 1)] === 'X' ? 'X' : ''; });
+    return o;
+  }
+  window.exportInterAll = function(){
+    xls(makeWb([{name: 'Intersections_full', data: INTERSECTIONS.slice().sort(function(a, b){ return b.nb - a.nb; }).map(interRow)}]),
+        'proteogen_intersections_all.xlsx');
+  };
+  window.exportInterFiltered = function(){
+    var nbMin = parseInt(document.getElementById('nbMin').value);
+    var q = (document.getElementById('interSearch').value || '').toLowerCase().trim();
+    var rows = INTERSECTIONS.filter(function(r){ return r.nb >= nbMin; });
+    if(q) rows = rows.filter(function(r){ return (r.g || '').toLowerCase().indexOf(q) >= 0 ||
+      (r.pg || '').toLowerCase().indexOf(q) >= 0 || (r.desc || '').toLowerCase().indexOf(q) >= 0; });
+    xls(makeWb([{name: 'Intersections', data: rows.map(interRow)}]), 'proteogen_intersections_filtered.xlsx');
+  };
+
+  // ── Heatmap : libellés d'origine des échantillons, p.adj de l'ANOVA ──
+  function hmRow(r){
+    var o = {'Protein': r.pg, 'Gene': r.g, 'Cluster': r.cl, 'ANOVA p.adj': r.q};
+    SAMPLE_COLS.forEach(function(s, i){ o[(SAMPLE_LABELS && SAMPLE_LABELS[s]) || s] = r.v[i]; });
+    return o;
+  }
+  window.exportHmAll = function(){
+    xls(makeWb([{name: 'Heatmap_full', data: HEATMAP.slice().sort(function(a, b){ return a.cl.localeCompare(b.cl) || a.q - b.q; }).map(hmRow)}]),
+        'proteogen_heatmap_complet.xlsx');
+  };
+  window.exportHmFiltered = function(){
+    var clF = document.getElementById('hmCluster').value, nMax = parseInt(document.getElementById('hmN').value);
+    var q = (document.getElementById('hmSearch').value || '').toLowerCase().trim();
+    var rows = HEATMAP.slice();
+    if(clF !== 'all') rows = rows.filter(function(r){ return r.cl === clF; });
+    if(q) rows = rows.filter(function(r){ return (r.g || '').toLowerCase().indexOf(q) >= 0 || (r.pg || '').toLowerCase().indexOf(q) >= 0; });
+    rows = rows.sort(function(a, b){ return a.q - b.q; }).slice(0, nMax);
+    xls(makeWb([{name: 'Heatmap_Zscore', data: rows.map(hmRow)}]), 'proteogen_heatmap_filtered.xlsx');
+  };
+
+  // ── GO : contraste par défaut si la page GO n'a pas encore été ouverte ──
+  window.exportGOTable = function(){
+    var sel = document.getElementById('goBubbleContrast');
+    var keys = Object.keys(GO_BUBBLE || {}).filter(function(k){ return (GO_BUBBLE[k] || []).length; });
+    var c = (sel && sel.value) ? sel.value : keys[0];
+    if(!c) return;
+    var lines = ['Source,Term,Term_ID,p_value,z_score,intersection_size,gene_ratio,genes'];
+    var esc = function(v){ return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
+    (GO_BUBBLE[c] || []).slice().sort(function(a, b){ return a.p - b.p; }).forEach(function(d){
+      lines.push([d.src, esc(d.term), d.tid, d.p, d.z, d.is, d.gr, esc(d.genes)].join(','));
+    });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([lines.join('\n')], {type: 'text/csv'}));
+    a.download = 'proteogen_GO_' + c + '.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+  window.exportWGCNA = function(){
+    var data = WGCNA_ROWS.map(function(r){ return {'Gene': r.g, 'Module': r.mod, 'HubScore': r.hub, 'Description': r.desc || ''}; });
+    xls(makeWb([{name: 'WGCNA (grey excluded)', data: data}]), 'proteogen_WGCNA.xlsx');
+  };
+
+  // ── Curseurs : valeurs exactes de la règle (plus de crans qui déplacent le seuil) ──
+  function setRange(id, val, labelId, digits){
+    var e = document.getElementById(id); if(!e) return;
+    e.step = 'any'; if(+e.max < val) e.max = val; e.value = val;
+    var l = document.getElementById(labelId); if(l) l.textContent = (+val).toFixed(digits);
+  }
+  function setRadio(name, v){ var r = document.querySelector('input[name="' + name + '"][value="' + v + '"]'); if(r) r.checked = true; }
+  setRange('fcSlider', RULE.lfc, 'fcVal', 3);
+  setRange('pThresh', RULE.p, 'pThreshVal', 3);
+  setRadio('ptype', RULE.ptype);
+  setRange('protLFC', RULE.lfc, 'protLFCVal', 3);
+  setRange('protPThresh', RULE.p, 'protPThreshVal', 3);
+  setRadio('ptypeProt', RULE.ptype);
+  var fcS = document.getElementById('fcSlider');
+  if(fcS) fcS.oninput = function(){ document.getElementById('fcVal').textContent = (+this.value).toFixed(3); drawVolcano(); };
+  // Robustesse : compte 0..n_iter (et non un pourcentage)
+  ['robSlider', 'protRob'].forEach(function(id){
+    var e = document.getElementById(id); if(!e) return;
+    if(RULE.n_iter > 0){ e.max = RULE.n_iter; e.step = 1; }
+    else { e.max = 0; e.disabled = true; e.title = 'Robustness score not computed (n_iter_robustness = 0)'; }
+    e.value = 0;
+  });
+  // Tableau DEP : rebrancher les contrôles sur les nouvelles fonctions, sans doublons
+  var _ipt = window.initProtTable;
+  window.initProtTable = function(){ var s = document.getElementById('protContrast'); if(s) s.innerHTML = ''; return _ipt && _ipt(); };
+  var sel = document.getElementById('protContrast');
+  if(sel){ var seen = {}; Array.from(sel.options).forEach(function(o){ if(seen[o.value]) o.remove(); else seen[o.value] = 1; });
+           sel.onchange = renderProtTable; }
+  var el;
+  if((el = document.getElementById('protDir'))) el.onchange = renderProtTable;
+  if((el = document.getElementById('protSearch'))) el.oninput = renderProtTable;
+  if((el = document.getElementById('protRob'))) el.oninput = function(){ document.getElementById('protRobVal').textContent = this.value; renderProtTable(); };
+  if((el = document.getElementById('protPThresh'))) el.oninput = function(){ document.getElementById('protPThreshVal').textContent = (+this.value).toFixed(3); renderProtTable(); };
+  if((el = document.getElementById('protLFC'))) el.oninput = function(){ document.getElementById('protLFCVal').textContent = (+this.value).toFixed(3); renderProtTable(); };
+  document.querySelectorAll('input[name="ptypeProt"]').forEach(function(r){ r.onchange = renderProtTable; });
+  // Tuiles des contrastes (page Volcano) : initDepGrid rappelé -> rangée dupliquée
+  var _idg = window.initDepGrid;
+  window.initDepGrid = function(){ var w = document.getElementById('depGrid'); if(w) w.innerHTML = ''; return _idg && _idg(); };
+  try { initDepGrid(); } catch(e){}
+  // Libellés : la règle réelle
+  document.querySelectorAll('.clbl').forEach(function(s){ if(s.textContent.trim() === 'threshold ≤') s.textContent = 'threshold <'; });
+  document.querySelectorAll('.ph span').forEach(function(s){ if(/LFC\|\s*>\s*0\.26/.test(s.textContent)) s.textContent = RULE.text; });
+  document.querySelectorAll('span').forEach(function(s){
+    if(s.children.length === 0 && /NS subsampled/.test(s.textContent))
+      s.textContent = 'Hover a point for details · non-significant points subsampled for display; counts, DEP table and exports use all proteins';
+  });
+  document.querySelectorAll('h2').forEach(function(h){
+    if(/^PCA — ANOVA significant proteins/.test(h.textContent))
+      h.textContent = 'PCA — samples (' + ((typeof PCA_DATA !== 'undefined' && PCA_DATA.source) || 'Deimos') + ')';
+  });
+  try { renderProtTable(); } catch(e){}
+  try { drawVolcano(); } catch(e){}
+})();
+</script>
+"""
+
+
+def patch_audit_2026_11(html):
+    """Corrections de l'audit du 06/11/2026 (claude/audit_dashboard_deimos_2026-11-06.md) :
+    gène lu dans p.g, comptes du volcano sur toutes les protéines, bornes de la règle de
+    Deimos, graduations de l'axe X, recherche globale sur toutes les protéines, puis le
+    script AUDIT_FIX_JS (exports, tableau DEP, curseurs, intersections, heatmap)."""
+    # PROTEOME_DATA porte le gène dans 'g' (le JS lisait 'Genes') : p.Genes -> (p.g||p.Genes),
+    # y compris sur un chemin (best.p.Genes -> (best.p.g||best.p.Genes))
+    import re as _re
+    pat = _re.compile(r'(?<![\w$.])((?:[A-Za-z_$][\w$]*\.)*p)\.Genes\b')
+    n0 = len(pat.findall(html))
+    html = pat.sub(lambda m: f"({m.group(1)}.g||{m.group(1)}.Genes)", html)
+    i = html.find("function drawVolcano(){")
+    if i >= 0:
+        seg_end = html.find("\nfunction ", i + 10)
+        seg = html[i:seg_end if seg_end > 0 else len(html)]
+        new = seg.replace("const isU=sig&&p.d>fc,isD=sig&&p.d<-fc;",
+                          "const isU=sig&&p.d>0,isD=sig&&p.d<0;")
+        new = new.replace(
+            "[-3,-2,-1,0,1,2,3].filter(v=>v>=xmin&&v<=xmax)",
+            "(function(){var st=Math.max(1,Math.ceil((xmax-xmin)/8)),t=[];"
+            "for(var v=Math.ceil(xmin/st)*st;v<=xmax;v+=st)t.push(v);return t;})()")
+        new = new.replace(
+            "ctx.font='bold 12px sans-serif';ctx.textAlign='left';",
+            "if(typeof fullCounts==='function'){var _fcn=fullCounts(activeContrast,fc,ptype,thresh,rob);"
+            "su=invertActive?_fcn.d:_fcn.u;sd=invertActive?_fcn.u:_fcn.d;}"
+            "ctx.font='bold 12px sans-serif';ctx.textAlign='left';", 1)
+        html = html[:i] + new + html[i + len(seg):]
+    # PCA de la page QC : graduations adaptées à l'étendue (elles étaient fixées à -2..2)
+    tick = ("(function(a,b){var r=b-a,st=Math.pow(10,Math.floor(Math.log10(r/4))),m=r/4/st;"
+            "st*=(m>=5?5:m>=2?2:1);var t=[];for(var v=Math.ceil(a/st)*st;v<=b;v+=st)"
+            "t.push(Math.round(v/st)*st);return t;})")
+    html = html.replace(
+        "[-2,-1,0,1,2].filter(v=>v>=xmn&&v<=xmx).forEach(v=>{ctx.textAlign='center';ctx.fillText(v.toFixed(0),sx(v),H-22);});",
+        tick + "(xmn,xmx).forEach(v=>{ctx.textAlign='center';ctx.fillText(+v.toPrecision(3),sx(v),H-22);});")
+    html = html.replace(
+        "[-2,-1,0,1,2].filter(v=>v>=ymn&&v<=ymx).forEach(v=>{ctx.fillText(v.toFixed(0),pad.l-4,sy(v)+3);});",
+        tick + "(ymn,ymx).forEach(v=>{ctx.fillText(+v.toPrecision(3),pad.l-4,sy(v)+3);});")
+    html = html.replace(
+        "Object.entries(VOLCANO||{}).forEach(function(e){\n      var contrast=e[0],pts=e[1];",
+        "Object.entries((typeof fullView==='function'?fullView():VOLCANO)||{}).forEach(function(e){\n"
+        "      var contrast=e[0],pts=e[1];")
+    marker = '<!--PROTEOGEN_BODY_END-->'
+    if marker in html:
+        html = html.replace(marker, AUDIT_FIX_JS + marker, 1)
+    else:
+        pos = html.rfind('</body>')
+        html = html[:pos] + AUDIT_FIX_JS + html[pos:]
+    print(f"  patch_audit_2026_11 : règle de Deimos, toutes protéines, gènes ({n0} accès), "
+          f"intersections, heatmap, curseurs.")
+    return html
 
 
 def main():
@@ -6296,12 +6767,14 @@ def main():
             chosen_params = None
     # Les seuils du pipeline définissent le statut DEP embarqué (volcano comparatif,
     # résumés) : mêmes protéines significatives que l'Excel et les volcanos PNG.
-    global P_THRESH, LFC_THRESH, SIG_SUFFIX
+    global P_THRESH, LFC_THRESH, SIG_SUFFIX, N_ITER_ROB, SAMPLE_LABELS, _GO_MANIFEST
     if chosen_params:
         try:
             P_THRESH = float(chosen_params.get("volcano_p_thresh", P_THRESH))
             LFC_THRESH = float(chosen_params.get("volcano_lfc_min", LFC_THRESH))
             SIG_SUFFIX = '_p.adj' if chosen_params.get("volcano_use_padj") else '_p.val'
+            N_ITER_ROB = int(chosen_params.get("n_iter_robustness", 0) or 0)
+            SAMPLE_LABELS = dict(chosen_params.get("sample_labels") or {})
         except (TypeError, ValueError):
             pass
 
@@ -6338,6 +6811,12 @@ def main():
 
     # 1. Lecture des stats
     df_comp, df_z, df_anova, df_inter, contrasts, sample_cols = read_stats(stats)
+    # GO : appariement onglet -> contraste par le _manifest de Deimos (classeur GO ou stats)
+    _GO_MANIFEST = read_manifest_go(go) if go else {}
+    if not _GO_MANIFEST:
+        _GO_MANIFEST = read_manifest_go(stats)
+    # Matrice des tests (moyennes des scatter / MA, repli de la PCA)
+    imp = read_analysis_matrix(stats)
     conditions, cond_map = build_conditions(sample_cols)
     cond_map_inv = {col: cond for cond, cols in cond_map.items() for col in cols}
     print("  -> %d contrastes, %d échantillons, %d conditions, %d protéines"
@@ -6358,8 +6837,16 @@ def main():
     data['intersections'] = inter_rows
     data['upset'] = upset
     # Projections de visualisation (dérivées des intensités, pas de recalcul de stats)
-    data['pca'] = build_pca(df_comp, sample_cols, cond_map_inv)
-    data['proteome_data'] = build_proteome_data(df_comp, contrasts, cond_map)
+    data['pca'] = build_pca(df_comp, sample_cols, cond_map_inv, stats_path=stats, imp=imp)
+    data['proteome_data'] = build_proteome_data(df_comp, contrasts, cond_map, imp=imp)
+    # Toutes les protéines (comptes, tableau DEP, recherche, exports) et règle de Deimos
+    data['full_de'] = build_full_de(df_comp, contrasts)
+    data['scatter_r'] = build_scatter_r(df_comp, contrasts, cond_map, imp=imp)
+    _ptxt = 'p.adj' if SIG_SUFFIX == '_p.adj' else 'p.value'
+    data['dep_rule'] = {'ptype': 'padj' if SIG_SUFFIX == '_p.adj' else 'p', 'p': P_THRESH,
+                        'lfc': LFC_THRESH, 'n_iter': N_ITER_ROB,
+                        'text': f"{_ptxt} < {P_THRESH:g} & |log2FC| \u2265 {LFC_THRESH:.3g}",
+                        'from_pipeline': bool(chosen_params)}
     data['volcano_bh'] = build_volcano_bh(df_comp, contrasts)
     data['pca_load'] = build_pca_loadings(stats)
     # Modules optionnels
@@ -6425,6 +6912,9 @@ def main():
     html = patch_pca_loadings(html)
     html = patch_go_network_js(html)
     html = patch_go_heatmap_js(html)
+    # 3j. Corrections de l'audit du 06/11/2026 (règle de Deimos, toutes protéines,
+    #     gènes, intersections, crans des curseurs...) — en dernier : elles priment
+    html = patch_audit_2026_11(html)
 
     # 4. Vérifications avant livraison (checklist du skill)
     assert 'const PROTEOME_DATA=' in html

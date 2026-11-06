@@ -204,6 +204,11 @@ MSigDB (data.broadinstitute.org), unless local `.gmt` files are given.
 
 (If absent, the dashboard falls back to loading both from cdnjs.cloudflare.com.)
 
+**Rebuild the dashboard only** — after a dashboard update, regenerate it from a finished run
+without re-running the pipeline: `python rebuild_dashboard.py proteomics_output`. The
+dashboard applies the run's selection rule everywhere (counts, DEP table, exports) and embeds
+every protein for its exports; only the volcano cloud is subsampled for display.
+
 ---
 
 ## Usage
@@ -348,6 +353,7 @@ deimos-proteomics-pipeline/
 ├── build_dashboardv7.py          # HTML dashboard generator
 ├── dashboard_template.html       # Dashboard template (light/dark theme)
 ├── diagnostic_dashboard.py       # Dashboard diagnostic utility
+├── rebuild_dashboard.py          # Regenerate the dashboard of a finished run
 ├── check_paired.py               # Pre-flight check of a paired design
 ├── check_gsea.py                 # GSEA integration diagnostic
 ├── diag_go.py                    # GO via orthologues: ID format, gProfiler coverage, backgrounds

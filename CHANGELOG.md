@@ -102,6 +102,10 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **`rebuild_dashboard.py`**: regenerates `proteogen_dashboard.html` from a finished run
+  (workbook + `last_config.yaml`, samples from `PCA_Scores`) without re-running the pipeline —
+  e.g. after a dashboard update. `--config` for runs whose `last_config.yaml` is missing.
+
 - **RBH progress** (Perseverance and STRING orthology): DIAMOND runs quietly, so Deimos now prints
   each of the four steps (two databases, two blastp searches) with sequence counts, threads and
   duration — a long reverse search no longer looks like a freeze. DIAMOND uses all cores minus one
@@ -309,6 +313,43 @@ and dashboard improvements accumulated since the previous public version.
   the HTML dashboard from an existing Excel workbook without rerunning analysis).
 
 ### Fixed
+
+- **Dashboard audit (06/11/2026): the dashboard now shows and exports what the workbook holds.**
+  Checked in Chromium on two full runs (400 and 3,200 proteins; raw p < 0.05 & ratio 1.5, and
+  p.adj < 0.05 & ratio 2), every export downloaded and compared with the Excel
+  (`claude/audit_dashboard_deimos_2026-11-06.md` in the project).
+  - GO sheets matched to contrasts by the `_manifest` (`go_sheet`), the name only as a fallback:
+    `GO_KOvWT` was shown and exported under `KO_vs_WT_stress` instead of `KO_vs_WT`.
+  - One selection rule everywhere, the run's (`p.adj`/`p.value` < threshold & |log2FC| ≥
+    log2(ratio), same bounds as `volcano_status`): DEP table, its export, "Export all DEP"
+    (Summary and per-contrast sheets now agree: 19 proteins instead of 448), volcano counts.
+    Sliders start on the exact rule (no 0.05 / 0.1 steps that turned 0.585 into 0.60 / 0.3);
+    p.adj selected when the run uses it; the export always equals what the table shows.
+  - Every protein is embedded once in a compact table (`FULL_DE`): "All proteins" exports all of
+    them (3,200 / 3,200 instead of 1,648), counts, DEP table, relaxed filters and the global
+    search cover all proteins; only the volcano cloud stays subsampled.
+  - Scatter / MA plots: condition means from the analysis matrix (`Log2_Impute`, like the Excel
+    scatter plots) instead of raw LFQ with missing values counted as 0 (bands at 3/4, 1/2, 1/4
+    of the intensity); Pearson r on all proteins.
+  - QC page PCA = the Deimos PCA (`PCA_Scores`), titled accordingly (was a raw-LFQ PCA with
+    NaN → 0 under a hard-coded "ANOVA significant proteins (n=847)" title); axis ticks follow
+    the range.
+  - Gene column filled and gene search working (table, volcano, global search): the JS read
+    `p.Genes`, the data carry `p.g`.
+  - Heatmap exports: "ANOVA p.adj" (was a `q-value` column at 1.0 for every protein, so the
+    filtered top N was not sorted by significance); original sample labels as headers.
+  - Intersection exports: one column per contrast with its name (were legacy "M/P1…P2/P3"
+    headers, 4th contrast missing, nothing beyond 6 contrasts).
+  - p-values kept to 4 significant digits (p < 5e-7 was exported and shown as 0).
+  - Robustness sliders and colours on 0…`n_iter_robustness` (the score is a count, not a %).
+  - Unique, valid sheet names in every export (two contrasts with the same first 31 characters
+    made the whole export fail).
+  - CV plot on linear intensities; ranked abundance without missing values counted as 0;
+    duplicated contrast tiles and dropdown entries removed; GO CSV export works before the GO
+    page is opened; WGCNA export says the grey module is excluded.
+  Tests: `tests/test_dashboard_audit.py`.
+- **`last_config.yaml` is also written when Deimos runs with `--config`** (the header of
+  `config.py` promised it; InSight and `rebuild_dashboard.py` read it).
 
 - **Perseverance: DIAMOND no longer hangs silently.** DIAMOND 2.2.8 (the version shipped)
   never exits when the first 10 sequences of a FASTA are nucleotide (CDS, transcripts):

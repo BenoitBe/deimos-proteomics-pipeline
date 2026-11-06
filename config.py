@@ -553,6 +553,9 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
             params["batch_column"] = None
 
         print_config_summary(params)
+        # last_config.yaml aussi avec --config (contrat de l'en-tête : toujours écrit),
+        # relu par InSight et par rebuild_dashboard.py
+        _save_last_config(params)
         return params
 
     # ── B. Proposition de rechargement last_config ─────────────────────────────
