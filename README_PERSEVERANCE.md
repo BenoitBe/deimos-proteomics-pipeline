@@ -127,6 +127,12 @@ annotation.
 3. **Le choix de l'espèce de référence est manuel** — pas de sélection
    automatique de la référence la plus proche disponible.
 
+4. **DIAMOND 2.2 se bloque sur un FASTA nucléotidique** (10 premières séquences en
+   A/C/G/T/N) au lieu de s'arrêter en erreur. Perseverance contrôle donc les deux FASTA
+   avant DIAMOND et surveille chaque appel (arrêt après 3 min sans CPU) ; la sortie de
+   DIAMOND est dans `perseverance/diamond_<étape>.log`. Le FASTA de référence doit être
+   un **protéome** (UniProt *reference proteome*, RefSeq `protein.faa`), pas des CDS.
+
 ## Architecture
 
 ```

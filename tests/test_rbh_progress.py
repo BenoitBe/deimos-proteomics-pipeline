@@ -22,7 +22,22 @@ def test_progress_lines_and_threads(tmp_path, monkeypatch, capsys):
         if "--out" in cmd:
             open(cmd[cmd.index("--out") + 1], "w").close()
         return _Ok()
+
+    class FakePopen:                    # DIAMOND est lancé sous surveillance (Popen)
+        def __init__(self, cmd, **kw):
+            fake_run(cmd)
+            self.returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
     monkeypatch.setattr(rbh.subprocess, "run", fake_run)
+    monkeypatch.setattr(rbh.subprocess, "Popen", FakePopen)
     q, r = tmp_path / "q.fa", tmp_path / "r.fa"
     q.write_text(">a\nMA\n>b\nMA\n")
     r.write_text(">c\nMA\n")

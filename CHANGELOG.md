@@ -310,6 +310,24 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **Perseverance: DIAMOND no longer hangs silently.** DIAMOND 2.2.8 (the version shipped)
+  never exits when the first 10 sequences of a FASTA are nucleotide (CDS, transcripts):
+  it reports "only contain DNA letters", keeps the message in its buffer when its output is
+  captured, and waits forever at 0 % CPU — the run stopped at "Construction de la base
+  DIAMOND (reference.fasta)..." with no message. Now (`rbh.py`):
+  - both FASTA are checked before DIAMOND (`check_protein_fasta`): nucleotide content,
+    UTF-16 or UTF-8 BOM encoding, CR-only line endings, empty sequences, not a FASTA —
+    clear message, Deimos continues without orthologues;
+  - each DIAMOND call is watched: killed after 3 min without CPU time (`IDLE_KILL_S`) or
+    5 s after an `Error:` line, with the last DIAMOND step and a hint in the message;
+  - DIAMOND output goes to one log per step (`perseverance/diamond_<step>.log`, with the
+    command line) instead of being discarded; blastp progress feeds a heartbeat line every
+    30 s; Ctrl+C also stops DIAMOND (no orphan `diamond.exe`).
+  Measured with DIAMOND 2.2.8: 6,703 vs 40,000 proteins, makedb < 1 s each, blastp ~5 s
+  each (2 threads). Tests: `tests/test_rbh_watchdog.py`.
+- **`tests/test_pca_loadings.py` restored**: the 06/11 push replaced it with an older copy,
+  dropping `test_driver_labels_do_not_overlap` and `test_missing_gene_and_description_do_not_crash`.
+
 - **GO lollipop / dotplot layout**: with a single source the general title overlapped the
   facet title (top margin as a fraction of a 2.4-inch figure); fixed 0.8-inch header now.
   Dotplot: the colour bar and the Count legend have their own columns (the legend sat on
