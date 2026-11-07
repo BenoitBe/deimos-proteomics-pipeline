@@ -1128,7 +1128,7 @@ def build_go(path, contrasts, df_comp):
                 'source': safe_str(r.get('source')),
                 'term_name': safe_str(r.get('term_name')),
                 'term_id': safe_str(r.get('term_id')),
-                'p_value': round(float(r['p_value']), 5) if pd.notna(r.get('p_value')) else None,
+                'p_value': _sig4(float(r['p_value'])) if pd.notna(r.get('p_value')) else None,
                 'intersection_size': int(r['intersection_size']) if pd.notna(r.get('intersection_size')) else 0,
                 'query_size': int(r['query_size']) if pd.notna(r.get('query_size')) else 0,
                 'z_score': round(float(r['z_score']), 5) if pd.notna(r.get('z_score')) else 0.0,
@@ -1163,7 +1163,7 @@ def build_go(path, contrasts, df_comp):
                 if genes:
                     chord_terms.append({
                         'term': safe_str(r.get('term_name')),
-                        'p': round(float(r['p_value']), 5) if pd.notna(r.get('p_value')) else None,
+                        'p': _sig4(float(r['p_value'])) if pd.notna(r.get('p_value')) else None,
                         'z': round(float(r['z_score']), 3) if pd.notna(r.get('z_score')) else 0.0,
                         'genes': genes,
                     })
@@ -1309,7 +1309,7 @@ def build_go_bubble(path, contrasts):
                 'term':   safe_str(r.get('term_name'))[:80],
                 'tid':    safe_str(r.get('term_id')),
                 'src':    safe_str(r.get('source','?')),
-                'p':      round(p, 6),
+                'p':      _sig4(p),
                 'lp':     round(float(-np.log10(max(p, 1e-10))), 3),
                 'z':      round(float(r.get('z_score', 0) or 0), 4),
                 'gr':     round(float(r.get('gene_ratio', 0) or 0), 4),
@@ -1500,7 +1500,7 @@ def build_go_network(path, contrasts):
                 'id':   tid,
                 'name': safe_str(row.get('term_name', tid))[:60],
                 'src':  safe_str(row.get('source', '?')),
-                'p':    round(float(row['p_value']), 6) if pd.notna(row.get('p_value')) else 1.0,
+                'p':    _sig4(float(row['p_value'])) if pd.notna(row.get('p_value')) else 1.0,
                 'z':    round(float(row['z_score']), 4)  if pd.notna(row.get('z_score'))  else 0.0,
                 'is':   int(row['intersection_size'])    if pd.notna(row.get('intersection_size')) else 0,
                 'level': 0,  # sera calculé
@@ -6651,6 +6651,84 @@ AUDIT_FIX_JS = r"""<script>
     var data = WGCNA_ROWS.map(function(r){ return {'Gene': r.g, 'Module': r.mod, 'HubScore': r.hub, 'Description': r.desc || ''}; });
     xls(makeWb([{name: 'WGCNA (grey excluded)', data: data}]), 'proteogen_WGCNA.xlsx');
   };
+
+  // ── Page GO : un contraste sans terme significatif n'affiche rien (la vue du
+  //    contraste précédent restait affichée : panneaux, z-scores, bulles, réseau) ──
+  function goLabel(c){ return c ? String(c).replace(/_vs_/g, ' vs ').replace(/_/g, ' ') : 'this contrast'; }
+  function goMsg(c){ return 'No significant GO / pathway term for ' + goLabel(c) + ' (q < 0.05).'; }
+  function goHas(obj, c){ var v = obj && c ? obj[c] : null; return !!(v && (v.length || (v.nodes && v.nodes.length))); }
+  function blankCanvas(id, msg){
+    var cv = document.getElementById(id); if(!cv) return;
+    var par = cv.parentElement || {}, dpr = window.devicePixelRatio || 1;
+    var W = Math.max(320, (par.clientWidth || cv.offsetWidth || 600) - 24), H = 70;
+    cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    var ctx = cv.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = THEME.tx3 || '#888'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(msg, W / 2, H / 2 + 4);
+  }
+  function goCurrent(selId, obj){
+    var sel = document.getElementById(selId);
+    var c = sel && sel.value ? sel.value : null;
+    if(!c && typeof currentGOContrast !== 'undefined') c = currentGOContrast;
+    return c;
+  }
+  if(typeof window.renderGO === 'function'){
+    var _rgo = window.renderGO;
+    window.renderGO = function(contrast){
+      var c = contrast || (typeof currentGOContrast !== 'undefined' ? currentGOContrast : null) || (CONTRASTS && CONTRASTS[0]);
+      if(typeof currentGOContrast !== 'undefined') currentGOContrast = c;
+      var zb = document.getElementById('goZChartReplace');
+      if(goHas(GO_DATA, c)){ if(zb) zb.style.display = ''; _rgo.call(this, c); }
+      else {
+        var pd = document.getElementById('goSourcePanels');
+        if(pd) pd.innerHTML = '<div class="panel" style="padding:18px;color:var(--tx3);font-size:13px;flex:1 1 100%;">' + goMsg(c) + '</div>';
+        if(zb){ zb.innerHTML = ''; zb.style.display = 'none'; }
+        if(typeof goZChart !== 'undefined' && goZChart){ try { goZChart.destroy(); } catch(e){} }
+      }
+      if(typeof showGOFig === 'function'){ try { showGOFig(c); } catch(e){} }
+    };
+  }
+  if(typeof window.drawGOBubble === 'function'){
+    var _dgb = window.drawGOBubble;
+    window.drawGOBubble = function(){
+      var c = goCurrent('goBubbleContrast'), src = (document.getElementById('goBubbleSrc') || {}).value || 'all';
+      var d = (GO_BUBBLE && c && GO_BUBBLE[c]) || [];
+      if(src !== 'all') d = d.filter(function(x){ return x.src === src; });
+      if(!d.length){ blankCanvas('goBubbleCanvas', goMsg(c) + (src !== 'all' ? ' [' + src + ']' : '')); return; }
+      return _dgb.apply(this, arguments);
+    };
+  }
+  if(typeof window.renderGOTable === 'function'){
+    var _rgt = window.renderGOTable;
+    window.renderGOTable = function(){
+      var c = goCurrent('goBubbleContrast');
+      if(!goHas(GO_BUBBLE, c)){
+        var tb = document.getElementById('goTableBody');
+        if(tb) tb.innerHTML = '<tr><td colspan="8" style="padding:10px;color:var(--tx3);">' + goMsg(c) + '</td></tr>';
+        var gc = document.getElementById('goTableCount'); if(gc) gc.textContent = '0 terms';
+        return;
+      }
+      return _rgt.apply(this, arguments);
+    };
+  }
+  if(typeof window.drawGONetwork === 'function'){
+    var _dgn = window.drawGONetwork;
+    window.drawGONetwork = function(){
+      var c = goCurrent('goNetContrast');
+      if(!goHas(typeof GO_NETWORK !== 'undefined' ? GO_NETWORK : null, c)){ blankCanvas('goNetCanvas', goMsg(c)); return; }
+      return _dgn.apply(this, arguments);
+    };
+  }
+  if(typeof window.drawGOHeatmap === 'function'){
+    var _dgh = window.drawGOHeatmap;
+    window.drawGOHeatmap = function(){
+      var src = (document.getElementById('goHmSrc') || {}).value || 'all';
+      var t = (GO_HEATMAP && GO_HEATMAP.terms) || [];
+      if(src !== 'all') t = t.filter(function(x){ return x.src === src; });
+      if(!t.length){ blankCanvas('goHmCanvas', 'No significant term' + (src !== 'all' ? ' for ' + src : '') + ' in any contrast.'); return; }
+      return _dgh.apply(this, arguments);
+    };
+  }
 
   // ── Curseurs : valeurs exactes de la règle (plus de crans qui déplacent le seuil) ──
   function setRange(id, val, labelId, digits){

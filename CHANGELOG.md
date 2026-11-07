@@ -326,6 +326,12 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **Dashboard, GO page: a contrast without significant term now shows nothing.** The source
+  panels, z-score chart, bubble plot, GO network, figures and term table kept the previous
+  contrast's view (the code returned early on empty data); they now state "No significant GO /
+  pathway term for <contrast> (q < 0.05)" and empty the table counter. GO p-values in the
+  dashboard keep 4 significant digits (very small ones were shown as 0).
+
 - **Dashboard, volcano "Invert" button: the exports now follow the display.** "Significant DEP"
   and "All proteins" exported the Deimos orientation even when the volcano was inverted; they now
   carry the opposite log2FC, swapped Up/Down, the inverted contrast in the file name and a

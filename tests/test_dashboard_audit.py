@@ -109,6 +109,10 @@ def test_audit_patch_rewrites_genes_and_injects_valid_js(bd, tmp_path):
     assert "const isU=sig&&p.d>0,isD=sig&&p.d<0;" in out and "fullCounts(activeContrast" in out
     assert "[-3,-2,-1,0,1,2,3]" not in out
     assert out.index("Audit du 06/11/2026") < out.index("<!--PROTEOGEN_BODY_END-->")
+    # page GO : un contraste sans terme affiche un message, pas la vue précédente
+    for fn in ("window.renderGO = function", "window.drawGOBubble = function",
+               "window.renderGOTable = function", "window.drawGONetwork = function"):
+        assert fn in bd.AUDIT_FIX_JS
     # bouton « Inverser » : les exports du volcano suivent l'affichage
     assert "volcOrient(fullRows(c))" in bd.AUDIT_FIX_JS and "volcName()" in bd.AUDIT_FIX_JS
     node = shutil.which("node")
