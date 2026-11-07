@@ -180,21 +180,30 @@ def ask_go_params() -> dict | None:
     print("  detects coordinated pathway shifts (even below the DEP threshold).")
     print("  [!] Requires 'gseapy' installed and internet access (Enrichr / MSigDB),")
     print("      or local .gmt files (config key gsea_gene_sets).")
-    print("  [!] Proteins are matched to the gene sets by gene symbol (Genes column):")
-    print("      mammals and species named after human/mouse genes.")
+    print("  [!] Human / mouse gene sets: proteins matched by gene symbol (Genes column),")
+    print("      for mammals. A. thaliana and other g:Profiler species: g:Profiler GO,")
+    print("      proteins linked by g:Convert (or Perseverance orthologues, e.g. B. napus).")
     if params.get("backend") == "string":
-        print("  [!] Independent of the STRING backend: for bacteria or plants,")
-        print("      these gene sets do not apply — answer N.")
+        print("  [!] Independent of the STRING backend: for bacteria, answer N.")
     rep_gsea = input("  Also run GSEA? (y/N) -> ").strip().lower()
     if rep_gsea in ("o", "oui", "y", "yes"):
         params["run_gsea"] = True
         print("  Gene sets:")
         print("     [1] human — Enrichr: GO 2021, KEGG 2021, Reactome 2022 (default)")
         print("     [2] mouse — MSigDB mouse: hallmarks, Reactome, WikiPathways, GO")
-        rep_org = input("  Gene sets [1/2] (default 1) -> ").strip().lower()
-        params["gsea_organism"] = ("mouse" if rep_org in ("2", "mouse", "m", "souris",
-                                                          "mmusculus", "mus musculus")
-                                   else "human")
+        print("     [3] A. thaliana — g:Profiler GO (Arabidopsis, or Brassica through")
+        print("         Perseverance orthologues to athaliana)")
+        print("     [4] other g:Profiler species (code, e.g. hvulgare, osativa)")
+        rep_org = input("  Gene sets [1/2] (3 = A. thaliana, 4 = other; default 1) -> ").strip().lower()
+        if rep_org in ("3", "athaliana", "arabidopsis", "a. thaliana", "ath"):
+            params["gsea_organism"] = "athaliana"
+        elif rep_org in ("4", "other", "autre"):
+            code = input("  g:Profiler organism code (e.g. hvulgare) -> ").strip().lower()
+            params["gsea_organism"] = f"gprofiler:{code}" if code else "human"
+        else:
+            params["gsea_organism"] = ("mouse" if rep_org in ("2", "mouse", "m", "souris",
+                                                              "mmusculus", "mus musculus")
+                                       else "human")
 
     return params
 

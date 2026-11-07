@@ -132,6 +132,17 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     (`gsea_organism: mouse`: hallmarks, Reactome, WikiPathways, GO), or local `.gmt` files
     (`gsea_gene_sets`, pinned version, no network). The log reports the share of ranked genes
     found in the gene sets
+  - **GSEA on *A. thaliana*** (`gsea_organism: athaliana`) and any other g:Profiler species
+    (`gsea_organism: gprofiler:<code>`, e.g. `gprofiler:hvulgare`, `gprofiler:osativa`): gene
+    sets = the g:Profiler GMT of the species (same source as the ORA: GO, plus the pathways
+    g:Profiler distributes for it), downloaded once and cached 30 days in
+    `~/.deimos_cache/gsea` (`gsea_cache_dir`); `gsea_go_obo: go-basic.obo` splits GO into
+    BP / MF / CC. Proteins are linked to genes by g:Convert (UniProt accession → AGI), or
+    through the Perseverance orthologues when Perseverance targets the same species — e.g.
+    *B. napus* ranked on its *A. thaliana* orthologues (homeologues sharing an orthologue keep
+    the strongest score). Local `.gmt` files (MapMan/Mercator, TAIR…) with AGI codes, gene
+    names or UniProt accessions work the same way. Each `GSEA_*` sheet states the gene-set
+    source and date and the ID mapping in cell A1
 - **Protein × sample matrices for other analyses** (`export_matrices: true`, default), folder
   `matrices/`: log2 with missing values kept (MOFA+ / MEFISTO), log2 imputed (Mfuzz, WGCNA),
   DPC abundances with standard errors and observed flags, DPC condition means, sample table and
@@ -195,7 +206,8 @@ sudo apt install diamond-aligner    # or: conda install -c bioconda diamond
 ```
 
 Enrichment needs network access to the gProfiler, STRING and UniProt APIs; GSEA to Enrichr or
-MSigDB (data.broadinstitute.org), unless local `.gmt` files are given.
+MSigDB (data.broadinstitute.org), or to g:Profiler (biit.cs.ut.ee) for `athaliana` /
+`gprofiler:<code>`, unless local `.gmt` files are given.
 
 **Dashboard offline** — place `chart.umd.min.js` and `xlsx.full.min.js` alongside `build_dashboardv7.py`:
 
@@ -438,7 +450,7 @@ enrichment_background: quantified # ORA universe: quantified (tested proteins) |
 run_perseverance:     "__auto__"  # "__auto__" (asks at runtime), true/false (gProfiler only)
 perseverance_reference_organism: null  # gProfiler code of the reference FASTA (e.g. athaliana)
 run_gsea:             false
-gsea_organism:        human       # human (Enrichr) | mouse (MSigDB)
+gsea_organism:        human       # human (Enrichr) | mouse (MSigDB) | athaliana | gprofiler:<code>
 gsea_gene_sets:       null        # null = defaults; or .gmt files / "msigdb:<collection>"
 export_matrices:      true        # matrices/ for Mfuzz, MOFA+/MEFISTO, multi-omics
 

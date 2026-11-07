@@ -102,6 +102,18 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **GSEA on *A. thaliana* and any g:Profiler species** (`gsea_organism: athaliana`, or
+  `gprofiler:<code>` such as `gprofiler:hvulgare`): gene sets from the species' g:Profiler GMT
+  (same source as the ORA), downloaded once and cached 30 days (`~/.deimos_cache/gsea`,
+  `gsea_cache_dir`), GO split into BP / MF / CC with `gsea_go_obo`. Proteins are linked to genes
+  by g:Convert (UniProt → AGI), or through the Perseverance orthologues when Perseverance targets
+  the same species (*B. napus* → *A. thaliana*); local `.gmt` files keyed by AGI, gene name or
+  UniProt accession are translated the same way. Without network or recognised IDs, falls back
+  on the Genes column with a warning. Interactive mode offers it as choice 3 (4 = another
+  g:Profiler species). Every `GSEA_*` sheet now states the gene-set source and date, the
+  ranking metric and the ID mapping in cell A1. Human / mouse runs are unchanged. Tests:
+  `tests/test_gsea_athaliana.py` (incl. a real `gseapy.prerank` on translated sets).
+
 - **`rebuild_dashboard.py`**: regenerates `proteogen_dashboard.html` from a finished run
   (workbook + `last_config.yaml`, samples from `PCA_Scores`) without re-running the pipeline —
   e.g. after a dashboard update. `--config` for runs whose `last_config.yaml` is missing.

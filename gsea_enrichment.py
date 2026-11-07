@@ -19,6 +19,8 @@
 # ==============================================================================
 
 import os
+import re
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -51,24 +53,63 @@ DEFAULT_GENE_SETS_MOUSE = [
 DEFAULT_MSIGDB_VERSION = {"human": "2025.1.Hs", "mouse": "2025.1.Mm"}
 GSEA_ORGANISMS = ("human", "mouse")
 
+# gsea_organism: athaliana (ou gprofiler:<code> pour toute espèce de g:Profiler,
+# ex. gprofiler:hvulgare, gprofiler:osativa) — jeux de gènes de g:Profiler (même
+# source que l'ORA : GO, et les voies que g:Profiler distribue pour l'espèce),
+# fichier GMT téléchargé une fois puis gardé en cache. Les protéines sont reliées
+# aux gènes par g:Convert (accession UniProt -> gène Ensembl, AGI chez Arabidopsis),
+# directement ou via les orthologues Perseverance vers la même espèce (B. napus ->
+# A. thaliana). Une espèce sans symboles humains/murins n'a plus besoin de la
+# colonne Genes.
+GPROFILER_GMT_URL = "https://biit.cs.ut.ee/gprofiler/static/gprofiler_full_{org}.name.gmt"
+GPROFILER_NAMED = {"athaliana": "athaliana", "arabidopsis": "athaliana",
+                   "a.thaliana": "athaliana", "arabidopsis_thaliana": "athaliana"}
+GMT_CACHE_DAYS = 30            # GMT g:Profiler retéléchargé au-delà (ou supprimer le fichier)
+_GP_CODE = re.compile(r"^[a-z][a-z0-9_]+$")
+_NO_HIT = {"", "NONE", "N/A", "NAN"}
+LAST_SOURCES = []              # provenance des jeux chargés (écrite dans les onglets GSEA)
+
+
+def gprofiler_code(organism) -> "str | None":
+    """Code g:Profiler de gsea_organism ('athaliana', 'gprofiler:hvulgare'), None pour
+    human / mouse (Enrichr / MSigDB) ou une valeur invalide."""
+    o = str(organism or "").strip().lower()
+    if o in GPROFILER_NAMED:
+        return GPROFILER_NAMED[o]
+    if o.startswith("gprofiler:"):
+        code = o.split(":", 1)[1].strip()
+        return code if _GP_CODE.match(code) else None
+    return None
+
+
+def valid_gsea_organism(organism) -> bool:
+    return str(organism or "").strip().lower() in GSEA_ORGANISMS or gprofiler_code(organism) is not None
+
 
 def gsea_settings(params, go_params=None) -> dict:
     """Réglages GSEA lus dans la configuration (clés gsea_*), avec repli sur
     go_params (ancien passage par go_params['gsea_gene_sets'])."""
     gp = go_params or {}
     org = str(params.get("gsea_organism") or gp.get("gsea_organism") or "human").lower()
-    if org not in GSEA_ORGANISMS:
+    code = gprofiler_code(org)
+    if code:
+        org = code
+    elif org not in GSEA_ORGANISMS:
         org = "human"
     sets = params.get("gsea_gene_sets") or gp.get("gsea_gene_sets")
     if isinstance(sets, str):
         sets = [sets]
     if not sets:
-        sets = list(DEFAULT_GENE_SETS_MOUSE if org == "mouse" else DEFAULT_GENE_SETS)
+        sets = ([f"gprofiler:{code}"] if code else
+                list(DEFAULT_GENE_SETS_MOUSE if org == "mouse" else DEFAULT_GENE_SETS))
     return {
         "organism": org,
+        "gprofiler": code,
         "gene_sets": list(sets),
+        "go_obo": params.get("gsea_go_obo") or None,
+        "cache_dir": params.get("gsea_cache_dir") or None,
         "msigdb_version": str(params.get("gsea_msigdb_version")
-                              or DEFAULT_MSIGDB_VERSION[org]),
+                              or DEFAULT_MSIGDB_VERSION.get(org, DEFAULT_MSIGDB_VERSION["human"])),
         "fdr": float(params.get("gsea_fdr", gp.get("gsea_fdr", 0.25))),
         "permutations": int(params.get("gsea_permutations",
                                        gp.get("gsea_permutations", 1000))),
@@ -87,8 +128,66 @@ def read_gmt(path: str) -> dict:
     return out
 
 
+def default_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".deimos_cache", "gsea")
+
+
+def fetch_gprofiler_gmt(code: str, cache_dir: "str | None" = None, verbose: bool = True,
+                        max_age_days: float = GMT_CACHE_DAYS) -> str:
+    """Chemin local du GMT complet de g:Profiler pour l'espèce `code` (gène = nom
+    Ensembl, colonne 1 = identifiant du terme, colonne 2 = son nom). Téléchargé dans
+    cache_dir (~/.deimos_cache/gsea) et réutilisé tant qu'il a moins de max_age_days.
+    Lève une erreur claire si l'espèce est inconnue de g:Profiler ou hors ligne."""
+    import requests
+    cache_dir = cache_dir or default_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"gprofiler_full_{code}.name.gmt")
+    if os.path.isfile(path) and (time.time() - os.path.getmtime(path)) < max_age_days * 86400:
+        return path
+    url = GPROFILER_GMT_URL.format(org=code)
+    if verbose:
+        print(f"     g:Profiler gene sets for '{code}': downloading {url}")
+    r = requests.get(url, timeout=300, headers={"User-Agent": "Deimos-proteomics-pipeline"})
+    if r.status_code != 200:
+        if os.path.isfile(path):                    # cache périmé mais utilisable
+            print(f"     [WARN] download failed (HTTP {r.status_code}) — cached copy kept.")
+            return path
+        raise ValueError(f"HTTP {r.status_code} for {url} (organism code unknown to "
+                         f"g:Profiler, or offline)")
+    first = r.text.split("\n", 1)[0]
+    if first.count("\t") < 2:
+        raise ValueError(f"{url} is not a GMT file")
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(r.text)
+    os.replace(tmp, path)
+    return path
+
+
+def read_gprofiler_gmt(path: str, go_namespaces: "dict | None" = None) -> dict:
+    """GMT g:Profiler -> {(source, 'ID nom'): [gènes]}. Source = préfixe de l'ID
+    (GO, KEGG, REAC, WP…) ; GO séparé en GO:BP / GO:MF / GO:CC si go_namespaces
+    ({GO:id: biological_process|molecular_function|cellular_component}) est fourni."""
+    ns_short = {"biological_process": "GO:BP", "molecular_function": "GO:MF",
+                "cellular_component": "GO:CC"}
+    out = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            row = line.rstrip("\n\r").split("\t")
+            if len(row) < 3 or not row[0]:
+                continue
+            tid, name = row[0].strip(), row[1].strip()
+            src = tid.split(":", 1)[0] if ":" in tid else "gprofiler"
+            if src == "GO" and go_namespaces:
+                src = ns_short.get(go_namespaces.get(tid, ""), "GO")
+            label = f"{tid} {name}" if name and name != tid else tid
+            out[(src, label)] = [g for g in row[2:] if g]
+    return out
+
+
 def load_gene_sets(specs, organism: str = "human",
-                   msigdb_version: "str | None" = None, verbose: bool = True) -> dict:
+                   msigdb_version: "str | None" = None, verbose: bool = True,
+                   cache_dir: "str | None" = None, go_obo: "str | None" = None) -> dict:
     """Charge les jeux de gènes UNE fois pour tous les contrastes.
 
     specs : liste de
@@ -99,13 +198,42 @@ def load_gene_sets(specs, organism: str = "human",
     Retourne {"<source>__<terme>": [SYMBOLES EN MAJUSCULES]} : même convention de
     nommage que gseapy avec plusieurs bibliothèques ; symboles en majuscules comme
     le classement (_ranking_metric), donc Actb (souris) = ACTB (humain).
-    Une source introuvable est signalée et ignorée."""
+    Une source introuvable est signalée et ignorée.
+      - "gprofiler:<code>" (ex. gprofiler:athaliana) : GMT complet de g:Profiler,
+        une entrée par source (GO, ou GO:BP/MF/CC si go_obo est donné ; KEGG, REAC,
+        WP… selon l'espèce), terme nommé « ID nom »."""
     import gseapy
     version = msigdb_version or DEFAULT_MSIGDB_VERSION.get(organism, "2025.1.Hs")
     sets = {}
+    del LAST_SOURCES[:]
     for spec in specs:
         spec = str(spec).strip()
         try:
+            if spec.lower().startswith("gprofiler:"):
+                code = spec.split(":", 1)[1].strip().lower()
+                gmt = fetch_gprofiler_gmt(code, cache_dir, verbose)
+                nss = None
+                if go_obo and os.path.isfile(go_obo):
+                    from annotation_import import read_obo
+                    nss = read_obo(go_obo)[1]
+                lib = read_gprofiler_gmt(gmt, nss)
+                n0 = len(sets)
+                by_src = {}
+                for (src, term), genes in lib.items():
+                    g = list(dict.fromkeys(str(x).strip().upper() for x in genes if str(x).strip()))
+                    if g:
+                        sets[f"{src}__{term}"] = g
+                        by_src[src] = by_src.get(src, 0) + 1
+                LAST_SOURCES.append(
+                    f"g:Profiler {code} GMT ({time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(gmt)))}; "
+                    + ", ".join(f"{k} {v}" for k, v in sorted(by_src.items())) + ")")
+                if verbose:
+                    age = (time.time() - os.path.getmtime(gmt)) / 86400
+                    print(f"     g:Profiler {code} ({os.path.basename(gmt)}, "
+                          f"{'downloaded today' if age < 1 else f'cached {age:.0f} d ago'}): "
+                          + ", ".join(f"{k} {v}" for k, v in sorted(by_src.items()))
+                          + f" — {len(sets) - n0} gene sets")
+                continue
             if os.path.isfile(spec):
                 src = os.path.splitext(os.path.basename(spec))[0]
                 lib = read_gmt(spec)
@@ -129,12 +257,93 @@ def load_gene_sets(specs, organism: str = "human",
             g = list(dict.fromkeys(str(x).strip().upper() for x in genes if str(x).strip()))
             if g:
                 sets[f"{src}__{term}"] = g
+        LAST_SOURCES.append(f"{src}" + (f" (MSigDB {version})" if spec.lower().startswith("msigdb:") else ""))
         if verbose:
             print(f"     {src}: {len(sets) - n0} gene sets")
     return sets
 
 
-def _ranking_metric(df_comparaison, contrast, params):
+def _leaders(df):
+    """Accession de tête (convention Deimos) de chaque ligne."""
+    col = "name" if "name" in df.columns else ("Protein.Group" if "Protein.Group" in df.columns
+                                               else df.columns[0])
+    return df[col].astype(str).str.split(";").str[0].str.strip()
+
+
+def _convert_ids(ids, code, chunk=2500):
+    """g:Convert (g:Profiler) : identifiants -> [(incoming, gène Ensembl, nom)]."""
+    from gprofiler import GProfiler
+    gp = GProfiler(user_agent="Deimos-proteomics-pipeline", return_dataframe=False)
+    out = []
+    ids = list(dict.fromkeys(i for i in ids if i))
+    for k in range(0, len(ids), chunk):
+        res = gp.convert(organism=code, query=ids[k:k + chunk], target_namespace="ENSG")
+        out += [(str(r.get("incoming", "")), str(r.get("converted", "")), str(r.get("name", "")))
+                for r in res]
+    return out
+
+
+def gprofiler_gene_keys(df, code, orthologs=None, convert_fn=None, verbose=True):
+    """Clé de classement par protéine pour les jeux g:Profiler de l'espèce `code`.
+
+    Requête g:Convert = accession de tête, ou son orthologue Perseverance si
+    `orthologs` ({protein_id: accession de l'espèce de référence}) est donné.
+    Clé = gène Ensembl (AGI chez Arabidopsis). Retourne (key_map {protein_id: clé},
+    alias {NOM / AGI / ACCESSION en majuscules: clé}, résumé). Hors ligne ou si
+    g:Convert ne reconnaît presque rien : repli sur la colonne Genes (symboles)."""
+    convert_fn = convert_fn or _convert_ids
+    pids = _leaders(df)
+    query = {p: (orthologs.get(p) if orthologs else p) for p in pids}
+    query = {p: q for p, q in query.items() if q}
+    try:
+        rows = convert_fn(list(query.values()), code)
+    except Exception as e:                                            # noqa: BLE001
+        rows, err = [], f"{type(e).__name__}: {str(e)[:80]}"
+    else:
+        err = None
+    hit = {}
+    for inc, conv, name in rows:
+        if conv.upper() in _NO_HIT or inc in hit:
+            continue
+        hit[inc] = (conv.upper(), name.upper())
+    key_map, alias = {}, {}
+    for p, q in query.items():
+        if q in hit:
+            key, name = hit[q]
+            key_map[p] = key
+            alias[key] = key
+            alias[q.upper()] = key
+            if name not in _NO_HIT:
+                alias.setdefault(name, key)
+    n_q = len(query)
+    if len(key_map) >= max(15, 0.1 * max(n_q, 1)):
+        summ = (f"{len(key_map)}/{len(pids)} proteins linked to {code} genes by g:Convert"
+                + (f" (through {len(query)} Perseverance orthologues)" if orthologs else ""))
+        return key_map, alias, summ
+    why = err or f"g:Convert linked only {len(key_map)}/{n_q} identifiers to {code} genes"
+    if "Genes" in df.columns:
+        g = df["Genes"].astype(str).str.split(";").str[0].str.strip().str.upper()
+        key_map = {p: v for p, v in zip(pids, g) if v and v not in _NO_HIT}
+        alias = {v: v for v in key_map.values()}
+        summ = (f"[WARN] {why} — fallback on the Genes column ({len(key_map)} symbols)"
+                + ("" if orthologs else "; for another species, run Perseverance towards "
+                   f"'{code}' (perseverance_reference_organism: {code})"))
+        return key_map, alias, summ
+    return {}, {}, f"[WARN] {why} and no Genes column"
+
+
+def translate_gene_sets(gene_sets: dict, alias: dict) -> dict:
+    """Membres des jeux (noms, AGI, accessions) -> clés de classement ; les membres
+    absents des données sont retirés (la GSEA ne tient compte que des gènes classés)."""
+    out = {}
+    for term, genes in gene_sets.items():
+        g = list(dict.fromkeys(alias[x] for x in genes if x in alias))
+        if g:
+            out[term] = g
+    return out
+
+
+def _ranking_metric(df_comparaison, contrast, params, key_map=None):
     """Construit le vecteur de ranking signé pour un contraste.
 
     Métrique = -log10(p) * sign(LFC), sur TOUTES les protéines (pas seulement
@@ -155,12 +364,16 @@ def _ranking_metric(df_comparaison, contrast, params):
     if col_p not in df_comparaison.columns or col_diff not in df_comparaison.columns:
         return None
 
-    gene_col = "Genes" if "Genes" in df_comparaison.columns else None
-    if gene_col is None:
-        return None
-
-    df = df_comparaison[[gene_col, col_p, col_diff]].copy()
-    df.columns = ["gene", "p", "lfc"]
+    if key_map is not None:                       # clés g:Profiler (gène Ensembl / AGI)
+        df = pd.DataFrame({"gene": _leaders(df_comparaison).map(key_map).values,
+                           "p": df_comparaison[col_p].values,
+                           "lfc": df_comparaison[col_diff].values})
+    else:
+        gene_col = "Genes" if "Genes" in df_comparaison.columns else None
+        if gene_col is None:
+            return None
+        df = df_comparaison[[gene_col, col_p, col_diff]].copy()
+        df.columns = ["gene", "p", "lfc"]
     df = df.dropna(subset=["p", "lfc"])
     # Symbole propre : premier gène avant ';', majuscule, sans espaces
     df["gene"] = (df["gene"].astype(str).str.split(";").str[0]
@@ -213,10 +426,12 @@ def _plot_gsea_nes(res2d, contrast, out_dir, top_n=15):
         return None
 
 
-def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir):
+def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir, orthologs=None):
     """
     GSEA pré-ranked par contraste.
 
+    orthologs : {"organism": code g:Profiler, "map": {protein_id: orthologue}} venu de
+    Perseverance ; utilisé si l'espèce de référence est celle des jeux g:Profiler.
     Retourne {contrast: {"table": df, "nes_plot": path}} ou None.
     Entièrement protégé : n'interrompt jamais le pipeline.
     """
@@ -240,16 +455,31 @@ def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir):
           f"{cfg['organism']} gene sets"
           + (f" (MSigDB {cfg['msigdb_version']})"
              if any(str(s).lower().startswith("msigdb:") for s in cfg["gene_sets"]) else ""))
-    gene_sets = load_gene_sets(cfg["gene_sets"], cfg["organism"], cfg["msigdb_version"])
+    gene_sets = load_gene_sets(cfg["gene_sets"], cfg["organism"], cfg["msigdb_version"],
+                               cache_dir=cfg["cache_dir"], go_obo=cfg["go_obo"])
     if not gene_sets:
         print("  [WARN] GSEA skipped: no gene set could be loaded.")
         return None
+    key_map, mapping_txt = None, "proteins matched by gene symbol (Genes column)"
+    if cfg["gprofiler"]:
+        code = cfg["gprofiler"]
+        orth = (orthologs or {}).get("map") if (orthologs or {}).get("organism") == code else None
+        key_map, alias, summ = gprofiler_gene_keys(df_comparaison, code, orth)
+        print(f"  [GSEA] {summ}")
+        mapping_txt = summ.replace("[WARN] ", "")
+        if not key_map:
+            print("  [WARN] GSEA skipped: proteins could not be linked to gene sets.")
+            return None
+        gene_sets = translate_gene_sets(gene_sets, alias)
+        if not gene_sets:
+            print("  [WARN] GSEA skipped: no gene set member matches the data.")
+            return None
     universe = {g for v in gene_sets.values() for g in v}
     results = {}
     coverage_done = False
     for contrast in contrast_names:
         try:
-            rnk = _ranking_metric(df_comparaison, contrast, params)
+            rnk = _ranking_metric(df_comparaison, contrast, params, key_map)
             if rnk is None:
                 print(f"  [SKIP] {contrast}: not enough ranked genes.")
                 continue
@@ -289,7 +519,12 @@ def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir):
                         lambda x: ";".join(map(str, x))
                         if isinstance(x, (list, tuple)) else x)
 
-            results[contrast] = {"table": res_sig, "nes_plot": f_nes}
+            results[contrast] = {
+                "table": res_sig, "nes_plot": f_nes,
+                "provenance": (f"GSEA pre-ranked (gseapy), metric -log10({p_lbl}) x sign(LFC), "
+                               f"{n_perm} permutations, FDR <= {fdr_max}, set size 10-1000 · "
+                               f"gene sets: {'; '.join(LAST_SOURCES) or ', '.join(cfg['gene_sets'])}"
+                               f" · {mapping_txt}")}
             n_up = (res_sig["NES"] > 0).sum()
             n_dn = (res_sig["NES"] < 0).sum()
             print(f"     [OK] {len(res_sig)} pathways (FDR<={fdr_max}): "
@@ -330,4 +565,6 @@ def export_gsea_sheets(wb, gsea_results, ins_img_fn):
                 elif isinstance(val, (list, tuple, np.ndarray)):
                     val = ";".join(map(str, val))
                 ws.cell(row=i, column=start_col + j, value=val)
+        if data.get("provenance"):
+            ws.cell(row=1, column=1, value=data["provenance"])
         ins_img_fn(ws, data.get("nes_plot"), "A2")

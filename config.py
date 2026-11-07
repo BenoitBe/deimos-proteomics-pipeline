@@ -80,12 +80,15 @@ _DEFAULTS = {
     "export_matrices":     True,     # matrices/ : log2 NA, imputée, DPC (Mfuzz, MOFA+...)
     "run_gsea":            False,    # GSEA rank-based (optionnel, complément ORA)
     "gsea_organism":       "human",  # jeux de gènes : human (Enrichr) | mouse (MSigDB souris)
+                                     # | athaliana ou gprofiler:<code> (GMT g:Profiler)
     "gsea_gene_sets":      None,     # None = défaut de l'organisme ; liste de .gmt locaux,
                                      # "msigdb:<collection>" ou noms Enrichr
     "gsea_msigdb_version": None,     # None = 2025.1.Hs / 2025.1.Mm
     "gsea_rank_p":         "pvalue", # classement sur la p brute | volcano (ancien : p du volcano)
     "gsea_fdr":            0.25,
     "gsea_permutations":   1000,
+    "gsea_go_obo":         None,     # go-basic.obo : sépare le GO g:Profiler en BP / MF / CC
+    "gsea_cache_dir":      None,     # None = ~/.deimos_cache/gsea (GMT g:Profiler, 30 jours)
     "qc_only":             False,   # True = données brutes + M&M + figures QC seulement (auto si aucun réplicat)
     "make_wgcna":          False,
     "make_dashboard":      True,
@@ -216,9 +219,18 @@ def _validate(params: dict) -> list[str]:
             errors.append(f"  {k} doit être true ou false (valeur : {params.get(k)!r})")
     if str(params.get("dpc_level", "auto")).lower() not in ("auto", "precursor", "protein"):
         errors.append(f"  dpc_level doit être 'auto', 'precursor' ou 'protein'")
-    if str(params.get("gsea_organism", "human")).lower() not in ("human", "mouse"):
-        errors.append(f"  gsea_organism doit être 'human' ou 'mouse' "
-                      f"(valeur : {params.get('gsea_organism')!r})")
+    try:
+        from gsea_enrichment import valid_gsea_organism as _vgo
+    except Exception:                                                  # noqa: BLE001
+        def _vgo(o):
+            o = str(o).lower()
+            return o in ("human", "mouse", "athaliana") or o.startswith("gprofiler:")
+    if not _vgo(params.get("gsea_organism", "human")):
+        errors.append(f"  gsea_organism doit être 'human', 'mouse', 'athaliana' ou "
+                      f"'gprofiler:<code g:Profiler>' (valeur : {params.get('gsea_organism')!r})")
+    for _k in ("gsea_go_obo", "gsea_cache_dir"):
+        if params.get(_k) is not None and not isinstance(params.get(_k), str):
+            errors.append(f"  {_k} : chemin attendu (valeur : {params.get(_k)!r})")
     if str(params.get("gsea_rank_p", "pvalue")).lower() not in ("pvalue", "volcano"):
         errors.append(f"  gsea_rank_p doit être 'pvalue' ou 'volcano'")
     _gs = params.get("gsea_gene_sets")
@@ -719,11 +731,16 @@ string_background:   null          # null = suit enrichment_background ; 'genome
 export_matrices:     true          # dossier matrices/ : log2 avec NA, imputée, DPC (Mfuzz, MOFA+/MEFISTO, multi-omique)
 run_gsea:            false         # GSEA pré-classée (gseapy), complément de l'ORA
 gsea_organism:       human         # human (Enrichr) | mouse (MSigDB souris : MH, M2 Reactome/WikiPathways, M5 GO)
+                                   # | athaliana (GO de g:Profiler, protéines reliées par g:Convert
+                                   #   ou par les orthologues Perseverance vers athaliana)
+                                   # | gprofiler:<code> pour une autre espèce g:Profiler (ex. gprofiler:hvulgare)
 gsea_gene_sets:      null          # null = défaut de l'organisme ; ou liste : fichiers .gmt locaux, "msigdb:m5.go.bp", noms Enrichr
 gsea_msigdb_version: null          # null = 2025.1.Hs / 2025.1.Mm
 gsea_rank_p:         pvalue        # classement -log10(p brute) x signe(LFC) ; 'volcano' = ancienne règle
 gsea_fdr:            0.25
 gsea_permutations:   1000
+gsea_go_obo:         null          # go-basic.obo : GO g:Profiler séparé en GO:BP / GO:MF / GO:CC
+gsea_cache_dir:      null          # null = ~/.deimos_cache/gsea (GMT g:Profiler gardé 30 jours)
 make_wgcna:          false
 make_dashboard:      true
 dpc_sensitivity:     true          # analyse différentielle sans imputation (ajoutée)

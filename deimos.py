@@ -5980,8 +5980,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         if (go_params or {}).get("run_gsea"):
             try:
                 from gsea_enrichment import run_gsea, export_gsea_sheets
+                # Orthologues Perseverance : GSEA sur les jeux de l'espèce de référence
+                # (ex. B. napus -> athaliana) quand gsea_organism la désigne
+                _gsea_orth = ({"organism": persev_override.get("organism"),
+                               "map": persev_override.get("ortholog_map")}
+                              if persev_override is not None and not _string_orth
+                              and persev_override.get("ortholog_map") else None)
                 gsea_results = run_gsea(
-                    df_results, contrast_names, params, go_params, out_dir)
+                    df_results, contrast_names, params, go_params, out_dir,
+                    orthologs=_gsea_orth)
                 if gsea_results:
                     export_gsea_sheets(wb, gsea_results, _ins_img)
                     print(f"  [OK] {len(gsea_results)} GSEA sheet(s) added.")
