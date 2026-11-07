@@ -6493,19 +6493,36 @@ AUDIT_FIX_JS = r"""<script>
     return wb;
   };
 
-  // ── Volcano ──
+  // ── Volcano ── (bouton « Inverser » : les exports suivent l'affichage —
+  //    log2FC de signe opposé, Up/Down permutés, contraste B_vs_A dans le nom)
+  function volcOrient(rows){
+    if(typeof invertActive === 'undefined' || !invertActive) return rows;
+    return rows.map(function(p){ var q = Object.assign({}, p); q.d = -p.d; return q; });
+  }
+  function volcName(){
+    var c = activeContrast, parts = c.split('_vs_');
+    return (typeof invertActive !== 'undefined' && invertActive && parts.length === 2)
+      ? parts[1] + '_vs_' + parts[0] : c;
+  }
+  window.volcOrient = volcOrient;
   window.exportVolcAll = function(){
-    var c = activeContrast;
-    var data = fullRows(c).slice().sort(byP).map(function(p){
+    var c = activeContrast, name = volcName();
+    var data = volcOrient(fullRows(c)).slice().sort(byP).map(function(p){
       return rowOut(p, isSig(p, RULE.lfc, RULE.ptype, RULE.p) ? (p.d > 0 ? 'Up' : 'Down') : 'NS');
     });
-    xls(makeWb([{name: 'All', data: data}]), 'proteogen_all_' + c.slice(0, 25) + '.xlsx');
+    xls(makeWb([{name: 'All', data: data}, {name: 'Contrast', data: [{'Contrast': name.replace('_vs_', ' vs '),
+        'LFC': 'log2(' + name.split('_vs_')[0] + ' / ' + (name.split('_vs_')[1] || '') + ')',
+        'Inverted': (name !== c) ? 'yes (Deimos contrast: ' + c + ')' : 'no'}]}]),
+        'proteogen_all_' + name.slice(0, 25) + '.xlsx');
   };
   window.exportVolcSig = function(){
-    var f = getVolcFilter(), c = activeContrast;
-    var data = fullRows(c).filter(function(p){ return (p.r || 0) >= f.rob && isSig(p, f.fc, f.ptype, f.thresh); })
+    var f = getVolcFilter(), c = activeContrast, name = volcName();
+    var data = volcOrient(fullRows(c).filter(function(p){ return (p.r || 0) >= f.rob && isSig(p, f.fc, f.ptype, f.thresh); }))
       .slice().sort(byP).map(depRow);
-    xls(makeWb([{name: 'DEP', data: data}]), 'proteogen_DEP_' + c.slice(0, 25) + '.xlsx');
+    xls(makeWb([{name: 'DEP', data: data}, {name: 'Contrast', data: [{'Contrast': name.replace('_vs_', ' vs '),
+        'LFC': 'log2(' + name.split('_vs_')[0] + ' / ' + (name.split('_vs_')[1] || '') + ')',
+        'Inverted': (name !== c) ? 'yes (Deimos contrast: ' + c + ')' : 'no'}]}]),
+        'proteogen_DEP_' + name.slice(0, 25) + '.xlsx');
   };
   window.exportAllDEP = function(){
     var sum = [], sheets = [];

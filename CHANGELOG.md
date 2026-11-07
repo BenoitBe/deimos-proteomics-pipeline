@@ -326,6 +326,12 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **Dashboard, volcano "Invert" button: the exports now follow the display.** "Significant DEP"
+  and "All proteins" exported the Deimos orientation even when the volcano was inverted; they now
+  carry the opposite log2FC, swapped Up/Down, the inverted contrast in the file name and a
+  `Contrast` sheet stating the orientation (checked in Chromium: 19/19 and 3,200/3,200 rows,
+  every LFC of opposite sign).
+
 - **Dashboard audit (06/11/2026): the dashboard now shows and exports what the workbook holds.**
   Checked in Chromium on two full runs (400 and 3,200 proteins; raw p < 0.05 & ratio 1.5, and
   p.adj < 0.05 & ratio 2), every export downloaded and compared with the Excel
