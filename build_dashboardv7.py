@@ -7227,7 +7227,13 @@ GSEA_JS = r"""<script>
     document.getElementById('gseaProv').textContent = d ? d.prov : '';
     var rows = filt(st.c);
     drawNes(rows); table(rows); lead(); matrix();
+    if(typeof window.drawGseaRidges === 'function') window.drawGseaRidges();
   };
+  // accès en lecture pour les figures ajoutées (ridge plot des leading edges, 09/11/2026)
+  window.gseaState = function(){ return {c: st.c, inv: st.inv, data: G[st.c] || null,
+    rows: st.c ? filt(st.c) : [], nes: nes, key: function(t){ return t.id + '|' + t.n; }, sel: st.sel}; };
+  window.gseaSelect = function(k){ st.sel = k; renderGSEA();
+    var p = document.getElementById('gseaLeadPanel'); if(p && p.scrollIntoView) p.scrollIntoView({behavior: 'smooth', block: 'nearest'}); };
   function rowsOut(rows){
     return rows.map(function(t){ return {'Pathway': t.n, 'Term ID': t.id, 'Source': t.s, 'NES': nes(t),
       'ES': t.es == null ? '' : (st.inv ? -t.es : t.es), 'NOM p-val': t.p, 'FDR q-val': t.q, 'FWER p-val': t.fwer,
@@ -7292,6 +7298,802 @@ def patch_gsea_page(html):
     html = html.replace(marker, GSEA_PAGE_HTML * (anchor not in html) + GSEA_JS + marker, 1) \
         if marker in html else html.replace('</body>', GSEA_JS + '</body>', 1)
     print("  patch_gsea_page : page GSEA (NES, table, leading edge, inter-contrastes, exports).")
+    return html
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIGURES EXPLORATOIRES (09/11/2026) — lot « dashboard » de l'audit des figures
+# (projet : audit_figures_exploratoires_2026-11-09). Tout s'ajoute, rien n'est retiré :
+#   • QC / PCA : raincloud observé / imputé, motifs de valeurs manquantes (UpSet),
+#                flèches de biplot sur le score plot de Deimos ;
+#   • GSEA     : ridge plot des log2FC des leading edges ;
+#   • FC vs FC : nouvelle page, log2FC d'un contraste contre un autre ;
+#   • Volcano  : export iPath3 des DEP du contraste (carte métabolique globale).
+# ──────────────────────────────────────────────────────────────────────────────
+RAIN_GRID = 120          # points de la grille de densité (commune à tous les échantillons)
+RAIN_PTS_TOTAL = 2600    # points de pluie répartis entre échantillons (60 à 220 chacun)
+MVP_TOP = 24             # motifs de valeurs manquantes affichés
+MVP_NAMES = 200          # protéines listées au plus par motif
+MVP_MAX_SAMPLES = 30     # au-delà, motifs au niveau des conditions (condition absente =
+                         # tous ses échantillons manquent) : par échantillon, presque chaque
+                         # protéine aurait son propre motif
+
+
+def _silverman(v):
+    """Largeur de noyau de Silverman (0.25 log2 par défaut si indéfinie)."""
+    v = np.asarray(v, float)
+    if len(v) < 2:
+        return 0.25
+    sd = float(np.std(v, ddof=1))
+    iqr = float(np.subtract(*np.percentile(v, [75, 25])))
+    s = min(sd, iqr / 1.349) if iqr > 0 else sd
+    return 0.9 * s * len(v) ** -0.2 if s > 0 else 0.25
+
+
+def _kde_counts(v, grid, bw):
+    """Densité gaussienne exprimée en nombre de valeurs par unité de log2 (aire = len(v))."""
+    v = np.asarray(v, float)
+    out = np.zeros(len(grid))
+    if not len(v):
+        return out
+    for k in range(0, len(v), 4000):                     # par blocs : mémoire bornée
+        z = (grid[:, None] - v[None, k:k + 4000]) / bw
+        out += np.exp(-0.5 * z * z).sum(axis=1)
+    return out / (bw * np.sqrt(2 * np.pi))
+
+
+def build_raincloud(df_comp, imp, sample_cols, cond_map_inv):
+    """Raincloud par échantillon sur la matrice des tests (Log2_Impute).
+
+    Une valeur est dite imputée quand l'intensité brute (raw_data, injectée dans
+    Differential_Expression par dashboard_integration) manque pour cette protéine et
+    cet échantillon. Densités en nombre de protéines par unité de log2, même noyau pour
+    les observées et les imputées : la surface des imputées dit combien il y en a.
+    None si la matrice des tests manque."""
+    if imp is None or not len(imp):
+        return None
+    cols = [c for c in sample_cols if c in imp.columns]
+    if not cols:
+        return None
+    M = imp[cols].apply(pd.to_numeric, errors='coerce')
+    has_raw = 'Protein.Group' in df_comp.columns and all(c in df_comp.columns for c in cols)
+    if has_raw:
+        raw = (df_comp.drop_duplicates('Protein.Group').set_index('Protein.Group')[cols]
+               .apply(pd.to_numeric, errors='coerce'))
+        M = M[M.index.isin(raw.index)]
+        observed = raw.reindex(M.index).notna().to_numpy()
+    else:
+        observed = np.ones(M.shape, bool)
+    X = M.to_numpy(float)
+    fin = np.isfinite(X)
+    if not fin.any():
+        return None
+    lo, hi = np.percentile(X[fin], [0.1, 99.9])
+    pad = (hi - lo) * 0.04 or 1.0
+    grid = np.linspace(lo - pad, hi + pad, RAIN_GRID)
+    rng = np.random.default_rng(SEED)
+    per = int(min(220, max(60, RAIN_PTS_TOTAL // max(1, len(cols)))))
+
+    samples = {}
+    for j, c in enumerate(cols):
+        v = X[:, j]
+        vo, vi = v[fin[:, j] & observed[:, j]], v[fin[:, j] & ~observed[:, j]]
+        bw = _silverman(vo if len(vo) > 1 else v[fin[:, j]])
+        # pluie : tirage conjoint, la part d'imputées parmi les points = leur part réelle
+        k = np.flatnonzero(fin[:, j])
+        pick = np.sort(rng.choice(k, min(per, len(k)), replace=False)) if len(k) else k
+        samples[c] = {
+            'cond': cond_map_inv.get(c, c.rsplit('_', 1)[0]),
+            'n_obs': int(len(vo)), 'n_imp': int(len(vi)), 'n_na': int((~fin[:, j]).sum()),
+            'do': np.round(_kde_counts(vo, grid, bw), 2).tolist(),
+            'di': np.round(_kde_counts(vi, grid, bw), 2).tolist() if len(vi) else [],
+            'q': np.percentile(vo, [5, 25, 50, 75, 95]).round(3).tolist() if len(vo) else None,
+            'po': np.round(v[pick[observed[pick, j]]], 2).tolist(),
+            'pi': np.round(v[pick[~observed[pick, j]]], 2).tolist(),
+            'mi': round(float(np.median(vi)), 3) if len(vi) else None,
+            'mo': round(float(np.median(vo)), 3) if len(vo) else None,
+        }
+    return {'grid': [round(float(g), 3) for g in grid], 'samples': samples, 'order': cols,
+            'mask': bool(has_raw), 'n_prot': int(len(M))}
+
+
+def build_missing_patterns(stats_path, sample_cols, cond_map_inv):
+    """Motifs de valeurs manquantes (UpSet) sur les intensités brutes de raw_data (avant
+    filtrage et imputation) : quels échantillons manquent ENSEMBLE.
+
+    Classe de chaque motif : 'cond' = une ou plusieurs conditions entières absentes
+    (candidat à une absence biologique), 'single' = un seul échantillon (perte
+    technique), 'within' = plusieurs échantillons d'une même condition, 'mixed' =
+    dispersé entre conditions, 'all' = absent partout. Au-delà de MVP_MAX_SAMPLES
+    échantillons, les motifs portent sur les conditions entièrement absentes (les
+    classes restent comptées par échantillon). None sans raw_data."""
+    try:
+        raw = pd.read_excel(stats_path, sheet_name='raw_data')
+    except Exception:
+        return None
+    lfq = [c for c in raw.columns if 'LFQ' in str(c)]
+    if not lfq or not len(raw):
+        return None
+
+    def _lab(c):
+        return re.sub(r'^LFQ\.intensity\.', '', str(c))
+    inv = {v: k for k, v in SAMPLE_LABELS.items()}               # libellé -> Cond_Rep
+    names = [inv.get(_lab(c)) or (_lab(c) if _lab(c) in cond_map_inv else None) for c in lfq]
+    if any(n is None for n in names):
+        # même repli que build_missing_values : colonnes dans l'ordre du plan
+        names = list(sample_cols) if len(lfq) == len(sample_cols) else [_lab(c) for c in lfq]
+    conds = [cond_map_inv.get(n, n.rsplit('_', 1)[0]) for n in names]
+    cond_order = list(dict.fromkeys([cond_map_inv.get(s, s.rsplit('_', 1)[0]) for s in sample_cols]
+                                    + conds))
+    order = sorted(range(len(lfq)), key=lambda i: (cond_order.index(conds[i]), i))
+    vals = raw[lfq].apply(pd.to_numeric, errors='coerce')
+    na = (vals.isna() | (vals <= 0)).to_numpy()[:, order]
+    names = [names[i] for i in order]
+    conds = [conds[i] for i in order]
+    labels = [SAMPLE_LABELS.get(n) or _lab(lfq[order[k]]) for k, n in enumerate(names)]
+    has = na.any(axis=1)
+    gcol = next((c for c in ('Genes', 'name', 'Protein.Group') if c in raw.columns), None)
+    genes = (raw[gcol].fillna('').astype(str) if gcol else pd.Series([''] * len(raw))).to_numpy()
+    cond_idx = {}
+    for i, c in enumerate(conds):
+        cond_idx.setdefault(c, set()).add(i)
+
+    def _cls(k):
+        miss = {i for i, ch in enumerate(k) if ch == '1'}
+        if len(miss) == len(k):
+            return 'all'
+        full = [ix for ix in cond_idx.values() if ix <= miss]
+        if full and set().union(*full) == miss:
+            return 'cond'
+        if len(miss) == 1:
+            return 'single'
+        return 'within' if len({conds[i] for i in miss}) == 1 else 'mixed'
+
+    def _patterns(mat, keep, classify):
+        key = [''.join('1' if b else '0' for b in row) for row in mat[keep]]
+        df = pd.DataFrame({'k': key, 'g': genes[keep]})
+        counts = df.groupby('k').size().sort_values(ascending=False, kind='mergesort')
+        return df, counts, {k: classify(k) for k in counts.index}
+
+    df, counts, cls = _patterns(na, has, _cls)
+    class_tot = {c: 0 for c in ('cond', 'single', 'within', 'mixed', 'all')}
+    for k, n in counts.items():
+        class_tot[cls[k]] += int(n)
+    level, rows_n, rows_l, rows_c, set_size = 'sample', names, labels, conds, na.sum(axis=0)
+    if len(names) > MVP_MAX_SAMPLES:
+        cl = [c for c in cond_order if c in cond_idx]
+        absent = np.column_stack([na[:, sorted(cond_idx[c])].all(axis=1) for c in cl])
+        df, counts, cls = _patterns(absent, absent.any(axis=1),
+                                    lambda k: 'all' if set(k) == {'1'} else 'cond')
+        level, rows_n, rows_l, rows_c, set_size = 'condition', cl, cl, cl, absent.sum(axis=0)
+    groups = df.groupby('k')['g']
+    patterns = [{'m': [i for i, ch in enumerate(k) if ch == '1'], 'n': int(counts[k]), 'k': cls[k],
+                 'g': [safe_str(x) for x in groups.get_group(k).head(MVP_NAMES)]}
+                for k in counts.index[:MVP_TOP]]
+    return {'samples': rows_n, 'labels': rows_l, 'cond': rows_c, 'level': level,
+            'n_samples': len(names), 'n_prot': int(len(raw)), 'n_with_na': int(has.sum()),
+            'set_size': np.asarray(set_size).astype(int).tolist(), 'patterns': patterns,
+            'class_tot': class_tot, 'n_patterns': int(len(counts))}
+
+
+def build_ipath_ids(stats_path, df_comp):
+    """Identifiant envoyé à iPath3 pour chaque protéine : l'orthologue de référence
+    (onglet Orthologues_Perseverance) quand il existe, sinon la première accession du
+    Protein.Group. {'ids': {name: id} (seulement si id != name), 'n_orth', 'n'}."""
+    first = {}
+    if 'name' in df_comp.columns:
+        pg = df_comp['Protein.Group'] if 'Protein.Group' in df_comp.columns else df_comp['name']
+        for n, g in zip(df_comp['name'].astype(str), pg.fillna('').astype(str)):
+            first[n] = g.split(';')[0].strip() or n
+    orth = {}
+    try:
+        o = pd.read_excel(stats_path, sheet_name='Orthologues_Perseverance')
+        if {'protein_id', 'ortholog_id'} <= set(o.columns):
+            o = o.dropna(subset=['ortholog_id'])
+            orth = dict(zip(o['protein_id'].astype(str).str.strip(),
+                            o['ortholog_id'].astype(str).str.strip()))
+    except Exception:
+        pass
+    ids, n_orth = {}, 0
+    for n, acc in first.items():
+        tgt = orth.get(acc) or orth.get(n)
+        n_orth += bool(tgt)
+        tgt = tgt or acc
+        if tgt and tgt != n:
+            ids[n] = tgt
+    return {'ids': ids, 'n_orth': int(n_orth), 'n': len(first)}
+
+
+FIG2611_QC_HTML = """
+<!-- Figures exploratoires (09/11/2026) : raincloud + motifs de valeurs manquantes -->
+<div class="panel" id="rainPanel">
+  <div class="ph"><h2>Raincloud — observed and imputed values</h2>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <select id="rainMode" onchange="drawRaincloud()" style="background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:4px;padding:3px 8px;font-size:11px;">
+        <option value="s">per sample</option><option value="c">per condition</option></select>
+      <button class="exp-btn" onclick="exportCanvas('rainCanvas','proteogen_raincloud')" style="padding:3px 9px;font-size:10px;">&#11015; PNG</button>
+    </div></div>
+  <div id="rainInfo" style="font-size:11px;color:var(--tx2);margin:2px 0 8px;"></div>
+  <canvas id="rainCanvas" style="display:block;"></canvas>
+</div>
+<div class="panel" id="mvpPanel">
+  <div class="ph"><h2>Missing-value patterns — which samples are missing together</h2>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <button class="exp-btn" onclick="exportMvp()" style="padding:3px 9px;font-size:10px;">&#11015; xlsx</button>
+      <button class="exp-btn" onclick="exportCanvas('mvpCanvas','proteogen_missing_patterns')" style="padding:3px 9px;font-size:10px;">&#11015; PNG</button>
+    </div></div>
+  <div id="mvpInfo" style="font-size:11px;color:var(--tx2);margin:2px 0 8px;"></div>
+  <canvas id="mvpCanvas" style="display:block;"></canvas>
+  <div id="mvpList" style="font-size:11px;color:var(--tx2);margin-top:8px;line-height:1.55;"></div>
+</div>
+"""
+
+FIG2611_RIDGE_HTML = """
+  <div class="panel" id="gseaRidgePanel">
+    <div class="ph"><h2>Leading edges — log2FC of their proteins</h2>
+      <button class="exp-btn" onclick="exportCanvas('gseaRidgeCanvas','proteogen_GSEA_ridges_'+gseaFileName())" style="padding:3px 9px;font-size:10px;">⬇ PNG</button></div>
+    <div style="font-size:10.5px;color:var(--tx3);margin:-4px 0 8px;">Each ridge = density of the log2FC of the
+      pathway's leading-edge proteins in this contrast; ticks = proteins (dark = DEP under the run rule).
+      Same pathways and filters as the NES chart. A pathway carried by a few strong proteins has a
+      flat ridge with distant ticks; one carried by many small changes, a narrow ridge off zero.
+      Click a ridge to list its proteins.</div>
+    <canvas id="gseaRidgeCanvas" style="display:block;width:100%;"></canvas>
+    <div id="gseaRidgeMsg" style="display:none;color:var(--tx2);font-size:12px;padding:18px 4px;"></div>
+  </div>
+"""
+
+FIG2611_FC_HTML = """
+<!-- FC vs FC (09/11/2026) -->
+<div id="fcpage" class="page">
+  <div class="panel">
+    <div class="ph"><h2>log2FC vs log2FC — do two contrasts respond the same way?</h2>
+      <div class="exp-bar" style="margin:0;">
+        <span class="exp-lbl">X</span><select id="fcX" onchange="drawFC()"></select>
+        <label class="exp-lbl" style="cursor:pointer;"><input type="checkbox" id="fcInvX" onchange="drawFC()"> ⇄</label>
+        <span class="exp-lbl">Y</span><select id="fcY" onchange="drawFC()"></select>
+        <label class="exp-lbl" style="cursor:pointer;"><input type="checkbox" id="fcInvY" onchange="drawFC()"> ⇄</label>
+        <span class="exp-lbl">Show</span><select id="fcShow" onchange="drawFC()">
+          <option value="all">all proteins</option><option value="dep">DEP in X or Y</option></select>
+        <button class="exp-btn" onclick="exportCanvas('fcCanvas','proteogen_FCvsFC')" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+        <button class="exp-btn grn" onclick="exportFC()" style="padding:3px 9px;font-size:10px;">⬇ xlsx</button>
+      </div></div>
+    <div id="fcInfo" style="font-size:11px;color:var(--tx2);margin:2px 0 8px;"></div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start;">
+      <canvas id="fcCanvas" style="display:block;"></canvas>
+      <div id="fcSide" style="flex:1;min-width:240px;font-size:11.5px;line-height:1.6;"></div>
+    </div>
+    <div style="font-size:10.5px;color:var(--tx3);margin-top:6px;">Status of each protein under the run rule in
+      each contrast. Dashed diagonal = identical response; solid line = major-axis fit on the shared DEP (slope &lt; 1:
+      weaker response in Y), drawn from 5 shared DEP. Hover for details, click a protein to find it in the volcano.</div>
+  </div>
+</div>
+"""
+
+FIG2611_JS = r"""<script>
+/* ── Figures exploratoires (09/11/2026) : raincloud, motifs de manquants, ridge plot
+   GSEA, flèches de biplot, page FC vs FC, export iPath3. Chaque figure se dessine à
+   l'ouverture de sa page ; une figure sans données se masque ou le dit. */
+(function(){
+  function cv(n, d){ try{ var v = getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v || d; }catch(e){ return d; } }
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(ch){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]; }); }
+  function pal(){ return {bg: cv('--bg2', '#161b22'), bg3: cv('--bg3', '#21262d'), tx: cv('--tx', '#e6edf3'),
+    tx2: cv('--tx2', '#8b949e'), tx3: cv('--tx3', '#6e7681'), bd: cv('--bd2', '#30363d')}; }
+  function setup(cvs, W, H){
+    var dpr = window.devicePixelRatio || 1;
+    cvs.width = Math.round(W * dpr); cvs.height = Math.round(H * dpr);
+    cvs.style.width = W + 'px'; cvs.style.height = H + 'px';
+    var ctx = cvs.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); return ctx;
+  }
+  function condCol(c){ return (window.COND_COLORS && COND_COLORS[c]) || '#8b949e'; }
+  function dark(c){ var m = /^#?([0-9a-f]{6})$/i.exec(String(c || '')); if(!m) return c;
+    var n = parseInt(m[1], 16), k = 0.62;
+    return 'rgb(' + Math.round(((n >> 16) & 255) * k) + ',' + Math.round(((n >> 8) & 255) * k) + ',' + Math.round((n & 255) * k) + ')'; }
+  // encre lisible sur le fond courant : couleur assombrie en thème clair, éclaircie en thème sombre
+  function isDarkBg(){ var m = /#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(cv('--bg2', '#161b22'));
+    if(!m) return false; return (0.299 * parseInt(m[1], 16) + 0.587 * parseInt(m[2], 16) + 0.114 * parseInt(m[3], 16)) < 110; }
+  function light(c){ var m = /^#?([0-9a-f]{6})$/i.exec(String(c || '')); if(!m) return c;
+    var n = parseInt(m[1], 16), k = 0.35, f = function(v){ return Math.round(v + (255 - v) * k); };
+    return 'rgb(' + f((n >> 16) & 255) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')'; }
+  function ink(c){ return isDarkBg() ? light(c) : dark(c); }
+  function rgba(c, a){ var m = /^#?([0-9a-f]{6})$/i.exec(String(c || '')); if(!m) return c;
+    var n = parseInt(m[1], 16); return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')'; }
+  function sampleLabel(s){ return (typeof SAMPLE_LABELS !== 'undefined' && SAMPLE_LABELS && SAMPLE_LABELS[s]) || s; }
+  function clab(c, inv){ var p = String(c).split('_vs_'); return (inv && p.length === 2 ? p[1] + ' vs ' + p[0] : String(c).replace(/_vs_/g, ' vs ')).replace(/_/g, ' '); }
+  function rule(){ return window.DEIMOS_RULE || {lfc: 0, ptype: 'p', p: 0.05, text: ''}; }
+  function sig(p){ var R = rule(); return typeof isSig === 'function' ? isSig(p, R.lfc, R.ptype, R.p) : false; }
+  function fmt(v, d){ return v == null || isNaN(v) ? '—' : (+v).toFixed(d == null ? 2 : d); }
+  function fp(v){ if(v == null || v === '') return '—'; var x = +v; return x === 0 ? '0' : x < 1e-3 ? x.toExponential(2) : x.toPrecision(3); }
+  function tip(){ var t = document.getElementById('fig2611Tip');
+    if(!t){ t = document.createElement('div'); t.className = 'tip'; t.id = 'fig2611Tip'; document.body.appendChild(t); } return t; }
+  function showTip(e, html){ var t = tip(); t.innerHTML = html; t.style.display = 'block';
+    t.style.left = Math.min(e.clientX + 14, window.innerWidth - 320) + 'px'; t.style.top = (e.clientY - 10) + 'px'; }
+  function hideTip(){ var t = document.getElementById('fig2611Tip'); if(t) t.style.display = 'none'; }
+  function pearson(xs, ys){ var n = xs.length; if(n < 3) return null; var mx = 0, my = 0, i;
+    for(i = 0; i < n; i++){ mx += xs[i]; my += ys[i]; } mx /= n; my /= n;
+    var sxx = 0, syy = 0, sxy = 0; for(i = 0; i < n; i++){ var a = xs[i] - mx, b = ys[i] - my; sxx += a * a; syy += b * b; sxy += a * b; }
+    return sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : null; }
+  function silverman(v){ var n = v.length; if(n < 2) return 0.25;
+    var m = v.reduce(function(a, b){ return a + b; }, 0) / n, s = Math.sqrt(v.reduce(function(a, b){ return a + (b - m) * (b - m); }, 0) / (n - 1));
+    var w = v.slice().sort(function(a, b){ return a - b; }), iqr = w[Math.floor(0.75 * (n - 1))] - w[Math.floor(0.25 * (n - 1))];
+    var sd = iqr > 0 ? Math.min(s, iqr / 1.349) : s; return sd > 0 ? 0.9 * sd * Math.pow(n, -0.2) : 0.25; }
+  function kde(v, grid, bw){ return grid.map(function(g){ var s = 0; for(var i = 0; i < v.length; i++){ var z = (g - v[i]) / bw; s += Math.exp(-0.5 * z * z); } return s; }); }
+  function thin(a, n){ if(a.length <= n) return a; var out = [], step = a.length / n; for(var i = 0; i < n; i++) out.push(a[Math.floor(i * step)]); return out; }
+  function jit(i){ var x = Math.sin((i + 1) * 12.9898) * 43758.5453; return x - Math.floor(x); }
+  function fit(ctx, s, w){ s = String(s); if(ctx.measureText(s).width <= w) return s;
+    while(s.length > 4 && ctx.measureText(s + '…').width > w) s = s.slice(0, -1); return s + '…'; }
+  var IMP = '#d29922';
+
+  /* ── 1. Raincloud (QC / PCA) ── */
+  function quantFromDensity(grid, dens, qs){
+    var cum = [0], i; for(i = 1; i < grid.length; i++) cum.push(cum[i - 1] + (dens[i] + dens[i - 1]) / 2 * (grid[i] - grid[i - 1]));
+    var tot = cum[cum.length - 1]; if(!(tot > 0)) return null;
+    return qs.map(function(q){ var t = q * tot; for(i = 1; i < cum.length; i++){ if(cum[i] >= t){
+      var f = (t - cum[i - 1]) / ((cum[i] - cum[i - 1]) || 1); return grid[i - 1] + f * (grid[i] - grid[i - 1]); } } return grid[grid.length - 1]; });
+  }
+  window.drawRaincloud = function(){
+    var D = (typeof RAIN_DATA !== 'undefined') ? RAIN_DATA : null, cvs = document.getElementById('rainCanvas'),
+        panel = document.getElementById('rainPanel'), info = document.getElementById('rainInfo');
+    if(!cvs || !panel) return;
+    if(!D || !D.order || !D.order.length){ panel.style.display = 'none'; return; }
+    var sel = document.getElementById('rainMode');
+    if(!sel.getAttribute('data-init')){ sel.value = D.order.length > 36 ? 'c' : 's'; sel.setAttribute('data-init', '1'); }
+    var mode = sel.value, rows = [], G = D.grid, nG = G.length;
+    if(mode === 's'){
+      D.order.forEach(function(s){ var d = D.samples[s];
+        rows.push({lab: sampleLabel(s), cond: d.cond, dO: d.do, dI: d.di || [], q: d.q, pO: d.po, pI: d.pi, nO: d.n_obs, nI: d.n_imp, mo: d.mo, mi: d.mi}); });
+    } else {
+      var by = {}, ord = [];
+      D.order.forEach(function(s){ var d = D.samples[s], r = by[d.cond];
+        if(!r){ r = by[d.cond] = {cond: d.cond, dO: new Array(nG).fill(0), dI: new Array(nG).fill(0), pO: [], pI: [], nO: 0, nI: 0, ns: 0}; ord.push(d.cond); }
+        d.do.forEach(function(v, i){ r.dO[i] += v; }); (d.di || []).forEach(function(v, i){ r.dI[i] += v; });
+        r.pO = r.pO.concat(d.po); r.pI = r.pI.concat(d.pi); r.nO += d.n_obs; r.nI += d.n_imp; r.ns++; });
+      ord.forEach(function(c){ var r = by[c]; r.lab = c + ' (n=' + r.ns + ')'; r.q = quantFromDensity(G, r.dO, [0.05, 0.25, 0.5, 0.75, 0.95]);
+        r.pO = thin(r.pO, 260); r.pI = thin(r.pI, 260); if(!r.nI) r.dI = []; rows.push(r); });
+    }
+    var P = pal(), W = Math.max(680, (cvs.parentElement.clientWidth || 900) - 30);
+    var LW = mode === 's' ? 120 : 210, RW = 96, TH = 30, BH = 40, ROW = rows.length > 40 ? 26 : 46;
+    var H = TH + rows.length * ROW + BH, ctx = setup(cvs, W, H);
+    ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+    var x0 = LW, x1 = W - RW, gx0 = G[0], gx1 = G[nG - 1];
+    function X(v){ return x0 + (v - gx0) / (gx1 - gx0) * (x1 - x0); }
+    var mx = 0; rows.forEach(function(r){ r.dO.forEach(function(v){ if(v > mx) mx = v; }); });
+    mx = mx || 1;
+    // graduations
+    ctx.strokeStyle = P.bg3; ctx.lineWidth = 1; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+    for(var t = Math.ceil(gx0); t <= gx1; t++){ if(t % 2) continue; var xt = X(t);
+      ctx.beginPath(); ctx.moveTo(xt, TH - 4); ctx.lineTo(xt, H - BH + 4); ctx.stroke();
+      ctx.fillStyle = P.tx3; ctx.fillText(t, xt, H - BH + 16); }
+    ctx.fillStyle = P.tx2; ctx.fillText('log₂ intensity — matrix of the tests (Log2_Impute)', (x0 + x1) / 2, H - 8);
+    // légende
+    ctx.textAlign = 'left'; ctx.font = '10.5px sans-serif';
+    ctx.fillStyle = rgba('#8b949e', 0.55); ctx.fillRect(x0, 9, 14, 9); ctx.fillStyle = P.tx2; ctx.fillText('observed (condition colour)', x0 + 19, 17);
+    if(D.mask){ ctx.fillStyle = rgba(IMP, 0.5); ctx.fillRect(x0 + 190, 9, 14, 9); ctx.fillStyle = P.tx2; ctx.fillText('imputed (missing in raw_data) — shape only, share at right', x0 + 209, 17); }
+    ctx.fillText('box: observed, 5–25–50–75–95 %', x0 + (D.mask ? 560 : 190), 17);
+    ctx.textAlign = 'right'; ctx.fillStyle = P.tx3; ctx.fillText('imputed', W - 8, 17);
+    var hC = ROW * 0.6, lastCond = null;
+    rows.forEach(function(r, i){
+      var y0 = TH + i * ROW, yb = y0 + hC + 2, col = condCol(r.cond);
+      if(r.cond !== lastCond && i > 0){ ctx.strokeStyle = P.bd; ctx.beginPath(); ctx.moveTo(8, y0 + 1); ctx.lineTo(W - 8, y0 + 1); ctx.stroke(); }
+      lastCond = r.cond;
+      function cloud(d, sc, fill, stroke){ if(!d || !d.length || !(sc > 0)) return; ctx.beginPath(); ctx.moveTo(X(G[0]), yb);
+        for(var k = 0; k < nG; k++) ctx.lineTo(X(G[k]), yb - d[k] / sc * hC);
+        ctx.lineTo(X(G[nG - 1]), yb); ctx.closePath(); ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke(); }
+      cloud(r.dO, mx, rgba(col, 0.55), ink(col));
+      // imputées : peu nombreuses, leur densité en nombres serait plate — forme seule, pic à 55 % de celui des observées
+      var pO = Math.max.apply(null, r.dO), pI = r.dI.length ? Math.max.apply(null, r.dI) : 0;
+      if(pI > 0) cloud(r.dI, pI * mx / (0.55 * (pO || mx)), rgba(IMP, 0.45), IMP);
+      if(r.q){ var bh = 5, by0 = yb + 2;
+        ctx.strokeStyle = P.tx2; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(X(r.q[0]), by0 + bh / 2); ctx.lineTo(X(r.q[1]), by0 + bh / 2);
+        ctx.moveTo(X(r.q[3]), by0 + bh / 2); ctx.lineTo(X(r.q[4]), by0 + bh / 2); ctx.stroke();
+        ctx.fillStyle = P.bg; ctx.fillRect(X(r.q[1]), by0, X(r.q[3]) - X(r.q[1]), bh); ctx.strokeRect(X(r.q[1]), by0, X(r.q[3]) - X(r.q[1]), bh);
+        ctx.strokeStyle = P.tx; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(r.q[2]), by0 - 1); ctx.lineTo(X(r.q[2]), by0 + bh + 1); ctx.stroke(); }
+      var ry0 = yb + 9, rh = Math.max(4, ROW - hC - 13);
+      ctx.fillStyle = ink(col); ctx.globalAlpha = 0.55; r.pO.forEach(function(v, k){ ctx.fillRect(X(v) - 0.9, ry0 + jit(k + i * 977) * rh, 1.8, 1.8); });
+      ctx.globalAlpha = 1; ctx.fillStyle = IMP; r.pI.forEach(function(v, k){ ctx.beginPath(); ctx.arc(X(v), ry0 + jit(k * 3 + 1 + i * 131) * rh, 2, 0, 6.283); ctx.fill(); });
+      ctx.fillStyle = ink(col); ctx.font = (ROW > 30 ? '11px' : '10px') + ' sans-serif'; ctx.textAlign = 'right';
+      ctx.fillText(r.lab.length > 30 ? r.lab.slice(0, 29) + '…' : r.lab, LW - 8, yb + 3);
+      var tot = r.nO + r.nI; ctx.textAlign = 'right'; ctx.fillStyle = r.nI ? IMP : P.tx3;
+      ctx.fillText(D.mask ? (tot ? (100 * r.nI / tot).toFixed(1) + ' %' : '—') : 'n/a', W - 8, yb + 3);
+      r._y0 = y0;
+    });
+    cvs._rows = rows; cvs._ROW = ROW; cvs._TH = TH;
+    cvs.onmousemove = function(e){ var b = cvs.getBoundingClientRect(), y = e.clientY - b.top, k = Math.floor((y - TH) / ROW), r = rows[k];
+      if(!r){ hideTip(); return; }
+      var mo = r.mo != null ? r.mo : (r.q ? r.q[2] : null), mi = r.mi != null ? r.mi : null;
+      showTip(e, '<div class="tg">' + esc(r.lab) + '</div><div class="tl">' + esc(r.cond) + '</div>'
+        + '<div class="tl">observed: ' + r.nO + (mo != null ? ' · median ' + fmt(mo) : '') + '</div>'
+        + (D.mask ? '<div class="tl">imputed: ' + r.nI + (mi != null ? ' · median ≈ ' + fmt(mi) : '') + '</div>' : '')); };
+    cvs.onmouseleave = hideTip;
+    if(info){
+      var nO = 0, nI = 0; D.order.forEach(function(s){ nO += D.samples[s].n_obs; nI += D.samples[s].n_imp; });
+      info.innerHTML = D.n_prot + ' proteins of the tests matrix. ' + (D.mask
+        ? (nI ? 'Imputed = missing in raw_data for that sample: <b>' + (100 * nI / (nO + nI)).toFixed(1) + ' %</b> of values. '
+              + 'A left-shifted amber cloud is expected (values imputed below detection); an imputed cloud inside the observed one means the imputation is not left-censored.'
+              : 'No imputed value in this matrix.')
+        : 'Imputation status unavailable (no raw intensities in the workbook): observed values only.');
+    }
+  };
+
+  /* ── 2. Motifs de valeurs manquantes (UpSet) ── */
+  var MVP_CLS = {cond: {c: '#8957e5', t: 'whole condition(s) missing', h: 'candidates for biological absence'},
+                 single: {c: '#8b949e', t: 'one sample', h: 'technical loss'},
+                 within: {c: '#2da44e', t: 'several samples of one condition', h: ''},
+                 mixed: {c: '#d29922', t: 'spread across conditions', h: 'low abundance, near detection limit'},
+                 all: {c: '#57606a', t: 'missing everywhere', h: ''}};
+  var mvpSel = null;
+  window.drawMissingPatterns = function(){
+    var D = (typeof MVP_DATA !== 'undefined') ? MVP_DATA : null, cvs = document.getElementById('mvpCanvas'),
+        panel = document.getElementById('mvpPanel'), info = document.getElementById('mvpInfo');
+    if(!cvs || !panel) return;
+    if(!D || !D.patterns || !D.patterns.length){
+      if(D && D.n_prot){ info.textContent = 'No missing value in raw_data (' + D.n_prot + ' proteins).'; cvs.style.display = 'none'; }
+      else panel.style.display = 'none';
+      return; }
+    var P = pal(), nS = D.samples.length, nP = D.patterns.length, avail = Math.max(700, (cvs.parentElement.clientWidth || 900) - 30);
+    var SW = 110, LW = 130, x0 = SW + LW, CW = Math.max(14, Math.min(30, (avail - x0 - 20) / nP));
+    var W = Math.min(avail, x0 + nP * CW + 20), BT = 26, BH = 150, RH = nS > 30 ? 10 : 15, MT = BT + BH + 10;
+    var H = MT + nS * RH + 34, ctx = setup(cvs, W, H);
+    ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+    var mx = Math.max.apply(null, D.patterns.map(function(p){ return p.n; })), smx = Math.max.apply(null, D.set_size.concat([1]));
+    // barres des motifs
+    ctx.font = '9.5px sans-serif'; ctx.textAlign = 'center';
+    D.patterns.forEach(function(p, j){
+      var x = x0 + j * CW + CW / 2, h = p.n / mx * BH, c = MVP_CLS[p.k].c;
+      ctx.fillStyle = mvpSel === j ? ink(c) : c; ctx.fillRect(x - CW * 0.36, BT + BH - h, CW * 0.72, h);
+      ctx.fillStyle = P.tx2; ctx.fillText(p.n, x, BT + BH - h - 3);
+    });
+    ctx.fillStyle = P.tx2; ctx.textAlign = 'right'; ctx.fillText('proteins', x0 - 6, BT + 10);
+    ctx.fillText('per pattern', x0 - 6, BT + 22);
+    // matrice
+    var lastC = null;
+    D.samples.forEach(function(s, i){
+      var y = MT + i * RH + RH / 2, col = condCol(D.cond[i]);
+      if(i % 2 === 0){ ctx.fillStyle = rgba('#8b949e', 0.07); ctx.fillRect(x0, y - RH / 2, nP * CW, RH); }
+      if(D.cond[i] !== lastC && i > 0){ ctx.strokeStyle = P.bd; ctx.beginPath(); ctx.moveTo(8, y - RH / 2); ctx.lineTo(x0 + nP * CW, y - RH / 2); ctx.stroke(); }
+      lastC = D.cond[i];
+      ctx.fillStyle = ink(col); ctx.font = (RH > 12 ? '10.5px' : '9px') + ' sans-serif'; ctx.textAlign = 'right';
+      var lb = D.labels[i] || s; ctx.fillText(lb.length > 20 ? lb.slice(0, 19) + '…' : lb, x0 - 6, y + 3.5);
+      var w = D.set_size[i] / smx * (SW - 46); ctx.fillStyle = rgba(col, 0.8); ctx.fillRect(SW - 6 - w, y - RH * 0.32, w, RH * 0.64);
+      ctx.fillStyle = P.tx3; ctx.textAlign = 'right'; ctx.font = '9px sans-serif'; ctx.fillText(D.set_size[i], SW - 10 - w, y + 3);
+    });
+    D.patterns.forEach(function(p, j){
+      var x = x0 + j * CW + CW / 2, set = {}; p.m.forEach(function(i){ set[i] = 1; });
+      if(p.m.length > 1){ ctx.strokeStyle = P.tx; ctx.lineWidth = 2; ctx.beginPath();
+        ctx.moveTo(x, MT + Math.min.apply(null, p.m) * RH + RH / 2); ctx.lineTo(x, MT + Math.max.apply(null, p.m) * RH + RH / 2); ctx.stroke(); }
+      for(var i = 0; i < nS; i++){ ctx.beginPath(); ctx.arc(x, MT + i * RH + RH / 2, Math.min(4, RH * 0.32), 0, 6.283);
+        ctx.fillStyle = set[i] ? P.tx : rgba('#8b949e', 0.28); ctx.fill(); }
+    });
+    ctx.fillStyle = P.tx3; ctx.font = '9.5px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(D.level === 'condition' ? 'proteins absent' : 'missing values per sample', SW / 2, MT - 4);
+    ctx.textAlign = 'left'; ctx.fillText('top ' + nP + ' of ' + D.n_patterns + ' patterns · click a bar to list its proteins', x0, H - 10);
+    cvs._g = {x0: x0, CW: CW, nP: nP, BT: BT, H: H};
+    function pick(e){ var b = cvs.getBoundingClientRect(), x = e.clientX - b.left, j = Math.floor((x - x0) / CW); return j >= 0 && j < nP ? j : -1; }
+    function names(p){ return p.m.map(function(i){ return D.labels[i] || D.samples[i]; }); }
+    cvs.onmousemove = function(e){ var j = pick(e); if(j < 0){ hideTip(); cvs.style.cursor = 'default'; return; }
+      var p = D.patterns[j], cl = MVP_CLS[p.k]; cvs.style.cursor = 'pointer';
+      showTip(e, '<div class="tg">' + p.n + ' proteins</div><div class="tl">' + esc(cl.t) + (cl.h ? ' — ' + esc(cl.h) : '') + '</div>'
+        + '<div class="tl">missing in: ' + esc(names(p).slice(0, 12).join(', ')) + (p.m.length > 12 ? '…' : '') + '</div>'); };
+    cvs.onmouseleave = hideTip;
+    cvs.onclick = function(e){ var j = pick(e); if(j < 0) return; mvpSel = j; drawMissingPatterns();
+      var p = D.patterns[j], box = document.getElementById('mvpList');
+      if(box) box.innerHTML = '<b style="color:var(--tx);">' + p.n + ' proteins missing in ' + esc(names(p).join(', ')) + '</b> ('
+        + esc(MVP_CLS[p.k].t) + ')' + (p.g.length < p.n ? ' — first ' + p.g.length + ':' : ':') + '<br>' + esc(p.g.filter(Boolean).join(', ')); };
+    if(info){
+      var tot = D.n_with_na || 1, h = D.n_with_na + ' of ' + D.n_prot + ' proteins have at least one missing value in raw_data (before filtering and imputation). '
+        + (D.level === 'condition' ? '<b>' + D.n_samples + ' samples: patterns are drawn per condition</b> (a condition is missing when all its samples are); classes below are counted per sample. ' : '');
+      h += '<span style="display:inline-flex;flex-wrap:wrap;gap:12px;margin-top:4px;">';
+      ['cond', 'single', 'within', 'mixed', 'all'].forEach(function(k){ var n = D.class_tot[k] || 0; if(!n) return;
+        h += '<span><span style="display:inline-block;width:10px;height:10px;background:' + MVP_CLS[k].c + ';margin-right:4px;vertical-align:-1px;"></span>'
+          + esc(MVP_CLS[k].t) + ' <b>' + n + '</b> (' + (100 * n / tot).toFixed(0) + ' %)' + (MVP_CLS[k].h ? ' <span style="color:var(--tx3);">' + esc(MVP_CLS[k].h) + '</span>' : '') + '</span>'; });
+      info.innerHTML = h + '</span>';
+    }
+  };
+  window.exportMvp = function(){
+    var D = (typeof MVP_DATA !== 'undefined') ? MVP_DATA : null; if(!D || !D.patterns) return;
+    var rows = D.patterns.map(function(p, j){ return {'Rank': j + 1, 'Proteins': p.n, 'Class': MVP_CLS[p.k].t,
+      'Missing in': p.m.map(function(i){ return D.labels[i] || D.samples[i]; }).join('; '),
+      'Conditions': p.m.map(function(i){ return D.cond[i]; }).filter(function(c, k, a){ return a.indexOf(c) === k; }).join('; '),
+      'Proteins listed': p.g.length, 'Proteins (first 200 at most)': p.g.join('; ')}; });
+    var per = D.samples.map(function(s, i){ var o = {}; o[D.level === 'condition' ? 'Condition' : 'Sample'] = D.labels[i] || s;
+      if(D.level !== 'condition') o['Condition'] = D.cond[i];
+      o[D.level === 'condition' ? 'Proteins absent (all samples missing)' : 'Missing values'] = D.set_size[i];
+      o['Missing (%)'] = +(100 * D.set_size[i] / D.n_prot).toFixed(2); return o; });
+    var cls = Object.keys(MVP_CLS).map(function(k){ return {'Class': MVP_CLS[k].t, 'Proteins': D.class_tot[k] || 0, 'Reading': MVP_CLS[k].h}; });
+    xls(makeWb([{name: 'Patterns', data: rows}, {name: D.level === 'condition' ? 'Per condition' : 'Per sample', data: per},
+                {name: 'Classes (per sample)', data: cls}]), 'proteogen_missing_patterns.xlsx');
+  };
+
+  /* ── 3. Ridge plot des leading edges (GSEA) ── */
+  window.drawGseaRidges = function(){
+    var cvs = document.getElementById('gseaRidgeCanvas'), msg = document.getElementById('gseaRidgeMsg'),
+        S = typeof window.gseaState === 'function' ? window.gseaState() : null;
+    if(!cvs) return;
+    function none(t){ cvs.style.display = 'none'; msg.style.display = 'block'; msg.textContent = t; }
+    if(!S || !S.data) return none('No GSEA pathway for this contrast.');
+    var top = parseInt((document.getElementById('gseaTop') || {}).value) || 15;
+    var up = S.rows.filter(function(t){ return S.nes(t) > 0; }).slice(0, top), dn = S.rows.filter(function(t){ return S.nes(t) < 0; }).slice(-top);
+    var show = up.concat(dn); if(!show.length) return none('No pathway passes the current filters.');
+    var all = (typeof fullRows === 'function' ? fullRows(S.c) : []), idx = {}, sg = S.inv ? -1 : 1;
+    all.forEach(function(p){ idx[p.name] = p; });
+    var R = rule(), le = [];
+    var items = show.map(function(t){
+      var v = [], s = []; (t.lp || []).forEach(function(id){ var p = idx[id]; if(p && p.d != null){ v.push(sg * p.d); s.push(sig(p)); le.push(Math.abs(p.d)); } });
+      return {t: t, v: v, s: s}; });
+    if(!le.length) return none('Leading-edge proteins could not be matched to the proteins of the workbook.');
+    cvs.style.display = 'block'; msg.style.display = 'none';
+    le.sort(function(a, b){ return a - b; });
+    var m = Math.min(5, Math.max(le[le.length - 1] + 0.6, 1.6 * (R.lfc || 0.5), 1)), allD = all.map(function(p){ return sg * p.d; }).filter(function(x){ return x != null && !isNaN(x); });
+    var P = pal(), W = Math.max(680, (cvs.parentElement.clientWidth || 900) - 30), LW = Math.min(400, W * 0.36), RW = 150, ROW = 24, TH = 18, AMP = ROW * 1.75, BH = 38;
+    var nR = items.length + 1, H = TH + AMP + (nR - 1) * ROW + 12 + BH, ctx = setup(cvs, W, H);
+    ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+    var x0 = LW + 12, x1 = W - RW; function X(v){ return x0 + (Math.max(-m, Math.min(m, v)) + m) / (2 * m) * (x1 - x0); }
+    var grid = []; for(var g = 0; g <= 140; g++) grid.push(-m + 2 * m * g / 140);
+    ctx.strokeStyle = P.bg3; ctx.lineWidth = 1; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+    var step = m > 4 ? 2 : m > 2 ? 1 : 0.5;
+    for(var tk = -Math.floor(m / step) * step; tk <= m + 1e-9; tk += step){ var xt = X(tk);
+      ctx.beginPath(); ctx.moveTo(xt, TH); ctx.lineTo(xt, H - BH + 4); ctx.stroke(); ctx.fillStyle = P.tx3; ctx.fillText(+tk.toFixed(1), xt, H - BH + 16); }
+    ctx.strokeStyle = P.tx3; ctx.beginPath(); ctx.moveTo(X(0), TH); ctx.lineTo(X(0), H - BH + 4); ctx.stroke();
+    if(R.lfc > 0){ ctx.setLineDash([3, 3]); ctx.strokeStyle = P.bd; [-R.lfc, R.lfc].forEach(function(v){ ctx.beginPath(); ctx.moveTo(X(v), TH); ctx.lineTo(X(v), H - BH + 4); ctx.stroke(); }); ctx.setLineDash([]); }
+    ctx.fillStyle = P.tx2; ctx.fillText('log₂FC in ' + clab(S.c, S.inv) + (R.lfc > 0 ? '  ·  dashed = ±' + (+R.lfc).toFixed(2) + ' (run rule)' : ''), (x0 + x1) / 2, H - 8);
+    function ridge(k, v, col, lab, right, sgs){
+      var yb = TH + AMP + k * ROW;
+      if(v.length >= 5){ var bw = Math.min(v.length < 8 ? 0.25 : 0.5, Math.max(0.1, silverman(v))), d = kde(v, grid, bw), dm = Math.max.apply(null, d) || 1;
+        ctx.beginPath(); ctx.moveTo(X(grid[0]), yb); grid.forEach(function(gv, i){ ctx.lineTo(X(gv), yb - d[i] / dm * AMP); }); ctx.lineTo(X(grid[grid.length - 1]), yb); ctx.closePath();
+        ctx.fillStyle = P.bg; ctx.fill(); ctx.fillStyle = rgba(col, isDarkBg() ? 0.7 : 0.55); ctx.fill(); ctx.strokeStyle = ink(col); ctx.lineWidth = 1.2; ctx.stroke(); }
+      ctx.strokeStyle = P.bd; ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x1, yb); ctx.stroke();
+      if(sgs){ v.forEach(function(x, i){ ctx.strokeStyle = sgs[i] ? ink(col) : rgba(col, 0.6); ctx.lineWidth = sgs[i] ? 1.4 : 1;
+        ctx.beginPath(); ctx.moveTo(X(x), yb - (v.length < 5 ? 6 : 0)); ctx.lineTo(X(x), yb + 5); ctx.stroke(); }); }
+      ctx.fillStyle = P.tx; ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.fillText(fit(ctx, lab, LW - 12), LW, yb - 3);
+      ctx.fillStyle = P.tx3; ctx.font = '10px sans-serif'; ctx.textAlign = 'left'; ctx.fillText(right, x1 + 8, yb - 3);
+    }
+    var med = function(v){ if(!v.length) return null; var w = v.slice().sort(function(a, b){ return a - b; }); return w[Math.floor(w.length / 2)]; };
+    ridge(0, thin(allD, 2500), '#8b949e', 'All quantified proteins', allD.length + ' proteins', null);
+    items.forEach(function(it, k){
+      var n = it.v.length, ns = it.s.filter(Boolean).length, md = med(it.v);
+      ridge(k + 1, it.v, S.nes(it.t) > 0 ? '#f85149' : '#388bfd', it.t.n, n + ' LE · ' + ns + ' DEP · med ' + fmt(md), it.s);
+      it.n = n; it.ns = ns; it.md = md; });
+    cvs._items = items;
+    function at(e){ var b = cvs.getBoundingClientRect(), y = e.clientY - b.top, k = Math.round((y - TH - AMP + ROW * 0.5) / ROW) - 1;
+      return k >= 0 && k < items.length ? items[k] : null; }
+    cvs.onmousemove = function(e){ var it = at(e); if(!it){ hideTip(); cvs.style.cursor = 'default'; return; } cvs.style.cursor = 'pointer';
+      var big = it.v.filter(function(x){ return Math.abs(x) >= (R.lfc || 0); }).length;
+      showTip(e, '<div class="tg">' + esc(it.t.n) + '</div><div class="tl">NES ' + fmt(S.nes(it.t)) + ' · FDR ' + (it.t.q === 0 && S.data.n_perm ? '< ' + (1 / S.data.n_perm).toPrecision(2) : fp(it.t.q)) + '</div>'
+        + '<div class="tl">' + it.n + ' leading-edge proteins matched (of ' + (it.t.lp || []).length + '), ' + it.ns + ' DEP</div>'
+        + '<div class="tl">median log2FC ' + fmt(it.md) + (R.lfc > 0 ? ' · ' + big + ' with |log2FC| ≥ ' + (+R.lfc).toFixed(2) : '') + '</div>'); };
+    cvs.onmouseleave = hideTip;
+    cvs.onclick = function(e){ var it = at(e); if(it && typeof window.gseaSelect === 'function') window.gseaSelect(S.key(it.t)); };
+  };
+
+  /* ── 4. Flèches de biplot sur le score plot (PCA de Deimos) ── */
+  (function(){
+    var orig = window.drawPCALoad;
+    if(typeof orig !== 'function') return;
+    window.drawPCALoad = function(){
+      orig.apply(this, arguments);
+      var cb = document.getElementById('pcaBiplot'), c = document.getElementById('pcaLoadScores');
+      if(!cb || !cb.checked || !c || !c._sx || typeof PCA_LOAD === 'undefined' || !PCA_LOAD) return;
+      var D = PCA_LOAD, drv = D.proteins.filter(function(p){ return p.drv; });
+      if(!drv.length) drv = D.proteins.slice().sort(function(a, b){ return (b.x * b.x + b.y * b.y) - (a.x * a.x + a.y * a.y); }).slice(0, 12);
+      if(!drv.length) return;
+      var sxm = Math.max.apply(null, D.scores.map(function(p){ return Math.abs(p.x); })), sym = Math.max.apply(null, D.scores.map(function(p){ return Math.abs(p.y); }));
+      var lxm = Math.max.apply(null, drv.map(function(p){ return Math.abs(p.x); })) || 1, lym = Math.max.apply(null, drv.map(function(p){ return Math.abs(p.y); })) || 1;
+      var f = 0.8 * Math.min(sxm / lxm, sym / lym), ctx = c.getContext('2d'), ox = c._sx(0), oy = c._sy(0), P = pal(), placed = [];
+      ctx.font = 'bold 9px sans-serif';
+      drv.forEach(function(p){
+        var col = (typeof _plColor === 'function' && p.grp) ? (typeof _plDark === 'function' ? _plDark(_plColor(p.grp)) : _plColor(p.grp)) : P.tx2;
+        var x = c._sx(p.x * f), y = c._sy(p.y * f), a = Math.atan2(y - oy, x - ox);
+        ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.85;
+        ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(x, y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - 7 * Math.cos(a - 0.4), y - 7 * Math.sin(a - 0.4)); ctx.lineTo(x - 7 * Math.cos(a + 0.4), y - 7 * Math.sin(a + 0.4)); ctx.closePath(); ctx.fill();
+        ctx.globalAlpha = 1;
+        var w = ctx.measureText(p.g).width, lx = x + (Math.cos(a) >= 0 ? 4 : -4 - w), ly = y + (Math.sin(a) >= 0 ? 10 : -4), tries = 0;
+        function hit(){ return placed.some(function(b){ return lx < b.x + b.w && lx + w > b.x && ly - 9 < b.y && ly > b.y - 9; }); }
+        while(hit() && tries < 8){ ly += Math.sin(a) >= 0 ? 10 : -10; tries++; }
+        placed.push({x: lx, y: ly, w: w}); ctx.fillText(p.g, lx, ly);
+      });
+      ctx.fillStyle = P.tx3; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+      ctx.fillText('arrows = driving proteins, loadings rescaled to the scores (direction matters, length is relative)', c.width / (window.devicePixelRatio || 1) - 16, 13);
+      ctx.textAlign = 'left';
+    };
+  })();
+
+  /* ── 5. Page FC vs FC ── */
+  var FC_CLS = {same: {c: '#8250df', t: 'DEP in both, same direction'}, opp: {c: '#cf222e', t: 'DEP in both, opposite directions'},
+                x: {c: '#0969da', t: 'DEP in X only'}, y: {c: '#bf8700', t: 'DEP in Y only'}, ns: {c: '#8b949e', t: 'DEP in neither'}};
+  var fcBuilt = false, fcLast = null;
+  function initFC(){
+    if(!fcBuilt){
+      var sx = document.getElementById('fcX'), sy = document.getElementById('fcY');
+      var opts = CONTRASTS.map(function(c){ return '<option value="' + esc(c) + '">' + esc(clab(c)) + '</option>'; }).join('');
+      sx.innerHTML = opts; sy.innerHTML = opts; sx.value = CONTRASTS[0]; sy.value = CONTRASTS[1] || CONTRASTS[0]; fcBuilt = true;
+    }
+    requestAnimationFrame(drawFC);
+  }
+  function fcData(){
+    var cx = document.getElementById('fcX').value, cy = document.getElementById('fcY').value,
+        ix = document.getElementById('fcInvX').checked ? -1 : 1, iy = document.getElementById('fcInvY').checked ? -1 : 1;
+    var A = fullRows(cx), B = fullRows(cy), idx = {}, pts = [];
+    B.forEach(function(p){ idx[p.name] = p; });
+    A.forEach(function(p){ var q = idx[p.name]; if(!q || p.d == null || q.d == null) return;
+      var dx = ix * p.d, dy = iy * q.d, sx = sig(p), sy = sig(q);
+      pts.push({n: p.name, g: (typeof geneOf === 'function' ? geneOf(p) : p.g) || '', desc: p.desc || '', dx: dx, dy: dy,
+                px: p.p, qx: p.padj, py: q.p, qy: q.padj, cls: sx && sy ? (dx * dy > 0 ? 'same' : 'opp') : sx ? 'x' : sy ? 'y' : 'ns'}); });
+    return {cx: cx, cy: cy, ix: ix, iy: iy, pts: pts};
+  }
+  window.drawFC = function(){
+    var cvs = document.getElementById('fcCanvas'), side = document.getElementById('fcSide'), info = document.getElementById('fcInfo');
+    if(!cvs) return;
+    if(CONTRASTS.length < 2){ cvs.style.display = 'none'; side.innerHTML = ''; info.textContent = 'Needs at least two contrasts.'; return; }
+    var F = fcData(), R = rule(), showAll = document.getElementById('fcShow').value === 'all';
+    var pts = showAll ? F.pts : F.pts.filter(function(p){ return p.cls !== 'ns'; }); fcLast = F;
+    var cnt = {same: 0, opp: 0, x: 0, y: 0, ns: 0}, q = {pp: 0, mm: 0, mp: 0, pm: 0};
+    F.pts.forEach(function(p){ cnt[p.cls]++; if(p.cls === 'same' || p.cls === 'opp') q[(p.dx > 0 ? 'p' : 'm') + (p.dy > 0 ? 'p' : 'm')]++; });
+    // pente et r sur les DEP COMMUNES : sur l'union, les DEP d'un seul contraste (sélectionnées sur
+    // un seul axe) forment une croix qui fausse la pente ; la concordance de signe lit le reste
+    var shared = F.pts.filter(function(p){ return p.cls === 'same' || p.cls === 'opp'; });
+    var rAll = pearson(F.pts.map(function(p){ return p.dx; }), F.pts.map(function(p){ return p.dy; })),
+        rSh = shared.length >= 5 ? pearson(shared.map(function(p){ return p.dx; }), shared.map(function(p){ return p.dy; })) : null;
+    var slope = null, mxm = 0, mym = 0;
+    if(shared.length >= 5){ shared.forEach(function(p){ mxm += p.dx; mym += p.dy; }); mxm /= shared.length; mym /= shared.length;
+      var sxx = 0, syy = 0, sxy = 0; shared.forEach(function(p){ var a = p.dx - mxm, b = p.dy - mym; sxx += a * a; syy += b * b; sxy += a * b; });
+      if(Math.abs(sxy) > 1e-12) slope = (syy - sxx + Math.sqrt((syy - sxx) * (syy - sxx) + 4 * sxy * sxy)) / (2 * sxy); }
+    function conc(k){ var a = F.pts.filter(function(p){ return p.cls === k || p.cls === 'same' || p.cls === 'opp'; });
+      var c = a.filter(function(p){ return p.dx * p.dy > 0; }).length; return a.length ? {n: a.length, f: c / a.length} : null; }
+    var cX = conc('x'), cY = conc('y');
+    var av = []; pts.forEach(function(p){ av.push(Math.abs(p.dx), Math.abs(p.dy)); }); av.sort(function(a, b){ return a - b; });
+    var dmx = 0; F.pts.forEach(function(p){ if(p.cls !== 'ns') dmx = Math.max(dmx, Math.abs(p.dx), Math.abs(p.dy)); });
+    var m = Math.min(10, Math.max(av.length ? av[Math.floor(0.998 * (av.length - 1))] : 1, dmx, 1.8 * (R.lfc || 0.5), 1)) * 1.05;
+    var P = pal(), S = Math.max(420, Math.min(620, (cvs.parentElement.clientWidth || 900) - 300)), pad = {l: 52, r: 16, t: 16, b: 44};
+    cvs.style.display = 'block'; var ctx = setup(cvs, S + pad.l + pad.r, S + pad.t + pad.b), W = S + pad.l + pad.r, H = S + pad.t + pad.b;
+    ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+    function X(v){ return pad.l + (Math.max(-m, Math.min(m, v)) + m) / (2 * m) * S; } function Y(v){ return pad.t + (m - Math.max(-m, Math.min(m, v))) / (2 * m) * S; }
+    var step = m > 6 ? 2 : m > 3 ? 1 : 0.5; ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
+    for(var t = -Math.floor(m / step) * step; t <= m + 1e-9; t += step){ ctx.strokeStyle = P.bg3;
+      ctx.beginPath(); ctx.moveTo(X(t), pad.t); ctx.lineTo(X(t), pad.t + S); ctx.moveTo(pad.l, Y(t)); ctx.lineTo(pad.l + S, Y(t)); ctx.stroke();
+      ctx.fillStyle = P.tx3; ctx.textAlign = 'center'; ctx.fillText(+t.toFixed(1), X(t), pad.t + S + 14); ctx.textAlign = 'right'; ctx.fillText(+t.toFixed(1), pad.l - 5, Y(t) + 3); }
+    ctx.strokeStyle = P.tx3; ctx.beginPath(); ctx.moveTo(X(0), pad.t); ctx.lineTo(X(0), pad.t + S); ctx.moveTo(pad.l, Y(0)); ctx.lineTo(pad.l + S, Y(0)); ctx.stroke();
+    if(R.lfc > 0){ ctx.strokeStyle = P.bd; ctx.setLineDash([2, 3]); [-R.lfc, R.lfc].forEach(function(v){ ctx.beginPath(); ctx.moveTo(X(v), pad.t); ctx.lineTo(X(v), pad.t + S); ctx.moveTo(pad.l, Y(v)); ctx.lineTo(pad.l + S, Y(v)); ctx.stroke(); }); }
+    ctx.strokeStyle = P.tx2; ctx.setLineDash([6, 4]); ctx.beginPath(); ctx.moveTo(X(-m), Y(-m)); ctx.lineTo(X(m), Y(m)); ctx.stroke(); ctx.setLineDash([]);
+    ['ns', 'x', 'y', 'opp', 'same'].forEach(function(k){
+      pts.forEach(function(p){ if(p.cls !== k) return; ctx.fillStyle = k === 'ns' ? rgba('#8b949e', 0.35) : rgba(FC_CLS[k].c, 0.85);
+        if(k === 'ns') ctx.fillRect(X(p.dx) - 1, Y(p.dy) - 1, 2, 2); else { ctx.beginPath(); ctx.arc(X(p.dx), Y(p.dy), k === 'same' || k === 'opp' ? 3.2 : 2.6, 0, 6.283); ctx.fill(); } }); });
+    if(slope != null){ var xa = -m, xb = m, ya = mym + slope * (xa - mxm), yb = mym + slope * (xb - mxm);
+      if(Math.abs(ya) > m){ ya = ya > 0 ? m : -m; xa = mxm + (ya - mym) / slope; } if(Math.abs(yb) > m){ yb = yb > 0 ? m : -m; xb = mxm + (yb - mym) / slope; }
+      ctx.strokeStyle = P.tx; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(X(xa), Y(ya)); ctx.lineTo(X(xb), Y(yb)); ctx.stroke(); ctx.lineWidth = 1; }
+    // étiquettes des protéines les plus fortes (DEP dans les deux)
+    var both = F.pts.filter(function(p){ return p.cls === 'same' || p.cls === 'opp'; }).sort(function(a, b){ return (Math.abs(b.dx) + Math.abs(b.dy)) - (Math.abs(a.dx) + Math.abs(a.dy)); }).slice(0, 10);
+    ctx.font = 'bold 9.5px sans-serif'; var placed = [];
+    both.forEach(function(p){ var lb = p.g || p.n, w = ctx.measureText(lb).width, x = X(p.dx), y = Y(p.dy), lx = p.dx > 0 ? x - w - 5 : x + 5, ly = y - 4, k = 0;
+      function hit(){ return placed.some(function(b){ return lx < b.x + b.w && lx + w > b.x && ly - 9 < b.y && ly > b.y - 9; }); }
+      while(hit() && k < 6){ ly += p.dy > 0 ? 10 : -10; k++; } placed.push({x: lx, y: ly, w: w});
+      ctx.fillStyle = ink(FC_CLS[p.cls].c); ctx.textAlign = 'left'; ctx.fillText(lb, lx, ly); });
+    // comptes des quadrants (DEP dans les deux)
+    ctx.font = 'bold 11px sans-serif'; ctx.fillStyle = FC_CLS.same.c; ctx.textAlign = 'right'; ctx.fillText('↑↑ ' + q.pp, pad.l + S - 6, pad.t + 14);
+    ctx.textAlign = 'left'; ctx.fillText('↓↓ ' + q.mm, pad.l + 6, pad.t + S - 8);
+    ctx.fillStyle = FC_CLS.opp.c; ctx.fillText('↓↑ ' + q.mp, pad.l + 6, pad.t + 14); ctx.textAlign = 'right'; ctx.fillText('↑↓ ' + q.pm, pad.l + S - 6, pad.t + S - 8);
+    ctx.fillStyle = P.tx2; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('log₂FC  X: ' + clab(F.cx, F.ix < 0), pad.l + S / 2, H - 10);
+    ctx.save(); ctx.translate(13, pad.t + S / 2); ctx.rotate(-Math.PI / 2); ctx.fillText('log₂FC  Y: ' + clab(F.cy, F.iy < 0), 0, 0); ctx.restore();
+    cvs._pts = pts; cvs._X = X; cvs._Y = Y;
+    cvs.onmousemove = function(e){ var b = cvs.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top, best = null, bd = 49;
+      pts.forEach(function(p){ var dx = X(p.dx) - mx, dy = Y(p.dy) - my, d = dx * dx + dy * dy; if(d < bd){ bd = d; best = p; } });
+      if(!best){ hideTip(); cvs.style.cursor = 'default'; return; } cvs.style.cursor = 'pointer';
+      showTip(e, '<div class="tg">' + esc(best.g || best.n) + '</div><div class="tl">' + esc(best.n) + '</div>' + (best.desc ? '<div class="tl">' + esc(best.desc) + '</div>' : '')
+        + '<div class="tl">X: log2FC ' + fmt(best.dx) + ' · p ' + fp(best.px) + ' · p.adj ' + fp(best.qx) + '</div>'
+        + '<div class="tl">Y: log2FC ' + fmt(best.dy) + ' · p ' + fp(best.py) + ' · p.adj ' + fp(best.qy) + '</div>'
+        + '<div class="tl" style="color:' + FC_CLS[best.cls].c + ';">' + FC_CLS[best.cls].t + '</div>'); };
+    cvs.onmouseleave = hideTip;
+    cvs.onclick = function(e){ var b = cvs.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top, best = null, bd = 49;
+      pts.forEach(function(p){ var dx = X(p.dx) - mx, dy = Y(p.dy) - my, d = dx * dx + dy * dy; if(d < bd){ bd = d; best = p; } });
+      if(best && typeof _plFind === 'function') _plFind(best.g || best.n); };
+    var h = '<div style="font-weight:600;color:var(--tx);margin-bottom:4px;">' + F.pts.length + ' proteins quantified in both</div>';
+    ['same', 'opp', 'x', 'y', 'ns'].forEach(function(k){ h += '<div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + FC_CLS[k].c
+      + ';margin-right:6px;vertical-align:-1px;"></span>' + FC_CLS[k].t + ' <b>' + cnt[k] + '</b></div>'; });
+    var sh = cnt.same + cnt.opp, uni = sh + cnt.x + cnt.y;
+    h += '<div style="margin-top:10px;">Shared DEP: <b>' + sh + '</b> of ' + uni + ' (' + (uni ? (100 * sh / uni).toFixed(0) : 0) + ' %), of which '
+      + cnt.opp + ' in opposite directions.</div>';
+    function pc(c){ return c ? '<b>' + (100 * c.f).toFixed(0) + ' %</b> (n = ' + c.n + ')' : '—'; }
+    h += '<div style="margin-top:6px;">Same sign in Y among DEP in X: ' + pc(cX) + '</div><div>Same sign in X among DEP in Y: ' + pc(cY) + '</div>'
+      + '<div style="color:var(--tx3);font-size:10.5px;">50 % = unrelated responses, 100 % = same direction even when not significant.</div>';
+    h += '<div style="margin-top:6px;">Pearson r, all proteins: <b>' + fmt(rAll) + '</b></div>';
+    h += shared.length >= 5
+      ? '<div>Pearson r, shared DEP: <b>' + fmt(rSh) + '</b></div><div>Major-axis slope, shared DEP: <b>' + fmt(slope) + '</b>'
+        + (slope != null ? (Math.abs(slope) < 0.8 ? ' — weaker response in Y' : Math.abs(slope) > 1.25 ? ' — stronger response in Y' : ' — similar amplitude') : '') + '</div>'
+      : '<div style="color:var(--tx3);">Slope: needs at least 5 shared DEP (' + shared.length + ').</div>';
+    side.innerHTML = h;
+    info.textContent = 'Rule: ' + (R.text || '') + '. X = ' + clab(F.cx, F.ix < 0) + ', Y = ' + clab(F.cy, F.iy < 0) + (showAll ? '' : ' — proteins that are DEP in neither are hidden.');
+  };
+  window.exportFC = function(){
+    var F = fcLast || fcData(), R = rule();
+    var rows = F.pts.map(function(p){ return {'Protein': p.n, 'Gene': p.g, 'Description': p.desc, 'log2FC X': p.dx, 'p X': p.px, 'p.adj X': p.qx,
+      'log2FC Y': p.dy, 'p Y': p.py, 'p.adj Y': p.qy, 'Class': FC_CLS[p.cls].t}; }).sort(function(a, b){ return Math.abs(b['log2FC X']) + Math.abs(b['log2FC Y']) - Math.abs(a['log2FC X']) - Math.abs(a['log2FC Y']); });
+    var infoS = [{'X': clab(F.cx, F.ix < 0), 'Y': clab(F.cy, F.iy < 0), 'Rule': R.text || '', 'Inverted X': F.ix < 0 ? 'yes' : 'no', 'Inverted Y': F.iy < 0 ? 'yes' : 'no'}];
+    xls(makeWb([{name: 'FC vs FC', data: rows}, {name: 'Info', data: infoS}]), 'proteogen_FCvsFC_' + (F.cx + '__' + F.cy).slice(0, 60) + '.xlsx');
+  };
+
+  /* ── 6. Export iPath3 (page Volcano) ── */
+  window.exportIPath = function(){
+    var c = (typeof activeContrast !== 'undefined' && activeContrast) || CONTRASTS[0], inv = (typeof invertActive !== 'undefined' && invertActive);
+    var I = (typeof IPATH_IDS !== 'undefined' && IPATH_IDS) ? IPATH_IDS.ids || {} : {}, R = rule(), lines = [], seen = {};
+    var rows = fullRows(c).filter(sig), mx = 0;
+    rows.forEach(function(p){ mx = Math.max(mx, Math.abs(p.d)); }); mx = Math.max(mx, (R.lfc || 0) + 0.5);
+    function hex(v){ return ('0' + Math.round(v).toString(16)).slice(-2); }
+    rows.forEach(function(p){ var d = inv ? -p.d : p.d, id = I[p.name] || p.name; if(!id || seen[id]) return; seen[id] = 1;
+      var f = Math.min(1, Math.max(0, (Math.abs(d) - (R.lfc || 0)) / ((mx - (R.lfc || 0)) || 1))), k = 0.35 + 0.65 * f;
+      var col = d > 0 ? '#' + hex(255 - 40 * k) + hex(200 - 170 * k) + hex(200 - 170 * k) : '#' + hex(200 - 170 * k) + hex(200 - 110 * k) + hex(255 - 40 * k);
+      lines.push(id + ' ' + col + ' W' + Math.round(8 + 12 * f)); });
+    if(!lines.length){ var bt = document.getElementById('btnIPath'); if(bt){ var t0 = bt.textContent; bt.textContent = 'no DEP in ' + clab(c, inv);
+      setTimeout(function(){ bt.textContent = t0; }, 2500); } return; }
+    var blob = new Blob([lines.join('\n') + '\n'], {type: 'text/plain'}), a = document.createElement('a');
+    var p = String(c).split('_vs_'), name = inv && p.length === 2 ? p[1] + '_vs_' + p[0] : c;
+    a.download = 'proteogen_iPath3_' + String(name).slice(0, 60) + '.txt'; a.href = URL.createObjectURL(blob); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 2000);
+  };
+
+  /* ── navigation : page FC vs FC ; figures QC à l'ouverture de l'onglet ── */
+  var _prev = window.showPage;
+  window.showPage = function(id){
+    if(id === 'fcpage'){
+      document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
+      document.getElementById('fcpage').classList.add('active');
+      document.querySelectorAll('nav a').forEach(function(a){ a.classList.toggle('active', (a.getAttribute('onclick') || '').indexOf("'fcpage'") >= 0); });
+      initFC();
+    } else if(typeof _prev === 'function'){ _prev(id); }
+    if(id === 'qcpage') requestAnimationFrame(function(){
+      try{ drawRaincloud(); }catch(e){ console.error('[QC] drawRaincloud :', e); }
+      try{ drawMissingPatterns(); }catch(e){ console.error('[QC] drawMissingPatterns :', e); } });
+  };
+})();
+</script>"""
+
+
+def patch_figures_2026_11(html, data):
+    """Figures exploratoires du 09/11/2026 (FIG2611_JS) : panneaux, données, script.
+    À appeler en dernier (après patch_gsea_page) : le script enveloppe showPage et
+    drawPCALoad. Chaque ancre manquante est signalée, le reste s'applique."""
+    done, miss = [], []
+
+    def _ins(anchor, new, label, before=False):
+        nonlocal html
+        if anchor in html:
+            html = html.replace(anchor, (new + anchor) if before else (anchor + new), 1)
+            done.append(label)
+        else:
+            miss.append(label)
+    # QC : raincloud + motifs de manquants, sous la rangée distribution / valeurs manquantes
+    _ins('<canvas id="missingCanvas" style="display:block;width:100%;"></canvas>\n  </div>\n</div>',
+         FIG2611_QC_HTML, 'raincloud + missing patterns')
+    # GSEA : ridge plot sous le graphique des NES
+    _ins('<div id="gseaNesMsg" style="display:none;color:var(--tx2);font-size:12px;padding:18px 4px;"></div>\n  </div>',
+         FIG2611_RIDGE_HTML, 'GSEA ridges')
+    # PCA : case « biplot arrows » dans l'en-tête du score / loading plot
+    _ins('<span style="font-size:10px;color:var(--tx2);" id="pcaLoadInfo"></span>',
+         '<label style="font-size:10.5px;color:var(--tx2);cursor:pointer;display:inline-flex;align-items:center;gap:4px;">'
+         '<input type="checkbox" id="pcaBiplot" onchange="drawPCALoad()"> biplot arrows</label>',
+         'biplot', before=True)
+    # Volcano : export iPath3 du contraste affiché
+    _ins('<button class="exp-btn" onclick="exportVolcAll()">📋 All proteins</button>',
+         '\n    <button class="exp-btn" id="btnIPath" onclick="exportIPath()" title="DEP of the contrast shown, '
+         'one line per protein: identifier #colour W width (red = up, blue = down, darker and wider = larger '
+         '|log2FC|). Identifier = reference ortholog when Deimos mapped one, else the first accession. Paste '
+         'into iPath3 (pathways.embl.de) to colour the global metabolic map.">🗺 iPath3 map</button>',
+         'iPath3')
+    # Page FC vs FC : lien après Volcano, page avant la heatmap
+    _ins('<a onclick="showPage(\'volcano\')">Volcano</a>',
+         '\n  <a onclick="showPage(\'fcpage\')">FC vs FC</a>', 'FC vs FC link')
+    _ins('<div id="heatmap" class="page">', FIG2611_FC_HTML, 'FC vs FC page', before=True)
+    # Données + script, après ceux de la page GSEA
+    payload = {'RAIN_DATA': data.get('raincloud'), 'MVP_DATA': data.get('mv_patterns'),
+               'IPATH_IDS': data.get('ipath_ids')}
+    inner = ''.join('const %s=%s;\n' % (k, json.dumps(v, ensure_ascii=False, separators=(',', ':')))
+                    for k, v in payload.items()).replace('</', '<\\/')
+    block = '<script>\n' + inner + '</script>\n' + FIG2611_JS
+    marker = '<!--PROTEOGEN_BODY_END-->'
+    html = html.replace(marker, block + marker, 1) if marker in html else html.replace('</body>', block + '</body>', 1)
+    print("  patch_figures_2026_11 : " + ', '.join(done)
+          + (" ; [warn] ancre introuvable : " + ', '.join(miss) if miss else '') + '.')
     return html
 
 
@@ -7423,6 +8225,10 @@ def main():
     data['ranked']  = build_ranked_abundance(df_comp, sample_cols)
     data['cv_plot'] = build_cv_plot(df_comp, sample_cols, cond_map_inv)
     data['qc_report'] = build_qc_report(stats, df_comp, sample_cols, cond_map_inv)
+    # Figures exploratoires (09/11/2026) : raincloud, motifs de manquants, ids iPath3
+    data['raincloud'] = build_raincloud(df_comp, imp, sample_cols, cond_map_inv)
+    data['mv_patterns'] = build_missing_patterns(stats, sample_cols, cond_map_inv)
+    data['ipath_ids'] = build_ipath_ids(stats, df_comp)
     data['about']   = build_about(stats, go, wgcna, umap,
                           contrasts, sample_cols, conditions,
                           len(df_comp), P_THRESH, LFC_THRESH, df_comp,
@@ -7471,6 +8277,9 @@ def main():
     html = patch_audit_2026_11(html)
     # 3k. Page GSEA (07/11/2026) : NES, table, leading edge, vue inter-contrastes, exports
     html = patch_gsea_page(html)
+    # 3l. Figures exploratoires (09/11/2026) : raincloud, motifs de manquants, ridge plot
+    #     GSEA, flèches de biplot, page FC vs FC, export iPath3 — en dernier
+    html = patch_figures_2026_11(html, data)
 
     # 4. Vérifications avant livraison (checklist du skill)
     assert 'const PROTEOME_DATA=' in html

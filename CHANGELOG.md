@@ -102,6 +102,30 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **Dashboard: six exploratory figures** (2026-11-09, from the audit of exploratory figures;
+  nothing removed, `rebuild_dashboard.py` adds them to a finished run):
+  - *QC / PCA* — **raincloud** of the tests matrix (`Log2_Impute`) per sample or per condition:
+    density of observed values, shape of the imputed ones (values missing in `raw_data`),
+    5–95 % box, rain of points drawn jointly (the imputed share among points is the real one),
+    imputed % per row. Shows where the imputation placed the values (left-censored or not).
+  - *QC / PCA* — **missing-value patterns (UpSet)** on `raw_data` before filtering: which
+    samples are missing together, top 24 patterns, missing values per sample, class of each
+    pattern (whole condition(s) absent = candidates for biological absence, one sample,
+    several samples of one condition, spread across conditions); click a bar to list its
+    proteins, xlsx export. Above 30 samples, patterns are drawn per condition (a condition is
+    missing when all its samples are), classes still counted per sample.
+  - *QC / PCA* — **biplot arrows** (checkbox) on the Deimos score plot: driving proteins,
+    loadings rescaled to the scores.
+  - *GSEA* — **ridge plot of the leading edges**: density of the log2FC of each pathway's
+    leading-edge proteins, ticks = proteins (dark = DEP), reference ridge of all proteins;
+    same pathways and filters as the NES chart, follows `⇄ Inverser`, click = leading edge.
+  - New **FC vs FC** page: log2FC of one contrast against another (each axis invertible), status
+    under the run rule in each contrast, quadrant counts, sign concordance (share of the DEP of
+    one contrast moving the same way in the other), Pearson r, major-axis slope on the shared
+    DEP (from 5), xlsx export.
+  - *Volcano* — **iPath3 export** of the DEP of the contrast shown (`ID #colour W width`, red =
+    up, blue = down, darker and wider = larger |log2FC|), identifier = reference ortholog
+    (`Orthologues_Perseverance`) when mapped, else the first accession; follows `⇄ Inverser`.
 - **One HTML report: make_insight absorbed by Pathfinder >= 1.3.0** (2026-11-09). When the
   Pathfinder found carries the biological reading, `make_insight` (YAML, `--insight` or the
   interactive answer) runs Pathfinder instead of InSight: no second `insight_report.html`,

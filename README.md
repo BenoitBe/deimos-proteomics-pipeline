@@ -151,6 +151,10 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
   DPC abundances with standard errors and observed flags, DPC condition means, sample table and
   a README on normalisation (DIA-NN only) and multi-omics integration
 - Multi-sheet Excel export + interactive HTML dashboard, with a **light/dark theme toggle**
+  - exploratory figures: raincloud of observed / imputed values, missing-value patterns
+    (UpSet, class of each pattern), biplot arrows on the PCA, ridge plot of the GSEA leading
+    edges, an **FC vs FC** page (two contrasts face to face: shared / specific / opposite DEP,
+    sign concordance, slope) and an **iPath3** export of the DEP of a contrast
 - **Pathfinder synthesis** as an optional last step (`make_pathfinder: true` / `--pathfinder`):
   core protein signature across contrasts, Meta-GO, WGCNA cross-reading, PCA × design factors.
   Pathfinder runs in a separate process on the saved workbook (no recomputation, no question);
