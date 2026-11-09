@@ -94,6 +94,7 @@ try:
 except ImportError:
     _DPC_AVAILABLE = False
 
+from pathfinder_bridge import pathfinder_has_reading
 from pathfinder_bridge import (write_manifest, run_pathfinder_step,
                                locate_pathfinder, pathfinder_version,
                                pathfinder_selection_text)
@@ -3914,7 +3915,13 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
         put_kv("Downstream synthesis", f"Pathfinder {pathfinder_version(_pf_dir)}",
                "Reads this workbook after it is saved, no recomputation; outputs in "
                "pathfinder/ (report, synthesis workbook, summary, log). "
-               + pathfinder_selection_text(params, _pf_dir))
+               + pathfinder_selection_text(params, _pf_dir)
+               + (" The report includes the biological reading (ex-InSight): response "
+                  "programmes with their stability under replicate resampling, functional "
+                  "groups (Meta-GO, or GSEA leading edges when the ORA is empty), annotated "
+                  "volcanos, condition map, spotlight proteins and, for factorial designs, "
+                  "the variance share per design factor."
+                  if pathfinder_has_reading(_pf_dir) else ""))
     _ins_dir = locate_insight(params) if params.get("make_insight") else None
     if _ins_dir:
         if not _pf_dir:
@@ -4827,6 +4834,13 @@ def main():
         dash_available    = _DASHBOARD_AVAILABLE,
         pr_path           = _pr_path_default,
     )
+    # InSight fusionné dans Pathfinder >= 1.3.0 : un seul rapport HTML (make_insight
+    # devient make_pathfinder quand ce Pathfinder est trouvé ; sinon InSight à part)
+    try:
+        from pathfinder_bridge import resolve_reading
+        resolve_reading(params)
+    except Exception as e:                                          # noqa: BLE001
+        print(f"  [WARN] InSight / Pathfinder resolution skipped ({type(e).__name__}: {e})")
 
     # --- Variables locales reconstituées (compatibilité avec le reste de main()) ---
     tsv_path    = params["tsv_path"]
@@ -5956,7 +5970,7 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                                       len(df_results), params)
 
     # --- 14. Enrichissement GO/gProfiler (optionnel, non bloquant) ---
-    go_sheet_map = {}
+    go_sheet_map, gsea_sheet_map = {}, {}
     if local_go_params is not None:
         print("\n[STEP] GO enrichment...")
         go_results = run_go_enrichment(
@@ -5990,7 +6004,7 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                     df_results, contrast_names, params, go_params, out_dir,
                     orthologs=_gsea_orth)
                 if gsea_results:
-                    export_gsea_sheets(wb, gsea_results, _ins_img)
+                    gsea_sheet_map = export_gsea_sheets(wb, gsea_results, _ins_img) or {}
                     print(f"  [OK] {len(gsea_results)} GSEA sheet(s) added.")
             except Exception as e:
                 print(f"  [WARN] GSEA step skipped ({type(e).__name__}) — "
@@ -6006,7 +6020,8 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                 if params["_primary"]["statistic"] == "dpc" else
                 "DEqMS" if any(str(c).endswith("_p.adj_limma") for c in df_results.columns)
                 else "limma eBayes"),
-            extra_rows=_sensitivity_manifest_rows(sensitivity, sensitivity_sheets))
+            extra_rows=_sensitivity_manifest_rows(sensitivity, sensitivity_sheets)
+            + [("gsea_sheet", sh, c) for sh, c in gsea_sheet_map.items()])
     except Exception as e:      # jamais bloquant pour le livrable
         print(f"  [WARN] _manifest sheet not written ({type(e).__name__}: {e})")
 
@@ -6036,7 +6051,9 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                                       go_ran=bool(go_sheet_map),
                                       perseverance=_persev_go)
         if pf_html:
-            print(f"  [OK] Pathfinder report: {pf_html}")
+            print(f"  [OK] Pathfinder report: {pf_html}"
+                  + (" (with the biological reading, ex-InSight)"
+                     if params.get("_reading_in_pathfinder") else ""))
 
     # --- 15ter. InSight (optionnel, processus séparé, non bloquant) ---
     # Lecture biologique (figures + page récit) du classeur et de matrices/ tels

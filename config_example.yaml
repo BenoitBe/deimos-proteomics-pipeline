@@ -253,7 +253,13 @@ make_pathfinder:         false   # true = run Pathfinder after the Excel and the
 pathfinder_path:         null    # Pathfinder clone; null = $PATHFINDER_HOME, then ../Pathfinder
 pathfinder_publications: false   # true = Publications axis (STRING PMID, needs network)
 pathfinder_options:      {}      # e.g. {jaccard: 0.5, no_umap: true}; proteins follow the volcano
-                                 # rule above by default (pthr / min_ratio override it)
+                                 # rule above by default (pthr / min_ratio override it).
+                                 # Pathfinder >= 1.3 (biological reading, ex-InSight): k,
+                                 # volcanos: [A_vs_B], max_volcanos, categorical, order_regex,
+                                 # reference_fasta, groups_from: auto|ora|gsea, prog_boot: 50,
+                                 # no_reading: true, factor_regex (factorial designs, e.g.
+                                 # '(?P<genotype>[^_]+)_T(?P<time>\d+)(?:_(?P<light>Light|Dark))?');
+                                 # unset keys fall back to insight_options
 pathfinder_timeout:      1800    # seconds
 
 # InSight — biological-reading figures + narrative report at the very end (also: --insight)

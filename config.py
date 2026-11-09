@@ -103,7 +103,7 @@ _DEFAULTS = {
     "make_pathfinder":     False,   # True = lancer Pathfinder après l'Excel et le dashboard
     "pathfinder_path":     None,    # clone Pathfinder ; None = $PATHFINDER_HOME puis ../Pathfinder
     "pathfinder_publications": False,  # True = axe Publications (STRING PMID, réseau)
-    "pathfinder_options":  {},      # ex: {pthr: 0.05, jaccard: 0.5, no_umap: true}
+    "pathfinder_options":  {},      # ex: {pthr: 0.05, jaccard: 0.5, no_umap: true, k: 6, groups_from: auto}
     "pathfinder_timeout":  1800,    # secondes
     # InSight (lecture biologique : figures + page récit, après Pathfinder, processus séparé)
     "make_insight":        False,   # True = lancer InSight en toute fin de run
@@ -640,9 +640,21 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
                         f"  ({_pf}) (y/N) -> ").strip().lower()
             params["make_pathfinder"] = rep in ("o", "oui", "y", "yes")
 
-    # InSight — question posée seulement si un clone est trouvé
+    # InSight — question posée seulement si un clone est trouvé, et pas si le Pathfinder
+    # retenu porte déjà la lecture biologique (InSight fusionné dans Pathfinder >= 1.3.0)
+    _pf_reading = False
+    if params.get("make_pathfinder"):
+        try:
+            from pathfinder_bridge import locate_pathfinder as _lp, pathfinder_has_reading
+            _pfd = _lp(params)
+            _pf_reading = bool(_pfd and pathfinder_has_reading(_pfd))
+        except Exception:                                           # noqa: BLE001
+            _pf_reading = False
     if getattr(args, "insight", False):
         params["make_insight"] = True
+    elif _pf_reading:
+        params["make_insight"] = False
+        print("  (biological reading included in the Pathfinder report)")
     else:
         from insight_bridge import locate_insight
         params["make_insight"] = False

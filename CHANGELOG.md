@@ -102,6 +102,35 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **One HTML report: make_insight absorbed by Pathfinder >= 1.3.0** (2026-11-09). When the
+  Pathfinder found carries the biological reading, `make_insight` (YAML, `--insight` or the
+  interactive answer) runs Pathfinder instead of InSight: no second `insight_report.html`,
+  the reading is the *Biological reading* tab of `pathfinder_report.html`, `insight_options`
+  are passed to it, the interactive InSight question is no longer asked once Pathfinder is
+  chosen, and the Methods sheet describes the reading under Pathfinder. Without such a
+  Pathfinder, InSight runs separately as before.
+- **Pathfinder >= 1.3.0 options** (2026-11-07): the biological reading merged into Pathfinder
+  takes `pathfinder_options` keys `k`, `volcanos`, `max_volcanos`, `categorical`, `order_regex`,
+  `reference_fasta`, `groups_from` (auto / ora / gsea), `prog_boot`, `no_reading` and
+  `factor_regex` (named groups reading the factors of a factorial design, checked at start); unset keys
+  fall back to `insight_options`. They are passed only to a Pathfinder that knows them
+  (`--no-reading` present), so an older clone keeps running. `make_insight` is unchanged; when
+  Pathfinder already carries the reading, the log says so.
+- **GSEA page in the dashboard** (2026-11-07). New `GSEA` tab after `GO`, fed by the `GSEA_*`
+  sheets of the workbook: per-contrast NES bar chart (top pathways up and down), filterable
+  table (source, FDR, direction, text/gene search), leading edge of a clicked pathway listed
+  as **proteins** with their log2FC, p.adj and DEP status under the run's rule, and a
+  cross-contrast NES matrix of the most significant pathways. The `⇄ Inverser` button flips
+  the NES sign everywhere, exports included; xlsx exports of the shown pathways, of all
+  contrasts and of a leading edge. A contrast without pathway shows only a message; a run
+  without GSEA shows how to enable it. FDR / p of 0 (no more extreme permutation) read
+  `< 1/n permutations`. `rebuild_dashboard.py` adds the page to finished runs.
+  - `GSEA_*` sheets gain a `Lead_proteins` column (leading-edge genes mapped back to the
+    accessions that carry them, through the same key as the ranking: g:Convert / orthologues
+    or the Genes column). Sheet names are unique after the 31-character truncation (`~2`).
+  - `_manifest` schema 1.3: section `gsea_sheet` (sheet → contrast), read by the dashboard
+    first; workbooks without it are matched by the sheet name.
+
 - **GSEA on *A. thaliana* and any g:Profiler species** (`gsea_organism: athaliana`, or
   `gprofiler:<code>` such as `gprofiler:hvulgare`): gene sets from the species' g:Profiler GMT
   (same source as the ORA), downloaded once and cached 30 days (`~/.deimos_cache/gsea`,

@@ -142,7 +142,10 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     *B. napus* ranked on its *A. thaliana* orthologues (homeologues sharing an orthologue keep
     the strongest score). Local `.gmt` files (MapMan/Mercator, TAIR…) with AGI codes, gene
     names or UniProt accessions work the same way. Each `GSEA_*` sheet states the gene-set
-    source and date and the ID mapping in cell A1
+    source and date and the ID mapping in cell A1, and lists the leading edge as genes and
+    as proteins (`Lead_proteins`)
+  - dashboard **GSEA** tab: NES per contrast, filterable table, leading-edge proteins with
+    their log2FC / DEP status, cross-contrast NES matrix, xlsx exports, `⇄ Inverser`
 - **Protein × sample matrices for other analyses** (`export_matrices: true`, default), folder
   `matrices/`: log2 with missing values kept (MOFA+ / MEFISTO), log2 imputed (Mfuzz, WGCNA),
   DPC abundances with standard errors and observed flags, DPC condition means, sample table and
@@ -260,6 +263,15 @@ STRING). `pathfinder_options: {pthr, min_ratio}` overrides the Pathfinder protei
 Methods sheet and its summary then say the counts differ). Pathfinder < 1.2 used `p.adj < 0.05`
 without a fold-change criterion; the Methods sheet states whichever rule the installed version
 applies.
+
+**Pathfinder ≥ 1.3.0 includes InSight**: its report gains a *Biological reading* tab (response
+programmes with their stability under replicate resampling, functional groups = the Meta-GO
+groups — or the GSEA leading edges when the ORA is empty —, annotated volcanos, condition map,
+spotlight proteins, variance share per design factor for factorial designs), as interactive SVG.
+The reading options go in `pathfinder_options` (`k`, `volcanos`, `max_volcanos`, `categorical`,
+`order_regex`, `reference_fasta`, `groups_from`, `prog_boot`, `no_reading`, `factor_regex`); keys left unset are
+taken from `insight_options`. **One HTML report**: with such a Pathfinder found, `make_insight` runs
+Pathfinder instead of the separate InSight (no `insight_report.html`); without it, InSight runs as before.
 
 **Unattended runs** (scheduler, cluster, no terminal): some options still ask a question at
 runtime when left unset, and the run stops with `EOFError` if nobody can answer —

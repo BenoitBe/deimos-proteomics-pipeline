@@ -23,9 +23,10 @@ import time
 
 MANIFEST_SHEET = "_manifest"
 SCHEMA_NAME = "deimos-results"
-SCHEMA_VERSION = "1.2"   # majeure +1 si un onglet/une colonne lu en aval est renommé ;
+SCHEMA_VERSION = "1.3"   # majeure +1 si un onglet/une colonne lu en aval est renommé ;
                          # mineure +1 pour un ajout (1.1 : section 'sensitivity' ;
-                         # 1.2 : règle volcano structurée, volcano_p_column/_thresh/_ratio_min)
+                         # 1.2 : règle volcano structurée, volcano_p_column/_thresh/_ratio_min;
+                         # 1.3 : section gsea_sheet (onglet GSEA_* -> contraste), ajout)
 
 STATS_SHEET = "Differential_Expression"
 MATRIX_SHEET = "Log2_Impute"
@@ -34,7 +35,14 @@ MATRIX_SHEET = "Log2_Impute"
 _NOT_FACTORS = {"label", "condition", "replicate", "rep", "replicat"}
 
 # Options Pathfinder transmissibles via le YAML (pathfinder_options)
-_PF_OPTIONS = {"pthr", "min_ratio", "jaccard", "no_umap"}
+_PF_OPTIONS = {"pthr", "min_ratio", "jaccard", "no_umap",
+               # lecture biologique (ex-InSight, Pathfinder >= 1.3.0)
+               "no_reading", "k", "volcanos", "max_volcanos", "categorical", "order_regex",
+               "reference_fasta", "groups_from", "prog_boot", "factor_regex"}
+# Options d'InSight reprises par la lecture biologique de Pathfinder >= 1.3.0, quand
+# pathfinder_options ne les donne pas (make_insight absorbé par make_pathfinder)
+_READING_FROM_INSIGHT = ("k", "volcanos", "max_volcanos", "categorical", "order_regex",
+                         "reference_fasta")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -216,8 +224,72 @@ def _tail(path, n=5):
         return []
 
 
+def pathfinder_has_reading(pf_dir):
+    """True si ce Pathfinder porte la lecture biologique (>= 1.3.0, option --no-reading)."""
+    try:
+        with open(os.path.join(pf_dir, "pathfinder.py"), encoding="utf-8") as f:
+            return "--no-reading" in f.read()
+    except OSError:
+        return False
+
+
+def resolve_reading(params, verbose=True):
+    """make_insight absorbé par make_pathfinder : un seul rapport HTML.
+
+    Si un Pathfinder >= 1.3.0 (lecture biologique intégrée) est trouvé, demander InSight
+    revient à demander Pathfinder : make_pathfinder passe à True, make_insight à False
+    (pas de second rapport insight_report.html) et les insight_options sont reprises par
+    Pathfinder (reading_argv). Sans ce Pathfinder, InSight reste lancé à part, comme avant.
+    Retourne 'pathfinder', 'insight' ou None (lecture non demandée)."""
+    if not params.get("make_insight"):
+        return None
+    pf = locate_pathfinder(params)
+    if pf and pathfinder_has_reading(pf):
+        was_pf = bool(params.get("make_pathfinder"))
+        params["make_pathfinder"] = True
+        params["make_insight"] = False
+        params["_reading_in_pathfinder"] = True
+        if verbose:
+            print("  [INFO] InSight is merged into Pathfinder >= 1.3.0: the biological reading is "
+                  "the 'Biological reading' tab of pathfinder_report.html (no separate "
+                  "insight_report.html)"
+                  + ("." if was_pf else "; Pathfinder is run for it."))
+        return "pathfinder"
+    return "insight"
+
+
+def reading_argv(params):
+    """Options de la lecture biologique : pathfinder_options, puis insight_options."""
+    opts = dict(params.get("pathfinder_options") or {})
+    for k, v in (params.get("insight_options") or {}).items():
+        if k in _READING_FROM_INSIGHT and k not in opts:
+            opts[k] = v
+    argv = []
+    if opts.get("no_reading"):
+        return ["--no-reading"]
+    if opts.get("k"):
+        argv += ["--k", str(int(opts["k"]))]
+    for c in opts.get("volcanos") or []:
+        argv += ["--volcano", str(c)]
+    if opts.get("max_volcanos") is not None:
+        argv += ["--max-volcanos", str(int(opts["max_volcanos"]))]
+    if opts.get("categorical"):
+        argv.append("--categorical")
+    if opts.get("order_regex"):
+        argv += ["--order-regex", str(opts["order_regex"])]
+    if opts.get("reference_fasta"):
+        argv += ["--reference-fasta", os.path.abspath(str(opts["reference_fasta"]))]
+    if opts.get("groups_from"):
+        argv += ["--groups-from", str(opts["groups_from"])]
+    if opts.get("prog_boot") is not None:
+        argv += ["--prog-boot", str(int(opts["prog_boot"]))]
+    if opts.get("factor_regex"):
+        argv += ["--factor-regex", str(opts["factor_regex"])]
+    return argv
+
+
 def build_pathfinder_argv(pf_dir, xlsx_path, design_csv, pf_out, params, *,
-                          go_ran=True, perseverance=False):
+                          go_ran=True, perseverance=False, reading=None):
     argv = [sys.executable, os.path.join(pf_dir, "pathfinder.py"),
             "--stats", os.path.abspath(xlsx_path),
             # jamais d'auto-détection : un classeur GO d'un autre projet pourrait être pris
@@ -238,6 +310,9 @@ def build_pathfinder_argv(pf_dir, xlsx_path, design_csv, pf_out, params, *,
         argv += ["--jaccard", str(float(opts["jaccard"]))]
     if opts.get("no_umap"):
         argv.append("--no-umap")
+    # lecture biologique : seulement si ce Pathfinder la connaît (un 1.2 refuserait l'option)
+    if pathfinder_has_reading(pf_dir) if reading is None else reading:
+        argv += reading_argv(params)
     return argv
 
 
@@ -321,6 +396,24 @@ def validate_pathfinder_params(params):
             except (TypeError, ValueError):
                 errors.append("  pathfinder_options.min_ratio doit être >= 1 (1 = sans critère "
                               "de fold-change)")
+        if "groups_from" in opts and opts["groups_from"] not in ("auto", "ora", "gsea"):
+            errors.append("  pathfinder_options.groups_from : auto, ora ou gsea")
+        for k, lo in (("k", 2), ("max_volcanos", 0), ("prog_boot", 0)):
+            if k in opts:
+                try:
+                    if int(opts[k]) < lo or float(opts[k]) != int(opts[k]):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(f"  pathfinder_options.{k} doit être un entier >= {lo}")
+        if opts.get("factor_regex"):
+            try:
+                if not re.compile(str(opts["factor_regex"])).groupindex:
+                    errors.append("  pathfinder_options.factor_regex : groupes nommés requis, "
+                                  "ex: '(?P<genotype>[^_]+)_T(?P<time>\\d+)'")
+            except re.error as e:
+                errors.append(f"  pathfinder_options.factor_regex invalide ({e})")
+        if "volcanos" in opts and not isinstance(opts["volcanos"], (list, tuple)):
+            errors.append("  pathfinder_options.volcanos : liste de contrastes, ex: [A_vs_B]")
         for k in ("pthr", "jaccard"):
             if k in opts:
                 try:

@@ -78,6 +78,7 @@ IMG_LABELS = ['lollipop', 'dotplot']  # ordre d'insertion dans les sheets GO
 
 # Audit du 06/11/2026 — données transmises par Deimos (dashboard_params.json / _manifest)
 _GO_MANIFEST = {}      # onglet GO_* -> contraste, d'après le _manifest (prioritaire sur le nom)
+_GSEA_MANIFEST = {}    # onglet GSEA_* -> contraste (_manifest, schéma 1.3)
 SAMPLE_LABELS = {}     # 'Condition_Replicate' -> libellé d'origine de l'échantillon
 N_ITER_ROB = 0         # Robustness_Score = compte 0..N_ITER_ROB (0 = robustesse non calculée)
 
@@ -88,8 +89,9 @@ def _sig4(x):
     return float('%.4g' % x)
 
 
-def read_manifest_go(path):
-    """{onglet GO_*: contraste} depuis l'onglet _manifest du classeur Deimos ({} sinon)."""
+def read_manifest_go(path, section='go_sheet'):
+    """{onglet: contraste} d'une section du _manifest de Deimos (go_sheet par défaut,
+    gsea_sheet pour les onglets GSEA_*) ; {} sinon."""
     try:
         m = pd.read_excel(path, sheet_name='_manifest', header=None)
     except Exception:
@@ -97,7 +99,7 @@ def read_manifest_go(path):
     out = {}
     for row in m.itertuples(index=False):
         vals = list(row)[:3]
-        if len(vals) == 3 and str(vals[0]).strip() == 'go_sheet' and pd.notna(vals[2]):
+        if len(vals) == 3 and str(vals[0]).strip() == section and pd.notna(vals[2]):
             out[str(vals[1]).strip()] = str(vals[2]).strip()
     return out
 
@@ -6382,6 +6384,7 @@ def inject(template_html, data):
         "const DEP_RULE="         + json.dumps(data.get('dep_rule', {}), ensure_ascii=False) + ";\n"
         "const SAMPLE_LABELS="    + json.dumps(SAMPLE_LABELS, ensure_ascii=False) + ";\n"
         "const SCATTER_R="        + json.dumps(data.get('scatter_r', {}), ensure_ascii=False) + ";\n"
+        "const GSEA_DATA="        + json.dumps(data.get('gsea', {}), ensure_ascii=False) + ";\n"
         # PROTEOME_DATA contient lp précalculé — VOLCANO et SCATTER_DATA sont des vues dérivées.
         # Les points dessinés sont SOUS-ÉCHANTILLONNÉS (max ~1500/contraste) pour
         # éviter de figer le navigateur au rendu de l'onglet QC/PCA.
@@ -6839,6 +6842,459 @@ def patch_audit_2026_11(html):
     return html
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GSEA (07/11/2026) — onglets GSEA_* de Deimos : NES, table, leading edge en protéines
+# ──────────────────────────────────────────────────────────────────────────────
+_GSEA_ID = re.compile(r'^((?:GO|KEGG|REAC|WP|HP|HPA|MIRNA|CORUM|TF):[^\s]+)\s+(.*)$')
+_GSEA_ID_TAIL = re.compile(r'^(.*?)\s*\(((?:GO|R-[A-Z]{3})[:\-][\w\-.]+)\)\s*$')
+
+
+def gsea_term_parts(term):
+    """'GO:BP__GO:0009414 response to water deprivation' -> (source, id, nom) ;
+    'GO_Biological_Process_2023__translation (GO:0006412)' -> (lib, GO:0006412, nom)."""
+    t = str(term)
+    src, rest = (t.split('__', 1) if '__' in t else ('', t))
+    m = _GSEA_ID.match(rest)
+    if m:
+        return src, m.group(1), m.group(2).strip()
+    m = _GSEA_ID_TAIL.match(rest)
+    if m:
+        return src, m.group(2), m.group(1).strip()
+    return src, '', rest.strip()
+
+
+def map_gsea_sheet(sheet, contrasts):
+    """Onglet GSEA_* -> contraste : _manifest (section gsea_sheet), sinon le nom que
+    construit export_gsea_sheets (GSEA_ + contraste, '_vs_' -> 'v', sans '_')."""
+    if _GSEA_MANIFEST.get(sheet) in contrasts:
+        return _GSEA_MANIFEST[sheet]
+    for c in contrasts:
+        if ('GSEA_' + c.replace('_vs_', 'v').replace('_', ''))[:31] == sheet:
+            return c
+    return None
+
+
+def read_gsea_table(path, sheet):
+    """(table, provenance) : la table de gseapy commence à la colonne 'Term' (le graphe
+    NES occupe la gauche de l'onglet), la provenance est en A1."""
+    raw = pd.read_excel(path, sheet_name=sheet, header=None)
+    if raw.empty:
+        return pd.DataFrame(), ''
+    head = [str(v).strip() if pd.notna(v) else '' for v in raw.iloc[0]]
+    prov = head[0] if head and head[0] and head[0] != 'Term' else ''
+    if 'Term' not in head:
+        return pd.DataFrame(), prov
+    j = head.index('Term')
+    cols = [h for h in head[j:] if h]
+    tab = raw.iloc[1:, j:j + len(cols)]
+    tab.columns = cols
+    return tab.dropna(subset=['Term']).reset_index(drop=True), prov
+
+
+def build_gsea(path, contrasts, df_comp):
+    """{contraste: {prov, fdr_max, terms: [...]}} pour la page GSEA (vide sans GSEA)."""
+    out = {}
+    if not path:
+        return out
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception:
+        return out
+    sheets = [s for s in xl.sheet_names if s.startswith('GSEA_')]
+    if not sheets:
+        return out
+    # repli pour les classeurs sans colonne Lead_proteins : symbole (Genes) -> accession
+    gene2prot = {}
+    if 'name' in df_comp.columns and 'Genes' in df_comp.columns:
+        for n, g in zip(df_comp['name'].astype(str), df_comp['Genes'].fillna('').astype(str)):
+            k = g.split(';')[0].strip().upper()
+            if k:
+                gene2prot.setdefault(k, []).append(n)
+
+    def _f(v, nd=None):
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        if x != x:
+            return None
+        return _sig4(x) if nd is None else round(x, nd)
+
+    for sh in sheets:
+        c = map_gsea_sheet(sh, contrasts)
+        if not c or c in out:
+            continue
+        try:
+            tab, prov = read_gsea_table(path, sh)
+        except Exception as e:                                        # noqa: BLE001
+            print(f"  [WARN] GSEA sheet {sh} unreadable ({type(e).__name__}) — skipped.")
+            continue
+        if tab.empty or 'NES' not in tab.columns:
+            continue
+        mq = re.search(r'FDR\s*<=\s*([0-9.]+)', prov)
+        mperm = re.search(r'(\d+)\s+permutations', prov)
+        terms = []
+        for _, r in tab.iterrows():
+            src, tid, name = gsea_term_parts(r['Term'])
+            lead = '' if pd.isna(r.get('Lead_genes')) else str(r.get('Lead_genes'))
+            if 'Lead_proteins' in tab.columns and pd.notna(r.get('Lead_proteins')):
+                lp = [x for x in str(r['Lead_proteins']).split(';') if x]
+            else:
+                lp = []
+                for g in lead.split(';'):
+                    lp += gene2prot.get(g.strip().upper(), [])
+                lp = list(dict.fromkeys(lp))
+            terms.append({'n': name, 'id': tid, 's': src or 'gene set',
+                          'nes': _f(r.get('NES'), 3), 'es': _f(r.get('ES'), 3),
+                          'p': _f(r.get('NOM p-val')), 'q': _f(r.get('FDR q-val')),
+                          'fwer': _f(r.get('FWER p-val')),
+                          'tag': safe_str(r.get('Tag %')), 'gene': safe_str(r.get('Gene %')),
+                          'lead': lead, 'lp': lp})
+        terms = [t for t in terms if t['nes'] is not None]
+        if terms:
+            out[c] = {'prov': prov, 'fdr_max': float(mq.group(1)) if mq else None,
+                      'n_perm': int(mperm.group(1)) if mperm else None,
+                      'sheet': sh, 'terms': terms}
+    if out:
+        n = sum(len(v['terms']) for v in out.values())
+        print(f"  GSEA : {n} voies sur {len(out)} contraste(s) "
+              f"({sum(1 for s in sheets if s in _GSEA_MANIFEST)} onglet(s) par le _manifest)")
+    return out
+
+
+GSEA_PAGE_HTML = """
+<!-- GSEA (07/11/2026) -->
+<div id="gseapage" class="page">
+  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;flex:1;" id="gseaBtns"></div>
+    <button id="btnGseaInvert" class="exp-btn" onclick="toggleGseaInvert()"
+      title="Inverser le signe du NES (A vs B → B vs A) — affichage et exports">⇄ Inverser</button>
+  </div>
+  <div id="gseaEmpty" class="wg-ph" style="display:none;"></div>
+  <div id="gseaBody">
+  <div class="panel">
+    <div class="ph">
+      <h2 id="gseaTitle">GSEA</h2>
+      <div class="exp-bar" style="margin:0;">
+        <span class="exp-lbl">Source</span><select id="gseaSrc" onchange="renderGSEA()"></select>
+        <span class="exp-lbl">FDR ≤</span><select id="gseaFdr" onchange="renderGSEA()">
+          <option value="1">all (run)</option><option value="0.1">0.1</option>
+          <option value="0.05">0.05</option><option value="0.01">0.01</option></select>
+        <span class="exp-lbl">Direction</span><select id="gseaDir" onchange="renderGSEA()">
+          <option value="A">all</option><option value="U">NES &gt; 0</option>
+          <option value="D">NES &lt; 0</option></select>
+        <span class="exp-lbl">Top</span><select id="gseaTop" onchange="renderGSEA()">
+          <option>10</option><option selected>15</option><option>20</option><option>30</option></select>
+        <button class="exp-btn" onclick="exportCanvas('gseaNesCanvas','proteogen_GSEA_NES_'+gseaFileName())" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
+      </div>
+    </div>
+    <div id="gseaProv" style="font-size:10.5px;color:var(--tx3);margin:-4px 0 8px;"></div>
+    <canvas id="gseaNesCanvas" style="display:block;width:100%;"></canvas>
+    <div id="gseaNesMsg" style="display:none;color:var(--tx2);font-size:12px;padding:18px 4px;"></div>
+  </div>
+  <div class="panel">
+    <div class="ph">
+      <h2>Pathways <span id="gseaCount" style="color:var(--tx3);font-weight:400;"></span></h2>
+      <div class="exp-bar" style="margin:0;">
+        <input id="gseaSearch" placeholder="search term / gene…" oninput="renderGSEA()"
+          style="background:var(--bg3);border:1px solid var(--bd2);color:var(--tx);border-radius:6px;padding:4px 8px;font-size:11px;width:180px;">
+        <button class="exp-btn grn" onclick="exportGseaFiltered()">⬇ Shown (xlsx)</button>
+        <button class="exp-btn" onclick="exportGseaAll()">⬇ All contrasts (xlsx)</button>
+      </div>
+    </div>
+    <div style="max-height:430px;overflow:auto;"><table class="itbl" id="gseaTable"></table></div>
+    <div style="font-size:10.5px;color:var(--tx3);margin-top:6px;">Click a pathway to list its leading-edge proteins below.</div>
+  </div>
+  <div class="panel" id="gseaLeadPanel">
+    <div class="ph"><h2 id="gseaLeadTitle">Leading edge</h2>
+      <button class="exp-btn" onclick="exportGseaLead()" style="padding:3px 9px;font-size:10px;">⬇ xlsx</button></div>
+    <div id="gseaLead" style="max-height:360px;overflow:auto;"></div>
+  </div>
+  <div class="panel">
+    <div class="ph"><h2>Across contrasts — NES of the most significant pathways</h2></div>
+    <div id="gseaMatrix" style="overflow:auto;"></div>
+  </div>
+  </div>
+</div>
+"""
+
+GSEA_JS = r"""<script>
+/* ── Page GSEA (07/11/2026) : voies de la GSEA pré-classée de Deimos (onglets GSEA_*),
+   NES, table filtrable, leading edge en protéines (log2FC, p.adj, statut DEP selon la
+   règle du run), vue inter-contrastes. « Inverser » change le signe du NES partout,
+   exports compris. Un contraste sans voie n'affiche rien d'autre qu'un message. */
+(function(){
+  var G = (typeof GSEA_DATA !== 'undefined' && GSEA_DATA) || {};
+  var st = {c: null, inv: false, sel: null, built: false};
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(ch){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]; }); }
+  function cv(n, d){ try{ var v = getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return v || d; }catch(e){ return d; } }
+  function lab(c){ var p = c.split('_vs_'); return (st.inv && p.length === 2 ? p[1] + ' vs ' + p[0] : c.replace(/_vs_/g, ' vs ')).replace(/_/g, ' '); }
+  function nes(t){ return st.inv ? -t.nes : t.nes; }
+  // p / FDR de gseapy : 0 = aucune permutation plus extrême -> « < 1/n permutations »
+  function fe(v){
+    if(v == null) return '—';
+    if(v === 0){ var n = (G[st.c] || {}).n_perm; return n ? '< ' + (1 / n).toPrecision(2) : '0'; }
+    return v < 1e-3 ? v.toExponential(2) : (+v).toPrecision(3); }
+  window.gseaFileName = function(){ var c = st.c || '', p = c.split('_vs_');
+    return (st.inv && p.length === 2 ? p[1] + '_vs_' + p[0] : c).slice(0, 40); };
+  function filt(c){
+    var d = G[c]; if(!d) return [];
+    var src = (document.getElementById('gseaSrc') || {}).value || '*';
+    var fdr = parseFloat((document.getElementById('gseaFdr') || {}).value || '1');
+    var dir = (document.getElementById('gseaDir') || {}).value || 'A';
+    var q = ((document.getElementById('gseaSearch') || {}).value || '').toLowerCase().trim();
+    return d.terms.filter(function(t){
+      if(src !== '*' && t.s !== src) return false;
+      if(t.q != null && t.q > fdr) return false;
+      var v = nes(t); if(dir === 'U' && !(v > 0)) return false; if(dir === 'D' && !(v < 0)) return false;
+      if(q && (t.n + ' ' + t.id + ' ' + t.lead).toLowerCase().indexOf(q) < 0) return false;
+      return true;
+    }).sort(function(a, b){ return nes(b) - nes(a); });
+  }
+  function buildButtons(){
+    var wrap = document.getElementById('gseaBtns'); wrap.innerHTML = '';
+    CONTRASTS.forEach(function(c){
+      var b = document.createElement('button');
+      b.className = 'cbtn' + (c === st.c ? ' active' : '');
+      var n = G[c] ? G[c].terms.length : 0;
+      b.textContent = lab(c) + ' (' + n + ')';
+      if(!n) b.style.opacity = '.55';
+      b.onclick = function(){ st.c = c; st.sel = null; buildButtons(); renderGSEA(); };
+      wrap.appendChild(b);
+    });
+  }
+  function fillSources(){
+    var sel = document.getElementById('gseaSrc'), cur = sel.value || '*', srcs = {};
+    Object.keys(G).forEach(function(c){ G[c].terms.forEach(function(t){ srcs[t.s] = 1; }); });
+    sel.innerHTML = '<option value="*">all</option>' + Object.keys(srcs).sort().map(function(s){
+      return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
+    sel.value = srcs[cur] || cur === '*' ? cur : '*';
+  }
+  window.initGSEA = function(){
+    var empty = document.getElementById('gseaEmpty'), body = document.getElementById('gseaBody');
+    if(!Object.keys(G).length){
+      empty.style.display = 'block'; body.style.display = 'none';
+      document.getElementById('btnGseaInvert').style.display = 'none';
+      empty.innerHTML = 'No GSEA in this run.<br><span style="font-size:11px;">Enable it with '
+        + '<code>run_gsea: true</code> (go_params) — gene sets for human, mouse, A. thaliana or any '
+        + 'g:Profiler organism (<code>gsea_organism</code>). Pathways are kept at FDR ≤ gsea_fdr.</span>';
+      return;
+    }
+    if(!st.built){
+      st.c = CONTRASTS.filter(function(c){ return G[c]; })[0] || CONTRASTS[0];
+      fillSources(); st.built = true;
+    }
+    buildButtons(); renderGSEA();
+  };
+  window.toggleGseaInvert = function(){
+    st.inv = !st.inv;
+    var b = document.getElementById('btnGseaInvert');
+    b.style.background = st.inv ? 'var(--ac)' : ''; b.style.color = st.inv ? '#fff' : '';
+    buildButtons(); renderGSEA();
+  };
+  function drawNes(rows){
+    var cvs = document.getElementById('gseaNesCanvas'), msg = document.getElementById('gseaNesMsg');
+    var top = parseInt(document.getElementById('gseaTop').value) || 15;
+    var up = rows.filter(function(t){ return nes(t) > 0; }).slice(0, top);
+    var dn = rows.filter(function(t){ return nes(t) < 0; }).slice(-top);
+    var show = up.concat(dn);
+    if(!show.length){ cvs.style.display = 'none'; msg.style.display = 'block';
+      msg.textContent = G[st.c] ? 'No pathway passes the current filters.'
+        : 'No GSEA pathway for ' + lab(st.c) + ' (FDR ≤ ' + (anyFdr() || 'gsea_fdr') + ').';
+      return; }
+    cvs.style.display = 'block'; msg.style.display = 'none';
+    var dpr = window.devicePixelRatio || 1, ROW = 21, PT = 26, PB = 34;
+    var W = cvs.parentElement.clientWidth - 30 || 900, H = PT + show.length * ROW + PB;
+    cvs.width = W * dpr; cvs.height = H * dpr; cvs.style.height = H + 'px';
+    var ctx = cvs.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var bg = cv('--bg2', '#161b22'), bg3 = cv('--bg3', '#21262d'), tx = cv('--tx', '#e6edf3'),
+        tx3 = cv('--tx3', '#6e7681'), bd = cv('--bd2', '#30363d');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    var LW = Math.min(420, W * 0.42), x0 = LW + 10, x1 = W - 70;
+    var m = Math.max.apply(null, show.map(function(t){ return Math.abs(nes(t)); }).concat([1]));
+    var xc = x0 + (x1 - x0) / 2, sc = (x1 - x0) / 2 / m;
+    ctx.strokeStyle = bd; ctx.lineWidth = 1;
+    [-m, -m / 2, 0, m / 2, m].forEach(function(v){
+      var x = xc + v * sc; ctx.beginPath(); ctx.moveTo(x, PT - 6); ctx.lineTo(x, H - PB + 4); ctx.stroke();
+      ctx.fillStyle = tx3; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(v.toFixed(1), x, H - PB + 16); });
+    ctx.fillStyle = tx3; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('NES (normalised enrichment score)  ·  ← enriched among proteins down   ·   up →', xc, H - 6);
+    ctx.textAlign = 'left'; ctx.fillText('FDR', x1 + 8, PT - 10);
+    show.forEach(function(t, i){
+      var y = PT + i * ROW, v = nes(t);
+      if(i % 2){ ctx.fillStyle = bg3; ctx.globalAlpha = .45; ctx.fillRect(0, y, W, ROW); ctx.globalAlpha = 1; }
+      ctx.fillStyle = v > 0 ? 'rgba(248,81,73,.85)' : 'rgba(56,139,253,.85)';
+      var xa = Math.min(xc, xc + v * sc); ctx.fillRect(xa, y + 4, Math.abs(v * sc), ROW - 8);
+      var name = t.n.length > 62 ? t.n.slice(0, 61) + '…' : t.n;
+      ctx.fillStyle = tx; ctx.font = '11px sans-serif'; ctx.textAlign = 'right';
+      ctx.fillText(name, LW, y + ROW / 2 + 4);
+      ctx.fillStyle = tx3; ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText(fe(t.q), x1 + 8, y + ROW / 2 + 4);
+    });
+    if(up.length && dn.length){ var ys = PT + up.length * ROW; ctx.strokeStyle = tx3; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(0, ys); ctx.lineTo(W, ys); ctx.stroke(); ctx.setLineDash([]); }
+  }
+  function anyFdr(){ for(var c in G){ if(G[c].fdr_max != null) return G[c].fdr_max; } return null; }
+  function table(rows){
+    var tb = document.getElementById('gseaTable');
+    document.getElementById('gseaCount').textContent = '· ' + rows.length + ' shown';
+    if(!rows.length){ tb.innerHTML = '<tr><td style="color:var(--tx2);padding:14px;">'
+      + (G[st.c] ? 'No pathway passes the current filters.' : 'No GSEA pathway for ' + esc(lab(st.c)) + '.')
+      + '</td></tr>'; return; }
+    var h = '<thead><tr><th>Pathway</th><th>Source</th><th>NES</th><th>FDR q</th><th>NOM p</th>'
+      + '<th>Tag %</th><th>Leading edge</th></tr></thead><tbody>';
+    rows.forEach(function(t){
+      var v = nes(t), sel = st.sel === t.id + '|' + t.n;
+      var lead = t.lead.split(';').filter(Boolean);
+      h += '<tr data-k="' + esc(t.id + '|' + t.n) + '" style="cursor:pointer;' + (sel ? 'outline:1px solid var(--ac);' : '') + '">'
+        + '<td title="' + esc(t.id) + '">' + esc(t.n) + (t.id ? ' <span style="color:var(--tx3)">' + esc(t.id) + '</span>' : '') + '</td>'
+        + '<td>' + esc(t.s) + '</td>'
+        + '<td style="color:' + (v > 0 ? '#f85149' : '#388bfd') + ';font-weight:600;">' + v.toFixed(2) + '</td>'
+        + '<td>' + fe(t.q) + '</td><td>' + fe(t.p) + '</td><td>' + esc(t.tag) + '</td>'
+        + '<td title="' + esc(lead.join(', ')) + '">' + lead.length + ' · ' + esc(lead.slice(0, 6).join(', ')) + (lead.length > 6 ? '…' : '') + '</td></tr>';
+    });
+    tb.innerHTML = h + '</tbody>';
+    tb.querySelectorAll('tbody tr[data-k]').forEach(function(tr){
+      tr.onclick = function(){ st.sel = tr.getAttribute('data-k'); table(rows); lead(); }; });
+  }
+  function selTerm(){
+    var d = G[st.c]; if(!d || !st.sel) return null;
+    return d.terms.filter(function(t){ return t.id + '|' + t.n === st.sel; })[0] || null;
+  }
+  function leadRows(t){
+    var R = window.DEIMOS_RULE || {lfc: 0, ptype: 'p', p: 0.05}, idx = {};
+    (typeof fullRows === 'function' ? fullRows(st.c) : []).forEach(function(p){ idx[p.name] = p; });
+    return t.lp.map(function(id){
+      var p = idx[id]; if(!p) return {'Protein': id, 'Gene': '', 'log2FC': '', 'p.val': '', 'p.adj': '', 'Status': 'not quantified'};
+      var d = st.inv ? -p.d : p.d, s = isSig(p, R.lfc, R.ptype, R.p);
+      return {'Protein': p.name, 'Gene': (typeof geneOf === 'function' ? geneOf(p) : p.g) || '',
+              'Description': p.desc || '', 'log2FC': +(+d).toFixed(3), 'p.val': p.p, 'p.adj': p.padj,
+              'Status': s ? (d > 0 ? 'Up' : 'Down') : 'NS'};
+    }).sort(function(a, b){ return Math.abs(b['log2FC'] || 0) - Math.abs(a['log2FC'] || 0); });
+  }
+  function lead(){
+    var box = document.getElementById('gseaLead'), t = selTerm(), ttl = document.getElementById('gseaLeadTitle');
+    if(!t){ ttl.textContent = 'Leading edge'; box.innerHTML = '<div style="color:var(--tx2);font-size:12px;padding:8px;">'
+      + (G[st.c] ? 'Select a pathway in the table.' : '') + '</div>'; return; }
+    var rows = leadRows(t), nsig = rows.filter(function(r){ return r.Status === 'Up' || r.Status === 'Down'; }).length;
+    ttl.textContent = 'Leading edge — ' + t.n + ' · ' + rows.length + ' proteins, ' + nsig + ' DEP (' + ((window.DEIMOS_RULE || {}).text || 'run rule') + ')';
+    if(!rows.length){ box.innerHTML = '<div style="color:var(--tx2);font-size:12px;padding:8px;">Leading-edge genes ('
+      + esc(t.lead.split(';').slice(0, 20).join(', ')) + ') could not be matched to proteins of the workbook.</div>'; return; }
+    var h = '<table class="itbl"><thead><tr><th>Protein</th><th>Gene</th><th>Description</th><th>log2FC</th><th>p.adj</th><th>Status</th></tr></thead><tbody>';
+    rows.forEach(function(r){
+      var col = r.Status === 'Up' ? '#f85149' : r.Status === 'Down' ? '#388bfd' : 'var(--tx3)';
+      h += '<tr><td>' + esc(r.Protein) + '</td><td>' + esc(r.Gene) + '</td><td>' + esc(String(r.Description || '').slice(0, 70))
+        + '</td><td>' + (r['log2FC'] === '' ? '—' : r['log2FC']) + '</td><td>' + fe(r['p.adj'] === '' ? null : r['p.adj'])
+        + '</td><td style="color:' + col + ';font-weight:600;">' + esc(r.Status) + '</td></tr>';
+    });
+    box.innerHTML = h + '</tbody></table>';
+  }
+  function matrix(){
+    var box = document.getElementById('gseaMatrix'), src = document.getElementById('gseaSrc').value || '*';
+    var cs = CONTRASTS.filter(function(c){ return G[c]; }), best = {}, info = {};
+    cs.forEach(function(c){ G[c].terms.forEach(function(t){
+      if(src !== '*' && t.s !== src) return;
+      var k = t.id + '|' + t.n; info[k] = t;
+      if(best[k] == null || (t.q != null && t.q < best[k])) best[k] = (t.q == null ? 1 : t.q); }); });
+    var keys = Object.keys(best).sort(function(a, b){ return best[a] - best[b]; }).slice(0, 30);
+    if(cs.length < 2 || !keys.length){ box.innerHTML = '<div style="color:var(--tx2);font-size:12px;padding:8px;">'
+      + (cs.length < 2 ? 'Needs GSEA results in at least two contrasts.' : 'No pathway for this source.') + '</div>'; return; }
+    var m = 0; cs.forEach(function(c){ G[c].terms.forEach(function(t){ m = Math.max(m, Math.abs(t.nes)); }); });
+    function col(v){ if(v == null) return 'transparent'; var a = Math.min(1, Math.abs(v) / (m || 1));
+      return v > 0 ? 'rgba(248,81,73,' + (0.15 + 0.85 * a).toFixed(2) + ')' : 'rgba(56,139,253,' + (0.15 + 0.85 * a).toFixed(2) + ')'; }
+    var h = '<table class="itbl" style="width:auto;"><thead><tr><th>Pathway</th>' + cs.map(function(c){
+      return '<th style="writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;max-height:150px;">' + esc(lab(c)) + '</th>'; }).join('') + '</tr></thead><tbody>';
+    keys.forEach(function(k){
+      h += '<tr><td title="' + esc(info[k].id) + '">' + esc(info[k].n.length > 60 ? info[k].n.slice(0, 59) + '…' : info[k].n) + '</td>';
+      cs.forEach(function(c){
+        var t = G[c].terms.filter(function(x){ return x.id + '|' + x.n === k; })[0];
+        var v = t ? nes(t) : null;
+        h += '<td title="' + esc(lab(c)) + (t ? ': NES ' + v.toFixed(2) + ', FDR ' + fe(t.q) : ': not significant') + '" style="background:' + col(v)
+          + ';text-align:center;min-width:34px;font-size:10px;color:#fff;">' + (t ? v.toFixed(1) : '') + '</td>';
+      });
+      h += '</tr>';
+    });
+    box.innerHTML = h + '</tbody></table><div style="font-size:10.5px;color:var(--tx3);margin-top:6px;">'
+      + 'Empty cell = not significant in that contrast (or absent from its GSEA sheet). Red = enriched among up-regulated proteins, blue = among down-regulated.</div>';
+  }
+  window.renderGSEA = function(){
+    if(!st.c) return;
+    var d = G[st.c];
+    document.getElementById('gseaTitle').textContent = 'GSEA — ' + lab(st.c);
+    document.getElementById('gseaProv').textContent = d ? d.prov : '';
+    var rows = filt(st.c);
+    drawNes(rows); table(rows); lead(); matrix();
+  };
+  function rowsOut(rows){
+    return rows.map(function(t){ return {'Pathway': t.n, 'Term ID': t.id, 'Source': t.s, 'NES': nes(t),
+      'ES': t.es == null ? '' : (st.inv ? -t.es : t.es), 'NOM p-val': t.p, 'FDR q-val': t.q, 'FWER p-val': t.fwer,
+      'Tag %': t.tag, 'Gene %': t.gene, 'Leading-edge genes': t.lead, 'Leading-edge proteins': t.lp.join(';'),
+      'n leading edge': t.lp.length}; });
+  }
+  function infoSheet(c){
+    var p = c.split('_vs_'), name = st.inv && p.length === 2 ? p[1] + '_vs_' + p[0] : c;
+    return {name: 'Contrast', data: [{'Contrast': name.replace('_vs_', ' vs '),
+      'NES sign': 'positive = enriched among proteins up in ' + name.split('_vs_')[0],
+      'Inverted': name !== c ? 'yes (Deimos contrast: ' + c + ')' : 'no',
+      'GSEA': G[c] ? G[c].prov : '', 'Deimos sheet': G[c] ? G[c].sheet : ''}]};
+  }
+  window.exportGseaFiltered = function(){
+    if(!G[st.c]) return;
+    xls(makeWb([{name: 'GSEA', data: rowsOut(filt(st.c))}, infoSheet(st.c)]), 'proteogen_GSEA_' + gseaFileName() + '.xlsx');
+  };
+  window.exportGseaAll = function(){
+    var sum = [], sheets = [];
+    CONTRASTS.forEach(function(c){
+      var d = G[c], up = 0, dn = 0;
+      if(d) d.terms.forEach(function(t){ if(nes(t) > 0) up++; else dn++; });
+      var p = c.split('_vs_'), name = st.inv && p.length === 2 ? p[1] + '_vs_' + p[0] : c;
+      sum.push({'Contrast': name.replace('_vs_', ' vs '), 'Pathways': d ? d.terms.length : 0,
+                'NES > 0': up, 'NES < 0': dn, 'Inverted': name !== c ? 'yes' : 'no', 'GSEA': d ? d.prov : 'no pathway'});
+      if(d) sheets.push({name: name, data: rowsOut(d.terms.slice().sort(function(a, b){ return nes(b) - nes(a); }))});
+    });
+    xls(makeWb([{name: 'Summary', data: sum}].concat(sheets)), 'proteogen_GSEA_all_contrasts.xlsx');
+  };
+  window.exportGseaLead = function(){
+    var t = selTerm(); if(!t) return;
+    xls(makeWb([{name: 'Leading edge', data: leadRows(t)}, {name: 'Pathway', data: rowsOut([t])}, infoSheet(st.c)]),
+        'proteogen_GSEA_lead_' + gseaFileName().slice(0, 25) + '.xlsx');
+  };
+  // navigation : la page GSEA s'ajoute aux pages du modèle (surlignage par onclick)
+  var _show = window.showPage;
+  window.showPage = function(id){
+    if(id === 'gseapage'){
+      document.querySelectorAll('.page').forEach(function(p){ p.classList.remove('active'); });
+      document.getElementById('gseapage').classList.add('active');
+    } else if(typeof _show === 'function'){ _show(id); }
+    document.querySelectorAll('nav a').forEach(function(a){
+      a.classList.toggle('active', (a.getAttribute('onclick') || '').indexOf("'" + id + "'") >= 0); });
+    if(id === 'gseapage') initGSEA();
+  };
+})();
+</script>"""
+
+
+def patch_gsea_page(html):
+    """Page GSEA : lien de navigation après GO, page, script (après AUDIT_FIX_JS)."""
+    link = """<a onclick="showPage('gseapage')">GSEA</a>"""
+    go = """<a onclick="showPage('gopage')">GO</a>"""
+    if go in html:
+        html = html.replace(go, go + "\n  " + link, 1)
+    else:
+        html = html.replace('<button class="theme-toggle"', link + '\n  <button class="theme-toggle"', 1)
+    anchor = '<div id="heatmap" class="page">'
+    if anchor in html:
+        html = html.replace(anchor, GSEA_PAGE_HTML + anchor, 1)
+    marker = '<!--PROTEOGEN_BODY_END-->'
+    html = html.replace(marker, GSEA_PAGE_HTML * (anchor not in html) + GSEA_JS + marker, 1) \
+        if marker in html else html.replace('</body>', GSEA_JS + '</body>', 1)
+    print("  patch_gsea_page : page GSEA (NES, table, leading edge, inter-contrastes, exports).")
+    return html
+
+
 def main():
     ap = argparse.ArgumentParser(description="Génère le dashboard protéomique HTML depuis les XLSX des scripts R.")
     ap.add_argument('--uploads', default='/Data/Dashboard/upload', help="Dossier d'auto-détection des XLSX")
@@ -6862,7 +7318,7 @@ def main():
             chosen_params = None
     # Les seuils du pipeline définissent le statut DEP embarqué (volcano comparatif,
     # résumés) : mêmes protéines significatives que l'Excel et les volcanos PNG.
-    global P_THRESH, LFC_THRESH, SIG_SUFFIX, N_ITER_ROB, SAMPLE_LABELS, _GO_MANIFEST
+    global P_THRESH, LFC_THRESH, SIG_SUFFIX, N_ITER_ROB, SAMPLE_LABELS, _GO_MANIFEST, _GSEA_MANIFEST
     if chosen_params:
         try:
             P_THRESH = float(chosen_params.get("volcano_p_thresh", P_THRESH))
@@ -6950,6 +7406,9 @@ def main():
     data['go_bubble']  = build_go_bubble(go, contrasts)
     data['go_heatmap']  = build_go_heatmap(go, contrasts)
     data['go_network']  = build_go_network(go, contrasts)
+    # GSEA (onglets GSEA_* du classeur de résultats, appariés par le _manifest)
+    _GSEA_MANIFEST = read_manifest_go(stats, 'gsea_sheet')
+    data['gsea'] = build_gsea(stats, contrasts, df_comp)
     data['wgcna_rows'], data['wgcna_top5'], data['wgcna_mods'] = build_wgcna(wgcna)
     data['wgcna_hub_map'] = build_wgcna_hub_map(wgcna)
     data['module_trait'] = build_module_trait(wgcna, df_comp, sample_cols, cond_map_inv)
@@ -7010,6 +7469,8 @@ def main():
     # 3j. Corrections de l'audit du 06/11/2026 (règle de Deimos, toutes protéines,
     #     gènes, intersections, crans des curseurs...) — en dernier : elles priment
     html = patch_audit_2026_11(html)
+    # 3k. Page GSEA (07/11/2026) : NES, table, leading edge, vue inter-contrastes, exports
+    html = patch_gsea_page(html)
 
     # 4. Vérifications avant livraison (checklist du skill)
     assert 'const PROTEOME_DATA=' in html

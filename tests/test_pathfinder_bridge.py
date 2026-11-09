@@ -307,3 +307,58 @@ class TestValidation:
     ])
     def test_invalid(self, params):
         assert pb.validate_pathfinder_params(params)
+
+
+def test_reading_options_reach_pathfinder_13(tmp_path):
+    """Pathfinder >= 1.3.0 porte la lecture biologique (ex-InSight) : options de
+    pathfinder_options, sinon d'insight_options ; jamais passées à un Pathfinder 1.2."""
+    import pathfinder_bridge as pb
+    params = {"pathfinder_options": {"k": 5, "groups_from": "gsea", "prog_boot": 0},
+              "insight_options": {"k": 7, "volcanos": ["A_vs_B"], "categorical": True}}
+    argv = pb.build_pathfinder_argv("/pf", "/x.xlsx", "/d.csv", "/o", params, reading=True)
+    s = " ".join(argv)
+    assert "--k 5" in s and "--k 7" not in s and "--volcano A_vs_B" in s
+    assert "--categorical" in s and "--groups-from gsea" in s and "--prog-boot 0" in s
+    assert "--k" not in pb.build_pathfinder_argv("/pf", "/x.xlsx", "/d.csv", "/o", params)
+    old = tmp_path / "pf12"
+    old.mkdir()
+    (old / "pathfinder.py").write_text("ap.add_argument('--jaccard')", encoding="utf-8")
+    new = tmp_path / "pf13"
+    new.mkdir()
+    (new / "pathfinder.py").write_text("rd.add_argument('--no-reading')", encoding="utf-8")
+    assert not pb.pathfinder_has_reading(str(old)) and pb.pathfinder_has_reading(str(new))
+    assert pb.reading_argv({"pathfinder_options": {"no_reading": True, "k": 3}}) == ["--no-reading"]
+    assert pb.validate_pathfinder_params({"pathfinder_options": {"groups_from": "x", "k": 1}})
+    assert not pb.validate_pathfinder_params(params)
+    rx = r"(?P<genotype>[^_]+)_T(?P<time>\d+)"
+    assert pb.reading_argv({"pathfinder_options": {"factor_regex": rx}}) == ["--factor-regex", rx]
+    assert not pb.validate_pathfinder_params({"pathfinder_options": {"factor_regex": rx}})
+    assert pb.validate_pathfinder_params({"pathfinder_options": {"factor_regex": "(a"}})
+    assert pb.validate_pathfinder_params({"pathfinder_options": {"factor_regex": "T(\\d+)"}})
+
+
+def test_make_insight_is_absorbed_by_pathfinder_13(tmp_path, monkeypatch, capsys):
+    """Un seul rapport HTML : avec un Pathfinder >= 1.3.0, make_insight lance Pathfinder
+    (onglet Biological reading) et plus InSight ; sans lui, InSight reste à part."""
+    import pathfinder_bridge as pb
+    new = tmp_path / "pf13"
+    new.mkdir()
+    (new / "pathfinder.py").write_text("rd.add_argument('--no-reading')", encoding="utf-8")
+    old = tmp_path / "pf12"
+    old.mkdir()
+    (old / "pathfinder.py").write_text("ap.add_argument('--jaccard')", encoding="utf-8")
+    monkeypatch.setattr(pb, "locate_pathfinder", lambda params: str(new))
+    p = {"make_insight": True, "make_pathfinder": False, "insight_options": {"k": 5}}
+    assert pb.resolve_reading(p) == "pathfinder"
+    assert p["make_pathfinder"] is True and p["make_insight"] is False
+    assert "no separate insight_report.html" in capsys.readouterr().out
+    assert "--k 5" in " ".join(pb.reading_argv(p))                 # options d'InSight reprises
+    p = {"make_insight": True, "make_pathfinder": True}
+    assert pb.resolve_reading(p) == "pathfinder" and not p["make_insight"]
+    assert pb.resolve_reading({"make_insight": False}) is None
+    monkeypatch.setattr(pb, "locate_pathfinder", lambda params: str(old))
+    p = {"make_insight": True, "make_pathfinder": True}
+    assert pb.resolve_reading(p) == "insight" and p["make_insight"] is True
+    monkeypatch.setattr(pb, "locate_pathfinder", lambda params: None)
+    p = {"make_insight": True}
+    assert pb.resolve_reading(p) == "insight" and not p.get("make_pathfinder")

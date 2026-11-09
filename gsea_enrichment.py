@@ -270,6 +270,33 @@ def _leaders(df):
     return df[col].astype(str).str.split(";").str[0].str.strip()
 
 
+def _key_proteins(df, key_map=None):
+    """Clé de classement (majuscules) -> accessions de tête des protéines qui la portent :
+    inverse de la clé utilisée par _ranking_metric (g:Profiler ou colonne Genes). Sert à
+    rendre le leading edge en protéines (colonne Lead_proteins, dashboard)."""
+    pids = _leaders(df)
+    if key_map is not None:
+        keys = pids.map(key_map)
+    elif "Genes" in df.columns:
+        keys = df["Genes"]
+    else:
+        return {}
+    keys = keys.astype(str).str.split(";").str[0].str.strip().str.upper()
+    out = {}
+    for k, p in zip(keys, pids):
+        if k and k not in ("NAN", "NONE"):
+            out.setdefault(k, []).append(p)
+    return out
+
+
+def _lead_proteins(lead, key2prot):
+    """'G1;G2' (Lead_genes de gseapy) -> 'P1;P2;P3'."""
+    out = []
+    for g in str(lead or "").split(";"):
+        out += key2prot.get(g.strip().upper(), [])
+    return ";".join(dict.fromkeys(out))
+
+
 def _convert_ids(ids, code, chunk=2500):
     """g:Convert (g:Profiler) : identifiants -> [(incoming, gène Ensembl, nom)]."""
     from gprofiler import GProfiler
@@ -475,6 +502,7 @@ def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir, ortholo
             print("  [WARN] GSEA skipped: no gene set member matches the data.")
             return None
     universe = {g for v in gene_sets.values() for g in v}
+    key2prot = _key_proteins(df_comparaison, key_map)
     results = {}
     coverage_done = False
     for contrast in contrast_names:
@@ -512,6 +540,10 @@ def run_gsea(df_comparaison, contrast_names, params, go_params, out_dir, ortholo
                 continue
 
             f_nes = _plot_gsea_nes(res_sig, contrast, out_dir)
+            if "Lead_genes" in res_sig.columns:       # leading edge en protéines
+                res_sig["Lead_proteins"] = res_sig["Lead_genes"].map(
+                    lambda x: _lead_proteins(";".join(x) if isinstance(x, (list, tuple)) else x,
+                                             key2prot))
             # Nettoyer les colonnes pour l'export (listes -> texte)
             for col in res_sig.columns:
                 if res_sig[col].apply(lambda x: isinstance(x, (list, tuple))).any():
@@ -545,14 +577,22 @@ def export_gsea_sheets(wb, gsea_results, ins_img_fn):
     """Ajoute un onglet GSEA_<contrast> par contraste au classeur Excel.
 
     Nommage sans 'GO' ni 'go' pour ne pas être capté par les filtres GO du
-    dashboard (heatmap/réseau GO cross-contrastes).
+    dashboard (heatmap/réseau GO cross-contrastes). Noms uniques (31 caractères
+    au plus, suffixe ~2, ~3... en cas de collision après troncature).
+    Retourne {onglet: contraste} pour le _manifest (section gsea_sheet).
     """
     if not gsea_results:
-        return
+        return {}
+    sheet_map = {}
+    used = {n.lower() for n in wb.sheetnames}
     for contrast, data in gsea_results.items():
-        # Nom court unique, sans collision avec les onglets GO
-        base = f"GSEA_{contrast.replace('_vs_', 'v').replace('_', '')}"
-        sheet_name = base[:31]
+        base = f"GSEA_{contrast.replace('_vs_', 'v').replace('_', '')}"[:31]
+        sheet_name, k = base, 2
+        while sheet_name.lower() in used:
+            suf = f"~{k}"
+            sheet_name, k = base[:31 - len(suf)] + suf, k + 1
+        used.add(sheet_name.lower())
+        sheet_map[sheet_name] = contrast
         ws = wb.create_sheet(sheet_name)
         df = data["table"]
         start_col = 16  # laisse de la place au plot NES à gauche
@@ -568,3 +608,4 @@ def export_gsea_sheets(wb, gsea_results, ins_img_fn):
         if data.get("provenance"):
             ws.cell(row=1, column=1, value=data["provenance"])
         ins_img_fn(ws, data.get("nes_plot"), "A2")
+    return sheet_map
