@@ -215,6 +215,20 @@ def locate_pathfinder(params):
     return None
 
 
+_SKIP_MARKS = ("Biological reading skipped", "\u26a0")
+
+
+def _skipped_steps(path, n=6):
+    """Lignes du log de Pathfinder qui annoncent une étape sautée, pour les relayer."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            out = [l.strip().lstrip("[Pathfinder]").strip()
+                   for l in f if any(m in l for m in _SKIP_MARKS)]
+    except OSError:
+        return []
+    return list(dict.fromkeys(out))[:n]
+
+
 def _tail(path, n=5):
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -371,6 +385,11 @@ def run_pathfinder_step(xlsx_path, design, params, out_dir, *, go_ran=True,
                 print(f"         | {line}")
             return None
         print(f"  [OK] Pathfinder {pathfinder_version(pf_dir)} finished in {time.time() - t0:.0f} s")
+        # Pathfinder n'interrompt pas son rapport quand une étape échoue : il l'écrit
+        # dans son log et continue. Sans ce relais, un onglet entier peut disparaître
+        # du rapport sans que rien ne le signale dans la sortie de Deimos.
+        for line in _skipped_steps(log_path):
+            print(f"  [WARN] Pathfinder: {line}")
         return html
     except Exception as e:      # garde-fou : Pathfinder ne doit jamais interrompre Deimos
         print(f"  [WARN] Pathfinder not run ({type(e).__name__}: {e})")
