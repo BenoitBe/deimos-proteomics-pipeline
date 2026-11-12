@@ -4314,12 +4314,19 @@ def build_qc_report(stats_path, df_comp, sample_cols, cond_map):
     if "imputed" in df_comp.columns:
         # La colonne 'imputed' peut être VRAI/FAUX (texte, format R), booléenne
         # ou 0/1. On normalise en booléen avant de compter.
+        # NB : tester `dtype == object` ne suffit pas. À partir de pandas 2.1
+        # (infer_string) et par défaut en pandas 3.0, une colonne de texte a le
+        # dtype `str` et non `object` : le test échouait, la branche numérique
+        # transformait "VRAI"/"FAUX" en NaN puis en 0, et le dashboard affichait
+        # 0 % d'imputation alors que num_NAs disait le contraire.
         imp_col = df_comp["imputed"]
-        if imp_col.dtype == object:
-            n_imp = int(imp_col.astype(str).str.upper().isin(
-                ["VRAI", "TRUE", "1", "OUI", "YES"]).sum())
-        else:
+        if pd.api.types.is_bool_dtype(imp_col):
+            n_imp = int(imp_col.sum())
+        elif pd.api.types.is_numeric_dtype(imp_col):
             n_imp = int(pd.to_numeric(imp_col, errors="coerce").fillna(0).astype(bool).sum())
+        else:
+            n_imp = int(imp_col.astype(str).str.strip().str.upper().isin(
+                ["VRAI", "TRUE", "1", "OUI", "YES"]).sum())
         n_tot = int(len(df_comp))
         rate  = round(n_imp/n_tot, 4) if n_tot else 0.0
         s = _qc_status(rate, QC_IMP_WARN, 0.50)
@@ -4329,10 +4336,20 @@ def build_qc_report(stats_path, df_comp, sample_cols, cond_map):
                              "status": s, "detail": str(n_imp)+"/"+str(n_tot)})
     if "num_NAs" in df_comp.columns:
         mna = round(float(df_comp["num_NAs"].mean()),2)
-        s2 = "OK" if mna < 2 else "WARN"
+        # Le seuil doit suivre la taille du plan : 2,83 NA/protéine, c'est 6 % de
+        # manquants sur 47 échantillons (bon) mais 47 % sur 6 (mauvais). On juge
+        # donc sur la PART de manquants, et on garde le nombre absolu affiché.
+        n_samp = len(sample_cols or [])
+        if n_samp:
+            pct_na = round(mna / n_samp * 100, 1)
+            s2 = _qc_status(pct_na, 10.0, 25.0)
+            det = str(pct_na) + "% des valeurs, " + str(n_samp) + " echantillons"
+        else:
+            s2 = "OK" if mna < 2 else "WARN"
+            det = ""
         all_statuses.append(s2)
         metrics_imp.append({"label": "NA moyen par proteine",
-                             "value": mna, "unit": "NA/prot.", "status": s2, "detail": ""})
+                             "value": mna, "unit": "NA/prot.", "status": s2, "detail": det})
     if metrics_imp:
         sections.append({"title": "Imputation", "metrics": metrics_imp})
 

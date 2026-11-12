@@ -273,6 +273,46 @@ insight_options:         {}      # e.g. {k: 6, max_volcanos: 4, categorical: fal
 insight_timeout:         900     # seconds
 
 
+# ── Annotation from the search FASTA ─────────────────────────────────────────
+# DIA-NN leaves Genes and First.Protein.Description empty when the FASTA headers
+# are not UniProt (Araport/TAIR, in-house proteomes): figures, GSEA and the GO
+# query then carry identifiers instead of gene names.
+# "__auto__" (default): when more than half of the proteins have no gene name,
+#             read them from the largest FASTA sitting next to the pg_matrix.
+#             Headers understood: Araport (| Symbols: ... |), UniProt (GN=),
+#             and plain ">ID description". Only EMPTY cells are filled: what
+#             DIA-NN found is never overwritten, and no file is ever written.
+# a path    : force that FASTA (even when DIA-NN already named the proteins)
+# false     : disable
+annotation_fasta:    "__auto__"
+
+
+# ── ANOVA par strate (en plus de l'ANOVA globale) ────────────────────────────
+# L'ANOVA globale compare les N conditions d'un coup et poole la variance
+# résiduelle sur tous les échantillons. Quand l'effet cherché est local — par
+# exemple « les 3 génotypes diffèrent-ils À CHAQUE TEMPS ? » — on veut une ANOVA
+# par temps. anova_strata les ajoute, sans rien retirer : l'ANOVA globale, ses
+# heatmaps et la feuille ANOVA_Results restent identiques.
+#
+# Deux écritures :
+#   une regex   "^(T\d+)_"      -> une strate par valeur capturée dans le nom de
+#                                  condition (groupe 1, ou le groupe nommé
+#                                  (?P<stratum>...))
+#   un mapping  {T0: [T0_Dark_Col_0, T0_Dark_OMP_like_Col6D], T3: [...]}
+#   false       -> désactivé (défaut)
+#
+# Sorties : une feuille ANOVA_<strate> par strate, avec ses 3 figures, et les PNG
+# dans out_dir/anova_strata/<strate>/.
+#
+# Ce qu'il faut savoir : le BH est propre à chaque strate (correct, chaque ANOVA
+# est sa propre famille), mais les degrés de liberté résiduels chutent. Sur un
+# plan 3 génotypes x 4 temps x 4 réplicats : 35 df en global, 9 df par temps.
+# Avec un effet faible, une ANOVA par temps ne trouvera rien là où la globale
+# trouvait. Si la question est « l'effet génotype dépend-il du temps ? », c'est
+# une interaction qu'il faut tester, pas 4 ANOVA séparées.
+anova_strata:        false
+
+
 # ── Input file paths ──────────────────────────────────────────────────────────
 # Edit these paths if your files are not in the current directory.
 # These values can also be overridden via: --tsv, --design, --out-dir

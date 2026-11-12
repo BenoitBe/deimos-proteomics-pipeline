@@ -119,6 +119,15 @@ _DEFAULTS = {
     "tsv_path":            "report.pg_matrix.tsv",
     "design_path":         "ExperimentalDesign.csv",
     "pr_path":             "report.pr_matrix.tsv",
+    # Genes vide (en-têtes FASTA non-UniProt) -> noms de gènes lus dans le FASTA de
+    # recherche. "__auto__" = seulement si plus de la moitié des protéines n'ont pas
+    # de nom ; un chemin force ce FASTA ; false désactive. Seules les cellules vides
+    # sont remplies, et aucun fichier n'est écrit.
+    "annotation_fasta":    "__auto__",
+    # ANOVA par strate, EN PLUS de l'ANOVA globale. Une regex sur les noms de
+    # conditions ("^(T\\d+)_" -> une ANOVA par temps), ou un mapping
+    # {étiquette: [conditions]}, ou false. Le BH est propre à chaque strate.
+    "anova_strata":        False,
     "out_dir":             "proteomics_output",
 }
 
@@ -588,7 +597,17 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
     # ask_params_fn() retourne uniquement les clés stats. On fusionne _DEFAULTS
     # en premier pour garantir tsv_path, design_path, pr_path, out_dir, etc.
     # Les réponses interactives ont priorité via le second spread.
-    params = {**_DEFAULTS, **ask_params_fn()}
+    # ask_params_fn peut accepter le chemin du plan, pour proposer des strates
+    # d'ANOVA tirées des vrais noms de conditions. Les anciennes signatures sans
+    # argument restent acceptées.
+    import inspect
+    try:
+        _takes_design = bool(inspect.signature(ask_params_fn).parameters)
+    except (TypeError, ValueError):
+        _takes_design = False
+    _answers = (ask_params_fn(args.design or _DEFAULTS["design_path"])
+                if _takes_design else ask_params_fn())
+    params = {**_DEFAULTS, **_answers}
 
     # Surchargez les chemins CLI si fournis (priorité maximale)
     if args.tsv:     params["tsv_path"]    = args.tsv

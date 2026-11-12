@@ -105,7 +105,125 @@ from insight_bridge import run_insight_step, locate_insight, insight_version
 # 0. PARAMÈTRES INTERACTIFS
 # ==============================================================================
 
-def ask_params() -> dict:
+def read_design_conditions(design_path: str) -> list:
+    """Conditions du plan, dans l'ordre, pour pouvoir proposer des strates d'ANOVA
+    AVANT de lancer l'analyse. Rend [] si le fichier n'est pas lisible : la question
+    se rabat alors sur la saisie libre."""
+    try:
+        for sep in (";", ",", "\t"):
+            try:
+                d = pd.read_csv(design_path, sep=sep)
+            except Exception:
+                continue
+            if "condition" in d.columns:
+                return list(dict.fromkeys(d["condition"].astype(str)))
+    except Exception:
+        pass
+    return []
+
+
+def suggest_strata(conditions: list, max_strata=12) -> list:
+    """Découpages plausibles des conditions, proposés à l'utilisateur.
+
+    Générique : aucun nom de projet en dur. Les noms de conditions sont coupés sur
+    leurs séparateurs (-, _, ., espace) et chaque position — comptée depuis la
+    gauche puis depuis la droite — devient un découpage candidat si elle a entre 2
+    et `max_strata` valeurs, que chaque valeur revient au moins deux fois, et que
+    toutes les conditions sont couvertes. Les positions constantes (un seul niveau)
+    sont écartées : elles ne découpent rien.
+
+    Rend une liste de dicts {label, regex, strata} du plus au moins équilibré.
+    """
+    conds = [str(c) for c in dict.fromkeys(conditions)]
+    if len(conds) < 4:
+        return []
+    split = {c: [t for t in re.split(r"[-_.\s]+", c) if t] for c in conds}
+    out, seen = [], set()
+    for side in ("left", "right"):
+        depth = min(len(v) for v in split.values())
+        for pos in range(min(depth, 3)):
+            vals = {}
+            for c, toks in split.items():
+                t = toks[pos] if side == "left" else toks[len(toks) - 1 - pos]
+                vals.setdefault(t, []).append(c)
+            if not 2 <= len(vals) <= max_strata:
+                continue
+            if any(len(v) < 2 for v in vals.values()):
+                continue
+            key = tuple(sorted((k, tuple(v)) for k, v in vals.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            sizes = [len(v) for v in vals.values()]
+            out.append({
+                "label": f"{('1st', '2nd', '3rd')[pos]} segment from the {side}",
+                "values": list(vals),
+                "strata": vals,
+                "balanced": max(sizes) - min(sizes),
+                "n": len(vals),
+            })
+    out.sort(key=lambda d: (d["balanced"], -d["n"]))
+    # Un plan factoriel donne des strates de même taille. Les découpages
+    # déséquilibrés viennent presque toujours d'un nom coupé au mauvais endroit
+    # ("OMP-like-Col6D" -> OMP / Col) : on les écarte dès qu'un découpage
+    # équilibré existe, et la saisie libre reste là pour les cas tordus.
+    if out and out[0]["balanced"] == 0:
+        out = [d for d in out if d["balanced"] == 0]
+    return out[:3]
+
+
+def ask_anova_strata(design_path: str):
+    """Question interactive : une ANOVA par strate, en plus de l'ANOVA globale."""
+    conds = read_design_conditions(design_path)
+    print("\n[2b/2] Stratified ANOVA (optional)")
+    print("  The global ANOVA compares every condition at once. A stratified ANOVA adds")
+    print("  one test per subgroup — e.g. one ANOVA per time point, comparing genotypes.")
+    if conds:
+        print(f"  Design read: {len(conds)} conditions.")
+    props = suggest_strata(conds)
+    opts = ["0"]
+    print("    0) no (default)")
+    for i, pr in enumerate(props, start=1):
+        opts.append(str(i))
+        vals = ", ".join(pr["values"][:6]) + ("..." if len(pr["values"]) > 6 else "")
+        sizes = sorted({len(v) for v in pr["strata"].values()})
+        size_txt = (f"{sizes[0]} conditions each" if len(sizes) == 1
+                    else f"{min(sizes)}-{max(sizes)} conditions")
+        print(f"    {i}) by the {pr['label']}: {pr['n']} strata ({vals}) — {size_txt}")
+    opts.append("r")
+    print("    r) enter a regular expression on the condition names")
+    raw = ""
+    while raw not in opts:
+        raw = input(f"  Choice [{'/'.join(opts)}] -> ").strip().lower() or "0"
+        if raw not in opts:
+            print(f"  Answer one of: {', '.join(opts)}.")
+    if raw == "0":
+        return False
+    if raw == "r":
+        print("    The first capture group names the stratum, e.g. ^(T\\d+)[-_]")
+        while True:
+            rx = input("  Regular expression -> ").strip()
+            if not rx:
+                return False
+            try:
+                re.compile(rx)
+            except re.error as e:
+                print(f"  Invalid regex ({e}), try again.")
+                continue
+            if conds:
+                hit = sorted({(re.search(rx, c).group(1)
+                               if re.search(rx, c) and re.search(rx, c).groups()
+                               else re.search(rx, c).group(0))
+                              for c in conds if re.search(rx, c)})
+                if not hit:
+                    print("  This matches none of the condition names, try again.")
+                    continue
+                print(f"  -> {len(hit)} strata: {', '.join(hit[:8])}")
+            return rx
+    return {k: v for k, v in props[int(raw) - 1]["strata"].items()}
+
+
+def ask_params(design_path: str = "ExperimentalDesign.csv") -> dict:
     """
     Asks the user 2 questions at launch and returns the thresholds.
     The volcano thresholds also govern the robustness score and the facet volcano.
@@ -235,7 +353,10 @@ def ask_params() -> dict:
         else:
             print("  Answer: 1 or 2.")
 
+    anova_strata = ask_anova_strata(design_path)
+
     params = {
+        "anova_strata": anova_strata,
         "primary_statistic": prim,
         "volcano_use_padj":  v_type == "2",
         "volcano_p_thresh":  v_val,
@@ -254,6 +375,12 @@ def ask_params() -> dict:
     print(f"     Volcanos/Robustness -> {'p.adj' if params['volcano_use_padj'] else 'p.value'} < {v_val}  |  ratio >= {v_ratio} (log2FC >= {params['volcano_lfc_min']:.3f})")
     print(f"     ANOVA/Heatmap       -> {'p.adj' if params['anova_use_padj'] else 'p.value'} < {a_val}")
     print(f"     Heatmap clusters    -> {n_clusters}")
+    if anova_strata:
+        _ns = (len(anova_strata) if isinstance(anova_strata, dict)
+               else f"regex {anova_strata}")
+        print(f"     Stratified ANOVA    -> {_ns} strata (in addition to the global one)"
+              if isinstance(anova_strata, dict) else
+              f"     Stratified ANOVA    -> {_ns}")
     print(f"     Robustness          -> {'disabled' if n_iter_rob == 0 else str(n_iter_rob) + ' iterations'}")
     _fdr_txt = "global (whole study)" if fdr_global else "per contrast"
     print(f"     FDR correction      -> {_fdr_txt}")
@@ -435,7 +562,170 @@ def _closest_label(target: str, candidates: list[str], max_dist: int = 4) -> str
 # 1. LECTURE ET NETTOYAGE DES DONNÉES
 # ==============================================================================
 
-def load_data(tsv_path: str, design_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+_FASTA_EXT = (".fasta", ".fa", ".faa", ".fas", ".pep")
+
+
+def parse_fasta_annotation(fasta_path: str) -> dict:
+    """Lit les en-têtes d'un FASTA et rend {identifiant: (gene, description)}.
+
+    Trois conventions couvertes, sans dépendance :
+      · Araport / TAIR   >AT1G01010.1 | Symbols: NAC001, ANAC001 | NAC domain ... | chr1:...
+      · UniProt          >sp|P12345|NAME_ARATH Description OS=... GN=XXX PE=1 SV=2
+      · générique        >ID description libre
+    L'identifiant est indexé tel quel ET sans son suffixe d'isoforme (AT1G01010.1
+    -> AT1G01010), parce que DIA-NN peut rapporter l'un ou l'autre.
+    """
+    ann: dict[str, tuple[str, str]] = {}
+    try:
+        fh = open(fasta_path, "r", errors="replace")
+    except OSError as e:
+        print(f"  [WARN] FASTA unreadable ({e}) — Genes left as is.")
+        return ann
+    with fh:
+        for line in fh:
+            if not line.startswith(">"):
+                continue
+            head = line[1:].rstrip("\n").rstrip("\r")
+            if not head:
+                continue
+            gene = desc = ""
+            if head.startswith(("sp|", "tr|")) or re.match(r"^[a-z]{2}\|[^|]+\|", head):
+                parts = head.split("|", 2)
+                pid = parts[1] if len(parts) > 2 else head.split()[0]
+                rest = parts[2] if len(parts) > 2 else ""
+                m = re.search(r"\bGN=(\S+)", rest)
+                gene = m.group(1) if m else ""
+                desc = re.split(r"\s+(?:OS|OX|GN|PE|SV)=", rest.split(" ", 1)[-1])[0].strip()
+            elif "|" in head:                                   # Araport / TAIR
+                fields = [f.strip() for f in head.split("|")]
+                pid = fields[0].split()[0]
+                for f in fields[1:]:
+                    if f.lower().startswith("symbols:"):
+                        syms = [x.strip() for x in f.split(":", 1)[1].split(",") if x.strip()]
+                        if syms and not gene:
+                            gene = syms[0]
+                    elif f and not desc:
+                        desc = f
+            else:
+                bits = head.split(None, 1)
+                pid = bits[0]
+                desc = bits[1].strip() if len(bits) > 1 else ""
+            if not pid:
+                continue
+            ann.setdefault(pid, (gene, desc))
+            base = pid.rsplit(".", 1)[0]
+            if base != pid:
+                ann.setdefault(base, (gene, desc))
+    return ann
+
+
+def _looks_like_fasta(path: str) -> bool:
+    """Première ligne non vide commençant par '>' : écarte les fichiers vides ou
+    renommés sans juger de la taille (un panel maison peut tenir en 300 octets)."""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if line.strip():
+                    return line.startswith(">")
+    except OSError:
+        return False
+    return False
+
+
+def find_annotation_fasta(tsv_path: str, explicit=None) -> str | None:
+    """FASTA à utiliser : le chemin donné, sinon le plus gros FASTA du dossier du
+    pg_matrix. Aucun fichier n'est écrit ni modifié : il est seulement lu."""
+    if explicit:
+        p = str(explicit)
+        return p if os.path.isfile(p) and _looks_like_fasta(p) else None
+    try:
+        folder = os.path.dirname(os.path.abspath(tsv_path)) or "."
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    cands = [os.path.join(folder, f) for f in names if f.lower().endswith(_FASTA_EXT)]
+    cands = [c for c in cands if os.path.isfile(c) and _looks_like_fasta(c)]
+    return max(cands, key=os.path.getsize) if cands else None
+
+
+def fill_annotation_from_fasta(tsv: pd.DataFrame, fasta_path: str) -> dict:
+    """Complète Genes et First.Protein.Description vides depuis le FASTA de recherche.
+
+    DIA-NN laisse ces colonnes vides quand les en-têtes du FASTA ne suivent pas la
+    convention UniProt (Araport, protéomes maison) : les figures et la GSEA se
+    retrouvent alors étiquetées avec des identifiants. Seules les cellules vides
+    sont remplies, jamais celles que DIA-NN a su renseigner.
+    """
+    done = {"genes": 0, "descriptions": 0, "matched": 0}
+    ann = parse_fasta_annotation(fasta_path)
+    if not ann:
+        return done
+    def _blank(v) -> bool:
+        return str(v).strip() in ("", "|", "nan", "None", "NaN")
+    if "Genes" not in tsv.columns:
+        tsv["Genes"] = ""
+    if "First.Protein.Description" not in tsv.columns:
+        tsv["First.Protein.Description"] = ""
+    ids_col = "Protein.Ids" if "Protein.Ids" in tsv.columns else "Protein.Group"
+    genes, descs = list(tsv["Genes"]), list(tsv["First.Protein.Description"])
+    for i, raw in enumerate(tsv[ids_col].astype(str)):
+        ids = [x for x in re.split(r"[;,]", raw) if x]
+        hits = [ann[x] for x in ids if x in ann]
+        if not hits:
+            hits = [ann[b] for x in ids if (b := x.rsplit(".", 1)[0]) in ann]
+        if not hits:
+            continue
+        done["matched"] += 1
+        if _blank(genes[i]):
+            g = list(dict.fromkeys(h[0] for h in hits if h[0]))
+            if g:
+                genes[i] = ";".join(g)
+                done["genes"] += 1
+        if _blank(descs[i]):
+            d = [h[1] for h in hits if h[1]]
+            if d:
+                descs[i] = d[0]
+                done["descriptions"] += 1
+    tsv["Genes"] = genes
+    tsv["First.Protein.Description"] = descs
+    return done
+
+
+def annotate_from_fasta(tsv: pd.DataFrame, tsv_path: str, setting="__auto__") -> str | None:
+    """Remplit Genes depuis un FASTA quand la colonne est vide et qu'un FASTA est là.
+
+    setting : "__auto__" (défaut) ne fait rien tant que plus de la moitié des
+    protéines ont déjà un nom de gène ; un chemin force ce FASTA ; false/None
+    désactive. Rend le FASTA utilisé, ou None.
+    """
+    if setting in (None, False, "", "none", "false"):
+        return None
+    explicit = None if setting == "__auto__" else setting
+    have = 0
+    if "Genes" in tsv.columns:
+        g = tsv["Genes"].astype(str).str.strip()
+        have = int((~g.isin(["", "|", "nan", "None", "NaN"])).sum())
+    if explicit is None and len(tsv) and have > 0.5 * len(tsv):
+        return None                                   # DIA-NN a déjà les noms
+    fasta = find_annotation_fasta(tsv_path, explicit)
+    if not fasta:
+        if explicit:
+            print(f"  [WARN] Annotation FASTA not found: {explicit}")
+        return None
+    done = fill_annotation_from_fasta(tsv, fasta)
+    base = os.path.basename(fasta)
+    if not done["matched"]:
+        print(f"  [WARN] No identifier of {base} matches the pg_matrix — Genes left as is.")
+        return None
+    if done["genes"] or done["descriptions"]:
+        print(f"  [IO] Read from {base}: {done['genes']} gene names and "
+              f"{done['descriptions']} descriptions added on {len(tsv)} proteins "
+              f"({have} already named by DIA-NN, left untouched)")
+    return fasta
+
+
+def load_data(tsv_path: str, design_path: str,
+              annotation_fasta="__auto__") -> tuple[pd.DataFrame, pd.DataFrame]:
     """Lit le pg_matrix.tsv et le design expérimental."""
     print("[IO] Reading raw files...")
 
@@ -466,6 +756,10 @@ def load_data(tsv_path: str, design_path: str) -> tuple[pd.DataFrame, pd.DataFra
 
     # Design
     design = pd.read_csv(design_path, sep=";")
+
+    # Genes vide (en-têtes FASTA non-UniProt : Araport, protéome maison) -> on les
+    # lit dans le FASTA de recherche, sinon figures et GSEA restent en identifiants
+    annotate_from_fasta(tsv, tsv_path, annotation_fasta)
 
     print(f"  -> {len(tsv)} proteins loaded | {len(design)} samples in the design")
     return tsv, design
@@ -2981,6 +3275,116 @@ def run_anova_heatmaps(mat_imp: pd.DataFrame, meta: pd.DataFrame,
     return df_anova, hm_classic, hm_clusters, hm_violin, mat_zscore, cluster_mapping, sig_names
 
 
+def parse_anova_strata(design: pd.DataFrame, setting) -> dict:
+    """Rend {étiquette de strate: [conditions]} à partir de `anova_strata`.
+
+    Trois écritures :
+      · une regex   "^(T\\d+)_"  -> une strate par valeur capturée dans le nom de
+        condition (premier groupe, nommé ou non) ;
+      · un mapping  {T0: [cond, cond, ...], ...} -> les strates telles quelles ;
+      · false/None  -> aucune strate.
+    Une strate de moins de deux conditions, ou dont aucune condition n'existe,
+    est écartée avec un avertissement : une ANOVA à un groupe n'a pas de sens.
+    """
+    if setting in (None, False, "", "none", "false"):
+        return {}
+    known = list(dict.fromkeys(design["condition"].astype(str)))
+    # `design` garde les noms BRUTS du CSV (T0-Dark-Col-0) ; les contrastes, eux,
+    # portent les noms normalisés (T0_Dark_Col_0). L'utilisateur peut légitimement
+    # écrire l'une ou l'autre forme, donc les deux sont reconnues.
+    norm = {c: re.sub(r"[^0-9A-Za-z]+", "_", c) for c in known}
+    by_any = {}
+    for c in known:
+        by_any.setdefault(c, c)
+        by_any.setdefault(norm[c], c)
+    strata: dict[str, list] = {}
+    if isinstance(setting, dict):
+        for lab, conds in setting.items():
+            keep, missing = [], []
+            for c in map(str, conds):
+                (keep if c in by_any else missing).append(by_any.get(c, c))
+            if missing:
+                print(f"  [WARN] ANOVA stratum '{lab}': unknown condition(s) "
+                      f"{', '.join(missing)} — ignored.")
+            strata[str(lab)] = list(dict.fromkeys(keep))
+    else:
+        try:
+            rx = re.compile(str(setting))
+        except re.error as e:
+            print(f"  [WARN] anova_strata: invalid regex ({e}) — no stratified ANOVA.")
+            return {}
+        for c in known:
+            m = rx.search(c) or rx.search(norm[c])
+            if not m:
+                continue
+            lab = (m.groupdict() or {}).get("stratum") or (
+                m.group(1) if m.groups() else m.group(0))
+            strata.setdefault(str(lab), []).append(c)
+        if not strata:
+            print(f"  [WARN] anova_strata: the regex matches none of the "
+                  f"{len(known)} condition names (e.g. {', '.join(known[:3])}) — "
+                  "no stratified ANOVA.")
+    out = {}
+    for lab, conds in strata.items():
+        if len(conds) < 2:
+            print(f"  [WARN] ANOVA stratum '{lab}': {len(conds)} condition — skipped "
+                  "(an ANOVA needs at least two groups).")
+            continue
+        out[lab] = conds
+    return out
+
+
+def run_anova_strata(mat_imp: pd.DataFrame, meta: pd.DataFrame, design: pd.DataFrame,
+                     params: dict, out_dir: str) -> dict:
+    """Une ANOVA et ses heatmaps par strate, EN PLUS de l'ANOVA globale.
+
+    Chaque strate est un sous-ensemble de conditions (par exemple un temps) : le
+    F-test n'y compare que ces groupes et la variance résiduelle n'est poolée que
+    sur leurs échantillons. C'est le but — l'effet cherché est local — mais c'est
+    aussi le prix : beaucoup moins de degrés de liberté résiduels que l'ANOVA
+    globale, donc moins de puissance. Le BH est propre à chaque strate, ce qui est
+    correct : chaque ANOVA est sa propre famille de tests.
+
+    La matrice imputée est celle du run complet : l'imputation profite de tous les
+    échantillons, seul le test est restreint.
+    """
+    strata = parse_anova_strata(design, params.get("anova_strata"))
+    if not strata:
+        return {}
+    print(f"\n[STEP] Stratified ANOVA ({len(strata)} strata)...")
+    sub_dir = os.path.join(out_dir, "anova_strata")
+    os.makedirs(sub_dir, exist_ok=True)
+    results = {}
+    for lab, conds in strata.items():
+        keep = design["condition"].astype(str).isin(conds).values
+        d_sub = design.loc[keep].reset_index(drop=True)
+        m_sub = mat_imp.loc[:, keep]
+        n_grp = d_sub["condition"].nunique()
+        df_res = len(d_sub) - n_grp
+        print(f"  - {lab}: {n_grp} groups, {len(d_sub)} samples, {df_res} residual df")
+        if df_res < 2:
+            print(f"    [WARN] only {df_res} residual degree(s) of freedom — skipped.")
+            continue
+        safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(lab))[:24] or "stratum"
+        s_dir = os.path.join(sub_dir, safe)
+        os.makedirs(s_dir, exist_ok=True)        # run_anova_heatmaps n'écrit que dedans
+        try:
+            out = run_anova_heatmaps(m_sub, meta, d_sub, params, s_dir)
+        except Exception as e:                       # une strate qui échoue n'arrête rien
+            print(f"    [WARN] stratum '{lab}' failed ({type(e).__name__}: {e}) — skipped.")
+            continue
+        df_a, hm_c, hm_k, hm_v, _z, cmap, sig = out
+        df_a = df_a.copy()
+        df_a.insert(0, "stratum", lab)
+        results[lab] = dict(table=df_a, classic=hm_c, clusters=hm_k, violin=hm_v,
+                            n_sig=int(len(sig)), conditions=conds,
+                            n_samples=int(len(d_sub)), df_resid=int(df_res))
+    if results:
+        tot = ", ".join(f"{k} {v['n_sig']}" for k, v in results.items())
+        print(f"  [OK] Stratified ANOVA significant proteins — {tot}")
+    return results
+
+
 def _draw_heatmap_pch(mat_z, row_names, sample_labels, conditions, cmap_cond,
                       title, out_path, show_row_names=True,
                       row_split_labels=None):
@@ -3953,7 +4357,8 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
                  go_enabled: bool = False, go_organism: str = None,
                  n_iter: int = 100, use_deqms: bool = False,
                  mat_imp: pd.DataFrame = None, umap_coords: pd.DataFrame = None,
-                 imputation_info: pd.DataFrame = None, pca_loadings_file: str = None):
+                 imputation_info: pd.DataFrame = None, pca_loadings_file: str = None,
+                 anova_strata: dict | None = None):
     """Assemble le classeur Excel multionglets."""
     print("\n[EXCEL] Generating the Excel file...")
     wb = openpyxl.Workbook()
@@ -4203,6 +4608,18 @@ def export_excel(tsv: pd.DataFrame, df_results: pd.DataFrame,
     insert_img(ws, hm_clusters, row=2, col=base_c, max_w_px=900, max_h_px=1100)
     insert_img(ws, hm_violin,   row=2, col=base_c + IMG_COL_STEP + 5,
                max_w_px=900, max_h_px=600)
+
+    # --- ANOVA par strate (une feuille par strate, après l'ANOVA globale) ---
+    for lab, r in (anova_strata or {}).items():
+        safe = re.sub(r"[^0-9A-Za-z_]+", "_", str(lab))[:20]
+        ws = wb.create_sheet(f"ANOVA_{safe}"[:31])
+        write_df(ws, r["table"])
+        base_c = r["table"].shape[1] + 2
+        insert_img(ws, r["classic"], row=2, col=base_c, max_w_px=900, max_h_px=1100)
+        insert_img(ws, r["clusters"], row=2, col=base_c + IMG_COL_STEP + 5,
+                   max_w_px=900, max_h_px=1100)
+        insert_img(ws, r["violin"], row=2, col=base_c + 2 * (IMG_COL_STEP + 5),
+                   max_w_px=900, max_h_px=600)
 
     wb.save(out_path)
     print(f"  [OK] Excel file saved: {out_path}")
@@ -4915,7 +5332,8 @@ def main():
         sys.exit(1)
 
     # --- 1. Chargement ---
-    tsv, design = load_data(tsv_path, design_path)
+    tsv, design = load_data(tsv_path, design_path,
+                            params.get("annotation_fasta", "__auto__"))
 
     # --- 1ter. Pré-vol STRING : taxid validé/détecté AVANT les stats ---
     # Échec rapide plutôt qu'au GO après tout le pipeline. Pour les bactéries,
@@ -5831,6 +6249,9 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         mat_imp, meta_filt, design_filt, params, out_dir
     )
 
+    # --- 10ter. ANOVA stratifiée (une par strate, en plus de la globale) ---
+    anova_strata_res = run_anova_strata(mat_imp, meta_filt, design_filt, params, out_dir)
+
     # --- 10bis. PCA : score plot + loading plot (après l'ANOVA : couleurs = clusters) ---
     print("\n[STEP] PCA loading plot...")
     pca_load_file, pca_loadings, pca_scores = plot_pca_loadings(
@@ -5890,6 +6311,7 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
 
     export_excel(
         tsv=tsv, df_results=df_results, df_anova=df_anova,
+        anova_strata=anova_strata_res,
         df_intersections=df_intersections, mat_zscore=mat_zscore,
         meta=meta_filt, sig_names=sig_names, contrast_names=contrast_names,
         design=design_filt, params=params,

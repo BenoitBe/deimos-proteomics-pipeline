@@ -10,6 +10,82 @@ Repository: https://github.com/BenoitBe/deimos-proteomics-pipeline
 This release bundles new statistical capabilities, several correctness fixes,
 and dashboard improvements accumulated since the previous public version.
 
+### Added
+
+- **Gene names read from the search FASTA when DIA-NN leaves them empty**
+  (`annotation_fasta: "__auto__"`). DIA-NN fills `Genes` and
+  `First.Protein.Description` only when the FASTA headers follow the UniProt
+  convention; with an Araport/TAIR proteome or an in-house FASTA the columns come
+  back empty and every figure, the GSEA ranking and the GO query then carry bare
+  identifiers (`AT1G01050.1`) instead of gene names. Deimos now reads the headers
+  of the search FASTA itself and fills **only the empty cells** — what DIA-NN
+  found is never overwritten, and no file is ever written back.
+  - Headers understood: Araport/TAIR (`>AT1G01010.1 | Symbols: NAC001, ... | NAC
+    domain containing protein 1 | ...`), UniProt (`>sp|P12345|NAME GN=XXX`) and
+    plain `>ID description`. Identifiers are indexed with and without their
+    isoform suffix, because DIA-NN may report either.
+  - `"__auto__"` (default) only acts when more than half of the proteins have no
+    gene name, and picks the largest real FASTA sitting next to the pg_matrix
+    (a file whose first line is not `>` is ignored). A path forces one FASTA;
+    `false` disables the step.
+  - Reported in one line: how many gene names and descriptions were added, and
+    how many DIA-NN had already named. When no identifier of the FASTA matches
+    the pg_matrix (a FASTA of another species left in the folder), nothing is
+    touched and a warning says so.
+  - Validated on a real Arabidopsis run (Araport11, 9798 protein groups):
+    9753 gene names and 9594 descriptions recovered, 0 previously named.
+  - `tests/test_annotation_fasta.py` (6 tests).
+
+- **Stratified ANOVA: one ANOVA + heatmaps per subgroup** (`anova_strata`), in addition
+  to the global one, which is unchanged. The global ANOVA compares every condition at
+  once and pools the residual variance over all samples; when the question is local
+  ("do the genotypes differ AT EACH TIME POINT?"), that is the wrong test.
+  - Asked at launch (question `[2b/2]`): Deimos reads the design file before the run
+    and proposes the splits it finds in the condition names — no project-specific
+    code. Each separator-delimited position (from the left, then from the right)
+    becomes a candidate when it has 2 to 12 values, each seen at least twice, covering
+    every condition; unbalanced candidates are dropped as soon as a balanced one
+    exists, since they almost always come from a name cut in the wrong place
+    (`OMP-like-Col6D` → `OMP` / `Col`). A free regex is always offered, and checked
+    against the real condition names before being accepted.
+  - In a config file: `anova_strata: "^(T\\d+)[-_]"` (first capture group names the
+    stratum) or `anova_strata: {T0: [cond, cond], T3: [...]}`, or `false` (default).
+    Both the raw CSV spelling (`T0-Dark-Col-0`) and the normalised one
+    (`T0_Dark_Col_0`) are accepted, and a regex matching nothing says so instead of
+    doing nothing.
+  - Outputs: one `ANOVA_<stratum>` sheet with its three figures, and the PNGs under
+    `out_dir/anova_strata/<stratum>/`. BH is per stratum — each ANOVA is its own
+    family of tests. A stratum with fewer than 2 residual degrees of freedom, or one
+    that fails, is skipped with a warning instead of stopping the run.
+  - The cost is power: on a 3 genotypes x 4 times x 4 replicates design, 35 residual
+    degrees of freedom globally against 9 per time point.
+  - `tests/test_anova_strata.py` (11 tests).
+
+### Fixed
+
+- **Python version floor is now tested.** Every module is compiled with the oldest
+  interpreter available on the machine (`tests/test_python_version_floor.py`). Since
+  3.12 (PEP 701) an f-string may contain a line break inside its expression and reuse
+  the same quotes; code written on a recent machine then fails to even parse on 3.11,
+  and the error only shows at run time. A sandbox running 3.13 cannot see it.
+- **Dashboard QC: "Proteins with imputation" always read 0 %** with recent pandas. The
+  `imputed` column holds `VRAI`/`FAUX`, and the card tested `dtype == object` to pick
+  the text branch; since pandas 2.1 (`infer_string`) and by default in pandas 3.0 a text
+  column has dtype `str`, so the numeric branch ran, turned `VRAI` into `NaN` then `0`,
+  and the dashboard reported 0 % imputation while `num_NAs` said otherwise (24 % on a
+  real run). The test now goes through `is_bool_dtype` / `is_numeric_dtype`, text being
+  the default case.
+- **Dashboard QC: "Mean NA per protein" used an absolute threshold** (`< 2` = OK)
+  regardless of the number of samples. 2.83 NA/protein is 6 % of the values on 47
+  samples (good) but 47 % on 6 (bad). The status now follows the share of missing
+  values (OK < 10 %, WARN < 25 %, FAIL above); the absolute number is still displayed
+  and the detail line gives the percentage and the sample count.
+- **A Pathfinder step skipped in silence.** Pathfinder writes its warnings to its own
+  log and carries on, so a whole tab could vanish from the report with nothing said in
+  Deimos' output. Deimos now relays those lines (`[WARN] Pathfinder: ...`) after a
+  successful run, and Pathfinder's own message names the missing `reading/` folder when
+  the biological reading cannot be imported.
+
 ### Changed
 
 - **Primary statistic: imputation-free DPC analysis by default** (`primary_statistic: dpc`).
