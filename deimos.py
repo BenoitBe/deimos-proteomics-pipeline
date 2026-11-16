@@ -47,7 +47,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from limma_ebayes import (lm_fit, contrasts_fit, ebayes, top_table,
                            spectra_count_ebayes,
                            make_all_contrasts, make_design_matrix,
-                           make_paired_design_matrix, detect_control_condition)
+                           make_paired_design_matrix, detect_control_condition,
+                           add_covariate_columns)
 
 # Module GO/gProfiler optionnel (import protégé : si absent, le pipeline tourne)
 try:
@@ -722,6 +723,57 @@ def annotate_from_fasta(tsv: pd.DataFrame, tsv_path: str, setting="__auto__") ->
               f"{done['descriptions']} descriptions added on {len(tsv)} proteins "
               f"({have} already named by DIA-NN, left untouched)")
     return fasta
+
+
+DASHBOARD_DEFAULT_NAME = "Proteomic_dashboard.html"
+
+# Nom utilisé jusqu'au 12/11/2026. Conservé parce que l'étape de nettoyage doit
+# continuer à épargner un dashboard écrit par un run antérieur, et parce que des
+# configs existantes le mentionnent explicitement.
+DASHBOARD_LEGACY_NAME = "proteogen_dashboard.html"
+
+
+def dashboard_filename(params: dict) -> str:
+    """Nom du dashboard HTML, depuis `dashboard_filename`.
+
+    Seul un NOM de fichier est accepté : tout chemin est réduit à son dernier
+    segment, pour que le dashboard reste dans out_dir et qu'une valeur de config
+    ne puisse pas écrire ailleurs. L'extension .html est ajoutée si elle manque,
+    et les caractères interdits sous Windows sont remplacés par '_'.
+    """
+    raw = (params or {}).get("dashboard_filename") or DASHBOARD_DEFAULT_NAME
+    name = os.path.basename(str(raw).strip().replace("\\", "/").rstrip("/"))
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return DASHBOARD_DEFAULT_NAME
+    if not name.lower().endswith((".html", ".htm")):
+        name += ".html"
+    return name
+
+
+VOLCANO_DEFAULT_SUBDIR = "Volcanos"
+
+
+def volcano_dir(params: dict, out_dir: str, create: bool = True) -> str:
+    """Dossier où écrire les volcanos, depuis `volcano_subdir`.
+
+    Renvoie `out_dir/<sous-dossier>`, ou `out_dir` lui-même quand la clé vaut
+    "" / false / None (comportement d'avant le 12/11/2026). Comme pour
+    `dashboard_filename`, seul un NOM de dossier est retenu : tout chemin est
+    réduit à son dernier segment, pour qu'une valeur de config ne puisse pas
+    faire écrire ailleurs que dans out_dir.
+    """
+    raw = (params or {}).get("volcano_subdir", VOLCANO_DEFAULT_SUBDIR)
+    if raw is False or raw is None:
+        return out_dir
+    name = os.path.basename(str(raw).strip().replace("\\", "/").rstrip("/"))
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return out_dir
+    path = os.path.join(out_dir, name)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
 
 
 def load_data(tsv_path: str, design_path: str,
@@ -2087,6 +2139,113 @@ def warn_design(design: pd.DataFrame) -> "dict | None":
     return pr
 
 
+def apply_batch_covariate(design_mat, all_cols, conditions,
+                          design: pd.DataFrame, params: dict,
+                          info_out: "dict | None" = None):
+    """
+    Ajoute la covariable de lot (cle `batch_column`) a la design matrix, si la
+    cle est renseignee, la colonne presente dans le plan et l'effet separable
+    des conditions.
+
+    Jusqu'au 16/11/2026 `batch_column` etait lue par la configuration et
+    documentee dans le README, mais n'entrait dans AUCUN modele : le lot etait
+    declare sans jamais etre controle. Il est desormais modelise comme terme de
+    nuisance (one-hot, premier niveau en reference), exactement comme le terme
+    'subject' d'un design apparie : la variance de lot est absorbee par le
+    modele, les contrastes ne portent que sur les conditions, et aucune valeur
+    de la matrice d'expression n'est modifiee -- ce n'est PAS une correction de
+    matrice type ComBat/removeBatchEffect, qui reecrit les intensites et biaise
+    ensuite toute analyse non supervisee.
+
+    Composee avec le design standard (~0 + condition) comme avec le design
+    apparie (~0 + condition + subject), les colonnes de nuisance restant apres
+    les conditions pour que make_all_contrasts(..., n_total_cols=...) pade les
+    contrastes a zero sur ces colonnes.
+
+    `info_out`, s'il est fourni, recoit la colonne reellement resolue, les
+    valeurs nettoyees et un drapeau `applied` -- meme motif que `model_out`
+    dans run_differential_analysis. Il sert au diagnostic PCA, qui doit savoir
+    sur quelle colonne porter.
+
+    Returns
+    -------
+    (design_mat, all_cols) -- inchanges si la covariable ne s'applique pas.
+    Sort en erreur (exit 1) si le lot est confondu avec la condition :
+    l'effet est alors inseparable et le "corriger" effacerait l'effet
+    biologique recherche.
+    """
+    raw = params.get("batch_column")
+    if not raw:
+        return design_mat, all_cols
+
+    col = str(raw).strip()
+    if col not in design.columns:
+        match = [c for c in design.columns if str(c).strip().lower() == col.lower()]
+        if match:
+            col = match[0]
+        else:
+            print(f"  [WARN] batch_column='{raw}' absent du plan "
+                  f"(colonnes disponibles : {list(design.columns)}) "
+                  f"-- covariable ignoree.")
+            return design_mat, all_cols
+
+    vals = design[col].astype(str).str.strip()
+    n_na = int(design[col].isna().sum() + vals.isin(["", "nan", "NaN", "None", "NA"]).sum())
+    if n_na > 0:
+        print(f"  [WARN] {n_na} echantillon(s) sans valeur de lot dans '{col}' "
+              f"-- covariable ignoree (plan incomplet ; verifiez le separateur "
+              f"du CSV, ';' attendu).")
+        return design_mat, all_cols
+
+    values = vals.values
+    n_levels = int(pd.Series(values).nunique())
+    if n_levels < 2:
+        print(f"  [WARN] batch_column='{col}' n'a qu'un seul niveau "
+              f"-- rien a controler, covariable ignoree.")
+        return design_mat, all_cols
+    if n_levels == len(values):
+        print(f"  [WARN] batch_column='{col}' a autant de niveaux "
+              f"({n_levels}) que d'echantillons -- non identifiable, "
+              f"covariable ignoree.")
+        return design_mat, all_cols
+
+    ext_mat, ext_cols = add_covariate_columns(design_mat, list(all_cols),
+                                              list(values), prefix=str(col))
+    if len(ext_cols) == len(all_cols):          # refusee en interne
+        return design_mat, all_cols
+
+    # --- Controle de confusion lot / condition -------------------------------
+    # Un lot entierement imbrique dans la condition rend la matrice singuliere :
+    # le modele ne peut plus distinguer le lot de l'effet biologique. On refuse
+    # plutot que d'avaler silencieusement une matrice de rang deficient.
+    rank = int(np.linalg.matrix_rank(ext_mat))
+    if rank < ext_mat.shape[1]:
+        tab = pd.crosstab(pd.Series(list(conditions), name="condition"),
+                          pd.Series(values, name=str(col)))
+        single = [c for c in tab.index if int((tab.loc[c] > 0).sum()) == 1]
+        print(f"\n  [ERROR] batch_column='{col}' est confondu avec la condition : "
+              f"la design matrix etendue n'est pas de rang plein "
+              f"({rank} < {ext_mat.shape[1]} colonnes). L'effet de lot et l'effet "
+              f"biologique sont inseparables ; les modeliser ensemble effacerait "
+              f"l'effet recherche.")
+        if single:
+            print(f"  [ERROR] Condition(s) presente(s) dans un SEUL lot : {single}")
+        print(f"  [ERROR] Croisement condition x {col} :\n{tab.to_string()}")
+        print(f"  [ERROR] Corrigez le plan (repartir chaque condition sur "
+              f"plusieurs lots) ou retirez batch_column de la configuration.")
+        sys.exit(1)
+
+    n_terms = len(ext_cols) - len(all_cols)
+    print(f"[MODEL] Covariable de lot '{col}' : {n_levels} niveaux, "
+          f"{n_terms} terme(s) de nuisance absorbe(s) "
+          f"(matrice d'expression inchangee).")
+    if info_out is not None:
+        info_out.update({"applied": True, "column": str(col),
+                         "values": list(values), "n_levels": n_levels,
+                         "n_terms": n_terms})
+    return ext_mat, ext_cols
+
+
 def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
                                meta: pd.DataFrame, design: pd.DataFrame,
                                params: dict, out_dir: str, n_iter: int = 100,
@@ -2173,15 +2332,26 @@ def run_differential_analysis(mat_imp: pd.DataFrame, mat_filt: pd.DataFrame,
     if paired:
         design_mat, group_names, all_cols = make_paired_design_matrix(
             conditions.tolist(), subjects.tolist(), control_condition=control_condition)
-        contrast_mat, contrast_names = make_all_contrasts(
-            group_names, n_total_cols=len(all_cols))
         n_subj_terms = len(all_cols) - len(group_names)
         print(f"\n[MODEL] PAIRED design (~0 + condition + subject): "
               f"{n_subj} subjects, {n_subj_terms} subject terms absorbed.")
     else:
         design_mat, group_names = make_design_matrix(
             conditions.tolist(), control_condition=control_condition)
-        contrast_mat, contrast_names = make_all_contrasts(group_names)
+        all_cols = list(group_names)
+
+    # --- Covariable de lot (cle `batch_column`) : terme de nuisance ajoute
+    #     APRES le design (standard ou apparie) et AVANT les contrastes, pour
+    #     que ceux-ci ne portent que sur les colonnes de condition. ---
+    batch_info: dict = {}
+    design_mat, all_cols = apply_batch_covariate(
+        design_mat, all_cols, conditions, design, params, info_out=batch_info)
+    if batch_info.get("applied"):
+        plot_batch_diagnostic(mat_imp, design, batch_info["values"],
+                              batch_info["column"], out_dir)
+
+    contrast_mat, contrast_names = make_all_contrasts(
+        group_names, n_total_cols=len(all_cols))
 
     # --- Sélection des contrastes (clé YAML `contrasts`) : appliquée ICI,
     #     avant le modèle, donc propagée à tout l'aval (FDR, robustesse,
@@ -2522,7 +2692,11 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
     """
     Génère les volcanos individuels + le facet volcano universel.
     Seuils = seuils volcanos (= seuils robustness). Axe Y : cf. volcano_axis.
+
+    Les PNG vont dans le sous-dossier donné par `volcano_subdir` (défaut
+    "Volcanos"), ou directement dans out_dir si la clé est vide.
     """
+    volc_dir = volcano_dir(params, out_dir)
     thresh = params["volcano_p_thresh"]
     lfc    = params["volcano_lfc_min"]
     stat_name = "p.adj" if params["volcano_use_padj"] else "p.value"
@@ -2615,7 +2789,7 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
                      fontsize=10)
         ax.legend(fontsize=7, loc="best", framealpha=0.85)
         fig.tight_layout()
-        f = os.path.join(out_dir, f"volc_{cname}.png")
+        f = os.path.join(volc_dir, f"volc_{cname}.png")
         fig.savefig(f, dpi=150)
         plt.close(fig)
         indiv_files.append(f)
@@ -2664,10 +2838,12 @@ def plot_volcanoes(df_results: pd.DataFrame, contrast_names: list,
                  f"threshold {rule_txt}{line_txt}", fontsize=11, fontweight="bold")
     fig.tight_layout(rect=[0, 0.02, 1, 0.97])
 
-    f_facet = os.path.join(out_dir, "all_volcano_plots_grid.png")
+    f_facet = os.path.join(volc_dir, "all_volcano_plots_grid.png")
     fig.savefig(f_facet, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [OK] Facet volcano saved ({n_c} contrasts)")
+    where = (f" -> {os.path.basename(volc_dir)}/"
+             if os.path.abspath(volc_dir) != os.path.abspath(out_dir) else "")
+    print(f"  [OK] Facet volcano saved ({n_c} contrasts){where}")
 
     return indiv_files, f_facet
 
@@ -2735,6 +2911,150 @@ def plot_pca(mat_imp: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         files.append(f)
 
     return files
+
+
+def _kruskal_eps2(values: np.ndarray, groups) -> tuple:
+    """Kruskal-Wallis + taille d'effet epsilon^2 (Tomczak & Tomczak 2014).
+
+    eps^2 = H * (n + 1) / (n^2 - 1), borne a [0, 1] : part de la variance de
+    rang expliquee par le facteur. Non parametrique -- on ne suppose rien sur
+    la distribution des scores de PC, qui n'ont aucune raison d'etre gaussiens.
+    Retourne (H, p, eps2) ou (nan, nan, nan) si le test n'est pas calculable.
+    """
+    g = pd.Series(list(groups)).astype(str).values
+    levels = [l for l in pd.unique(g) if (g == l).sum() >= 1]
+    samples = [np.asarray(values)[g == l] for l in levels]
+    n = len(values)
+    k = len(samples)
+    if k < 2 or n <= k or any(len(s) < 1 for s in samples):
+        return float("nan"), float("nan"), float("nan")
+    try:
+        with warnings.catch_warnings():      # variance nulle -> H = NaN, pas d'erreur
+            warnings.simplefilter("ignore", RuntimeWarning)
+            H, p = stats.kruskal(*samples)
+    except ValueError:                       # toutes les valeurs identiques
+        return float("nan"), float("nan"), float("nan")
+    if H != H:
+        return float("nan"), float("nan"), float("nan")
+    eps2 = float(np.clip(H * (n + 1) / (n ** 2 - 1), 0.0, 1.0))
+    return float(H), float(p), eps2
+
+
+def plot_batch_diagnostic(mat_imp: pd.DataFrame, design: pd.DataFrame,
+                          batch_values, batch_col: str, out_dir: str,
+                          n_pc: int = 5) -> "str | None":
+    """Le lot structure-t-il les donnees plus que la condition ?
+
+    Diagnostic a lire AVANT d'interpreter quoi que ce soit : sur la meme PCA
+    que `plot_pca`, on teste l'association de chaque composante au lot et a la
+    condition (Kruskal-Wallis, taille d'effet epsilon^2). Ce n'est pas un
+    avant/apres : Deimos ne reecrit jamais la matrice d'expression, le lot est
+    modelise comme terme de nuisance (cf. apply_batch_covariate). La figure dit
+    seulement de combien de structure de lot le modele doit s'occuper.
+
+    Lecture :
+      - epsilon^2(lot) faible sur toutes les PC  -> lot negligeable, la
+        covariable coute des degres de liberte pour rien ;
+      - epsilon^2(lot) eleve sur les PC de tete  -> le lot domine la variance,
+        la covariable est justifiee ;
+      - epsilon^2(lot) et epsilon^2(condition) eleves sur la MEME PC ->
+        confusion partielle : lire le croisement condition x lot avant tout.
+    """
+    try:
+        fit = _pca_fit(mat_imp)
+    except Exception as e:                   # PCA impossible : on n'echoue pas
+        print(f"  [WARN] Batch diagnostic skipped ({type(e).__name__}: {e})")
+        return None
+
+    coords, var_exp = fit["coords"], fit["var_exp"]
+    conditions = np.asarray(design["condition"].values).astype(str)
+    batches    = np.asarray(list(batch_values)).astype(str)
+    labels     = np.asarray(design["label"].values) if "label" in design.columns \
+                 else np.array([f"S{i+1}" for i in range(len(conditions))])
+    k = int(min(n_pc, coords.shape[1]))
+    if k < 1:
+        return None
+
+    rows = []
+    for i in range(k):
+        _, p_b, e_b = _kruskal_eps2(coords[:, i], batches)
+        _, p_c, e_c = _kruskal_eps2(coords[:, i], conditions)
+        rows.append({"pc": f"PC{i+1}", "var": float(var_exp[i]),
+                     "p_batch": p_b, "eps2_batch": e_b,
+                     "p_cond": p_c, "eps2_cond": e_c})
+
+    # --- Console : le chiffre compte plus que la figure dans un log de run ---
+    print(f"  [BATCH] Structure de lot sur la PCA ('{batch_col}') :")
+    for r in rows:
+        def _f(x, fmt="{:.2f}"):
+            return "n/a" if x != x else fmt.format(x)
+        print(f"    {r['pc']} ({r['var']*100:5.1f}% var) | "
+              f"lot eps2={_f(r['eps2_batch'])} p={_f(r['p_batch'], '{:.1e}')} | "
+              f"condition eps2={_f(r['eps2_cond'])} p={_f(r['p_cond'], '{:.1e}')}")
+    worst = max((r for r in rows if r["eps2_batch"] == r["eps2_batch"]),
+                key=lambda r: r["eps2_batch"], default=None)
+    if worst is not None and worst["eps2_batch"] >= 0.5 and \
+       worst["eps2_batch"] > worst.get("eps2_cond", 0):
+        print(f"  [WARN] Sur {worst['pc']}, le lot explique PLUS de variance "
+              f"que la condition (eps2 {worst['eps2_batch']:.2f} vs "
+              f"{worst['eps2_cond']:.2f}) : verifiez le croisement "
+              f"condition x {batch_col} avant d'interpreter les contrastes.")
+
+    # --- Figure ----------------------------------------------------------
+    cmap_b = _condition_colors(batches)
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+    cond_lv = list(pd.unique(conditions))
+    mk = {c: markers[i % len(markers)] for i, c in enumerate(cond_lv)}
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    ax = axes[0]
+    for b in pd.unique(batches):
+        for c in cond_lv:
+            m = (batches == b) & (conditions == c)
+            if not m.any():
+                continue
+            ax.scatter(coords[m, 0], coords[m, 1], color=cmap_b[b], marker=mk[c],
+                       s=70, alpha=0.9, zorder=3, edgecolor="white", linewidth=0.6)
+    for xi, yi, li in zip(coords[:, 0], coords[:, 1], labels):
+        ax.annotate(li, (xi, yi), fontsize=6, alpha=0.65,
+                    xytext=(3, 3), textcoords="offset points")
+    ax.axhline(0, color="grey", lw=0.5)
+    ax.axvline(0, color="grey", lw=0.5)
+    ax.set_xlabel(f"PC1 ({var_exp[0]*100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({var_exp[1]*100:.1f}%)" if len(var_exp) > 1 else "PC2")
+    ax.set_title(f"A. PCA — couleur = {batch_col}, forme = condition")
+    handles = [plt.Line2D([], [], marker="o", ls="", color=cmap_b[b],
+                          label=f"{batch_col}={b}") for b in pd.unique(batches)]
+    handles += [plt.Line2D([], [], marker=mk[c], ls="", color="0.35", label=c)
+                for c in cond_lv]
+    ax.legend(handles=handles, fontsize=7, bbox_to_anchor=(1.01, 1), loc="upper left")
+
+    ax = axes[1]
+    x = np.arange(len(rows))
+    w = 0.38
+    eb = [0 if r["eps2_batch"] != r["eps2_batch"] else r["eps2_batch"] for r in rows]
+    ec = [0 if r["eps2_cond"] != r["eps2_cond"] else r["eps2_cond"] for r in rows]
+    ax.bar(x - w / 2, eb, w, label=f"{batch_col} (lot)", color="#C1666B")
+    ax.bar(x + w / 2, ec, w, label="condition", color="#4F6D7A")
+    for i, r in enumerate(rows):
+        for off, pv, ev in ((-w / 2, r["p_batch"], eb[i]), (w / 2, r["p_cond"], ec[i])):
+            if pv == pv and pv < 0.05:
+                ax.text(i + off, ev + 0.02, "*", ha="center", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{r['pc']}\n{r['var']*100:.0f}%" for r in rows], fontsize=8)
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel("epsilon² (Kruskal-Wallis)")
+    ax.set_title("B. Variance de rang expliquée par PC (* p < 0.05)")
+    ax.legend(fontsize=8)
+    fig.text(0.5, -0.02,
+             "Aucune valeur d'expression n'est modifiée : le lot est modélisé comme "
+             "terme de nuisance, pas soustrait de la matrice.",
+             ha="center", fontsize=7.5, style="italic", color="0.35")
+    fig.tight_layout()
+    f = os.path.join(out_dir, "diagnostic_batch.png")
+    fig.savefig(f, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return f
 
 
 def pca_drivers(L: np.ndarray, coords: np.ndarray, conditions, n_total: int) -> dict:
@@ -6457,7 +6777,7 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     # --- 15. Dashboard HTML interactif (optionnel, non bloquant) ---
     if make_dash and _DASHBOARD_AVAILABLE:
         print("\n[STEP] Generating the interactive HTML dashboard...")
-        dash_out = os.path.join(out_dir, "proteogen_dashboard.html")
+        dash_out = os.path.join(out_dir, dashboard_filename(params))
         result = run_dashboard(output_name, design_filt, dash_out, params=params)
         if result:
             print(f"  [OK] Dashboard generated: {result}")
@@ -6493,8 +6813,8 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     # car souvent réutilisés individuellement pour les figures d'article.
     print("\n[CLEAN] Removing temporary figures...")
     keep_prefixes = ("volc_",)              # volcanos individuels conservés
-    keep_exact = {"proteogen_dashboard.html",
-                  "ProteomicAnalysis_Results.xlsx"}
+    keep_exact = {dashboard_filename(params), DASHBOARD_DEFAULT_NAME,
+                  DASHBOARD_LEGACY_NAME, "ProteomicAnalysis_Results.xlsx"}
     removed = 0
     for fn in os.listdir(out_dir):
         if not fn.lower().endswith((".png", ".tiff", ".tif")):
@@ -6510,8 +6830,29 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
             removed += 1
         except OSError:
             pass
-    print(f"  [OK] {removed} temporary figures removed "
-          f"(individual volcanos kept).")
+
+    # Le sous-dossier des volcanos n'est pas balayé par la boucle ci-dessus
+    # (os.listdir ne descend pas). Les copies redimensionnées pour l'Excel y
+    # sont pourtant créées, à côté de leur original : on les y supprime donc
+    # explicitement. Les volcanos eux-mêmes et le facet sont conservés.
+    volc_dir = volcano_dir(params, out_dir, create=False)
+    if os.path.abspath(volc_dir) != os.path.abspath(out_dir) and os.path.isdir(volc_dir):
+        for fn in os.listdir(volc_dir):
+            if not fn.lower().endswith((".png", ".tiff", ".tif")):
+                continue
+            if not ("_xl" in fn and "x" in fn.split("_xl")[-1]):
+                continue
+            try:
+                os.remove(os.path.join(volc_dir, fn))
+                removed += 1
+            except OSError:
+                pass
+        kept = len([f for f in os.listdir(volc_dir) if f.lower().endswith(".png")])
+        print(f"  [OK] {removed} temporary figures removed "
+              f"({kept} volcanos kept in {os.path.basename(volc_dir)}/).")
+    else:
+        print(f"  [OK] {removed} temporary figures removed "
+              f"(individual volcanos kept).")
 
 
 if __name__ == "__main__":

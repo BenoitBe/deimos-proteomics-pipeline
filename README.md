@@ -52,8 +52,12 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
   - **pseudo-replication check**: warning (console + Methods) when a subject has several samples in
     the same condition — those samples are not independent replicates. Warning only: the model is
     not modified
-  - optional **batch covariate** (`batch_column`), modelled in the design (not a matrix correction
-    reused for testing), with a before/after PCA diagnostic (Kruskal-Wallis + ε²)
+  - optional **batch covariate** (`batch_column`), modelled in the design as a nuisance term
+    (one-hot, first level as reference) — never a matrix correction: no expression value is
+    rewritten, so the unsupervised views stay honest. A run is **refused** when the batch is
+    confounded with the condition (rank-deficient design), with the condition × batch crosstab
+    printed. Comes with `diagnostic_batch.png`: the same PCA as `plot_pca`, testing each PC
+    against batch and against condition (Kruskal-Wallis, ε² effect size)
 - **QC-only mode** (`qc_only` / `--qc-only`), enabled automatically when no condition has a
   replicate: raw data, Methods and QC figures, no statistics
 - Automatic **multi-organism detection** (UniProt-style `_TAG` suffix in `Protein.Names`, e.g.
@@ -412,7 +416,10 @@ deimos-proteomics-pipeline/
 proteomics_output/
 ├── ProteomicAnalysis_Results.xlsx   # Full multi-sheet report
 ├── ProteomicAnalysis_QC.xlsx        # QC-only mode (instead of the above)
-├── proteogen_dashboard.html         # Interactive dashboard (light/dark toggle)
+├── Proteomic_dashboard.html         # Interactive dashboard (light/dark toggle, day by
+│                                    #   default). Renamed with `dashboard_filename`
+├── Volcanos/                        # volc_<contrast>.png + all_volcano_plots_grid.png.
+│                                    #   Folder set by `volcano_subdir` ("" = out_dir root)
 ├── matrices/                        # export_matrices: protein x sample TSV matrices + README
 ├── string_orthologs/                # STRING orthology mode: proteome cache + DIAMOND files
 ├── perseverance/                    # Perseverance: DIAMOND outputs, orthologue table
@@ -456,7 +463,7 @@ contrasts:            "__auto__"  # "__auto__", "all", or a list of patterns:
 #  - "Live_*_vs_Live_*"              # *   = any value
 
 control_condition:    "__auto__"  # "__auto__" (auto-detect), an explicit name, or false
-batch_column:         null        # column of ExperimentalDesign.csv modelled as a covariate
+batch_column:         null        # column of ExperimentalDesign.csv modelled as a nuisance covariate
 use_deqms:            false       # DEqMS, gated by the automatic reliability diagnostic
 
 go_organism:          null        # gProfiler species code (e.g. "bnapus"), null = disabled

@@ -8,9 +8,11 @@
 (function(){
   try{
     var saved=localStorage.getItem('deimos-theme');
-    var theme=saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    // Jour par défaut à l'ouverture. Le choix de l'utilisateur, lui, est
+    // toujours respecte : il est relu dans localStorage avant ce défaut.
+    var theme=(saved==='light'||saved==='dark') ? saved : 'light';
     document.documentElement.setAttribute('data-theme', theme);
-  }catch(e){document.documentElement.setAttribute('data-theme','dark');}
+  }catch(e){document.documentElement.setAttribute('data-theme','light');}
 })();
 </script>
 <title>Proteogen — Proteomics Dashboard</title>
@@ -515,7 +517,7 @@ function toggleTheme(){
 }
 // Icone initiale cohérente avec le thème déjà appliqué par le script du <head>
 document.addEventListener('DOMContentLoaded',()=>{
-  const cur=document.documentElement.getAttribute('data-theme')||'dark';
+  const cur=document.documentElement.getAttribute('data-theme')||'light';
   const btn=document.getElementById('themeToggleBtn');
   if(btn) btn.textContent = cur==='light' ? '☀️' : '🌙';
 });
