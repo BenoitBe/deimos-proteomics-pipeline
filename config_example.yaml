@@ -127,7 +127,11 @@ seed:                42
 
 # Batch covariate — column of ExperimentalDesign.csv modelled as a nuisance
 # covariate in the design (NOT a correction applied to the matrix before the
-# tests; see diagnostic_batch_correction.png for the before/after check).
+# tests: no expression value is ever rewritten, so PCA/UMAP/correlation keep
+# showing the data as acquired). The run is REFUSED if the batch is confounded
+# with the condition — the effects would be inseparable and "correcting" one
+# would erase the other. Writes diagnostic_batch.png: same PCA as plot_pca,
+# each PC tested against batch and against condition (Kruskal-Wallis, ε²).
 # CLI equivalent: --batch-column batch
 batch_column:        null         # e.g. "batch" or "plate"; null = disabled
 
@@ -311,6 +315,28 @@ annotation_fasta:    "__auto__"
 # trouvait. Si la question est « l'effet génotype dépend-il du temps ? », c'est
 # une interaction qu'il faut tester, pas 4 ANOVA séparées.
 anova_strata:        false
+
+
+# ── Nom du dashboard HTML ─────────────────────────────────────────────────────
+# Fichier écrit dans out_dir. Par défaut "Proteomic_dashboard.html".
+# Jusqu'au 12/11/2026 le défaut était "proteogen_dashboard.html" : remettre
+# cette valeur ici pour retrouver l'ancien nom.
+# Seul un NOM est retenu : un chemin est réduit à son dernier segment, pour que
+# le dashboard reste dans out_dir. L'extension .html est ajoutée si elle manque.
+# rebuild_dashboard.py suit la même clé via last_config.yaml.
+dashboard_filename:  "Proteomic_dashboard.html"
+
+
+# ── Sous-dossier des volcanos ─────────────────────────────────────────────────
+# Les volcanos individuels (volc_*.png) et le facet (all_volcano_plots_grid.png)
+# sont écrits dans ce sous-dossier de out_dir, au lieu d'être mêlés aux autres
+# sorties. Le facet, auparavant supprimé par le nettoyage final, est désormais
+# conservé lui aussi.
+# "" (chaîne vide) ou false = volcanos à la racine de out_dir, comportement
+# d'avant le 12/11/2026.
+# Comme pour dashboard_filename, seul un NOM de dossier est retenu : un chemin
+# est réduit à son dernier segment, le dossier reste donc dans out_dir.
+volcano_subdir:      "Volcanos"
 
 
 # ── Input file paths ──────────────────────────────────────────────────────────

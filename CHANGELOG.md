@@ -12,6 +12,54 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **`LIRE_LES_RESULTATS.md`**: a reading guide for the three outputs of a run — the
+  workbook, the Deimos dashboard and the Pathfinder report. Sheet by sheet, page by
+  page, what each number means, what to check before interpreting anything, the five
+  most common misreadings, and why a section may be missing. Written from the actual
+  output of a real run, not from memory.
+- **Day theme by default** in both HTML outputs. The viewer's own choice still wins:
+  it is read from `localStorage` before the default applies. The Deimos dashboard no
+  longer follows the operating system's `prefers-color-scheme` — say so if you want
+  that back.
+- **`volcano_subdir`: the volcano plots go to their own folder.** Individual volcanos
+  (`volc_<contrast>.png`) and the facet grid are written to `out_dir/Volcanos/` instead
+  of being mixed in with everything else. Same guard as `dashboard_filename`: only a
+  folder NAME is kept, so a config value cannot write outside `out_dir`. Set the key to
+  `""` or `false` for the previous behaviour, at the root of `out_dir`. The end-of-run
+  cleanup now also sweeps that subfolder, where `_resize_png` drops the resized copies
+  it makes for the workbook — without this, `Volcanos/` would silently fill up with
+  `*_xl560x440.png` files that nothing deletes.
+- **The facet volcano is kept.** `all_volcano_plots_grid.png` used to be deleted by the
+  end-of-run cleanup, because it lives at the root and does not start with `volc_`.
+  Inside `Volcanos/` it survives, alongside the individual plots.
+
+### Changed
+
+- **The dashboard is now named `Proteomic_dashboard.html`.** `dashboard_filename` made
+  the name configurable; the default itself stayed `proteogen_dashboard.html`, so a run
+  that did not set the key still produced the old name — which is exactly what happened.
+  The default is now the new name. Put `dashboard_filename: "proteogen_dashboard.html"`
+  back in the config to keep the old one. The end-of-run cleanup spares both names, so a
+  dashboard written by an earlier run is not removed, and `rebuild_dashboard.py` follows
+  the same key through `last_config.yaml`.
+  A test now asserts that `config.py` and `deimos.py` agree on the default: the gap
+  between the two is what let the wrong name through.
+- **`annotation_import.py`: identifiers matched across annotation levels.** A
+  collaborator's annotation is often keyed on the **gene** (`scaffold1.g1`) while the
+  reference FASTA is keyed on the **transcript** (`g1.t1`, `g1.t2`), sometimes with a
+  prefix only one of the two carries — the exact match then returned nothing at all.
+  `match_to_fasta()` now tries three routes: exact (unchanged), gene-level (the
+  annotation of a gene reaches **every isoform**), then suffix (`scaffold1_g1` → `g1`),
+  the last one kept **only when it is one-to-one** over the whole file: if two scaffolds
+  both carry a `g1`, that gene is dropped rather than wrongly annotated. One line per
+  route in the report.
+- **`annotation_import.py`: the e-value column is recognised by its shape.** Trinotate
+  names it `p-value`, which the guard refused, so the table went through **unfiltered**
+  — on a real *Ostrea* annotation that meant transferring 13 288 of 35 963 rows (37 %)
+  built on weak hits. A column capped at 10, reaching 1e-125, with more than 20 % of its
+  values below 1e-3, can be neither a percent identity (0–100) nor a bitscore, so it is
+  now used automatically. A genuine p-value or an identity column is still reported
+  without being guessed.
 - **Gene names read from the search FASTA when DIA-NN leaves them empty**
   (`annotation_fasta: "__auto__"`). DIA-NN fills `Genes` and
   `First.Protein.Description` only when the FASTA headers follow the UniProt
@@ -63,6 +111,35 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **`batch_column` was read but never modelled.** The key was parsed by `config.py`,
+  exposed as `--batch-column` and documented in the README, yet no code path ever used
+  it: a run declaring a batch produced exactly the same model as a run without one, and
+  nothing said so. The batch is now a real nuisance term in the design (`~0 + condition
+  + batch`, one-hot with the first level as reference), composed with the standard design
+  and with the paired design alike; contrasts are padded to zero on the nuisance columns,
+  so they still bear on conditions only. This is a *model* term, not a matrix correction:
+  no expression value is rewritten, so PCA, UMAP and correlation keep showing the data as
+  acquired — unlike ComBat/`removeBatchEffect`, whose output is then reused for testing
+  and inflates significance.
+  - **A confounded batch is now refused, not absorbed.** When the batch is nested in the
+    condition the extended design loses full rank: the batch effect and the biological
+    effect are inseparable, and modelling them together erases the one you are looking
+    for. The run stops with the condition × batch crosstab and the conditions that sit in
+    a single batch. Partial confounding (one condition alone in its batch) is caught by
+    the same rank test.
+  - Degenerate cases warn and continue with the batch ignored rather than failing:
+    column absent from the design (with the available columns listed), a single level,
+    one level per sample, or missing values. The column name is matched case-insensitively.
+  - `tests/test_batch_covariate.py` (24 tests), including the three refusals.
+- **`diagnostic_batch_correction.png` did not exist either.** Both the README and
+  `config_example.yaml` promised a batch diagnostic figure that no code produced, and
+  described it as a "before/after" check — which cannot exist, since nothing is corrected.
+  `diagnostic_batch.png` now ships: the same PCA as `plot_pca`, samples coloured by batch
+  and shaped by condition, plus ε² (Kruskal-Wallis) per component for batch *and* for
+  condition. It answers the question that decides whether the covariate is worth its
+  degrees of freedom — and flags the case where batch outranks condition on a leading
+  component. The figures are written; the numbers also go to the console, where a run log
+  will actually keep them.
 - **Python version floor is now tested.** Every module is compiled with the oldest
   interpreter available on the machine (`tests/test_python_version_floor.py`). Since
   3.12 (PEP 701) an f-string may contain a line break inside its expression and reuse

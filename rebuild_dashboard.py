@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-rebuild_dashboard.py — Regenerates proteogen_dashboard.html from a finished Deimos run,
-without re-running the pipeline (e.g. after a dashboard update).
+rebuild_dashboard.py — Regenerates the HTML dashboard from a finished Deimos run,
+without re-running the pipeline (e.g. after a dashboard update). The output file is
+named by the run's `dashboard_filename` key (default Proteomic_dashboard.html).
 
     python rebuild_dashboard.py                      # ./proteomics_output
     python rebuild_dashboard.py path/to/proteomics_output [--out other.html]
@@ -41,7 +42,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("out_dir", nargs="?", default="proteomics_output")
     ap.add_argument("--xlsx", help="results workbook (default: ProteomicAnalysis_Results.xlsx)")
-    ap.add_argument("--out", help="output HTML (default: <out_dir>/proteogen_dashboard.html)")
+    ap.add_argument("--out", help="output HTML (default: <out_dir>/<dashboard_filename>, "
+                                  "i.e. Proteomic_dashboard.html unless the config says otherwise)")
     ap.add_argument("--config", help="YAML of the run, if last_config.yaml is missing (runs "
                     "launched with --config before 2026-11-06 did not write it)")
     a = ap.parse_args(argv)
@@ -56,7 +58,9 @@ def main(argv=None):
     design, dsrc = _design(xlsx, params, a.out_dir)
     print(f"[dashboard] workbook : {xlsx}\n[dashboard] thresholds: {src}\n"
           f"[dashboard] samples  : {len(design)} ({dsrc})")
-    out = run_dashboard(xlsx, design, a.out or os.path.join(a.out_dir, "proteogen_dashboard.html"),
+    from deimos import dashboard_filename
+    out = run_dashboard(xlsx, design,
+                        a.out or os.path.join(a.out_dir, dashboard_filename(params)),
                         params=params)
     print(f"[OK] {out}" if out else "[WARN] Dashboard not generated (see messages above).")
     return 0 if out else 1

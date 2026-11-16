@@ -198,3 +198,57 @@ def test_group_leaders_get_member_annotation():
     assert by["XP_3"] == "GO:9"                 # tête annotée : inchangée
     assert "XP_5" not in by
     assert len(out) == len(ann) + 1             # rien n'est retiré
+
+
+def test_gene_level_annotation_reaches_every_isoform(tmp_path):
+    """Une annotation au niveau du gène (scaffold1.g1) doit atteindre toutes les
+    isoformes du FASTA (g1.t1, g1.t2), malgré le préfixe de scaffold absent du FASTA."""
+    from annotation_import import match_to_fasta
+    fa = tmp_path / "prot.fa"
+    fa.write_text(">g1.t1\nMK\n>g1.t2\nMKK\n>g2.t1\nMA\n>g7.t1\nMW\n")
+    out, rep = match_to_fasta(["scaffold1_g1", "scaffold1_g2"], str(fa))
+    assert out["scaffold1_g1"] == ["g1.t1", "g1.t2"]        # les deux isoformes
+    assert out["scaffold1_g2"] == ["g2.t1"]
+    assert rep["matched_suffix"] == 2 and rep["proteins_annotated"] == 3
+    assert rep["matched_exact"] == 0 and rep["ambiguous_dropped"] == 0
+
+    # voie exacte et voie gène, quand les identifiants se correspondent déjà
+    out, rep = match_to_fasta(["g1_t1", "g2"], str(fa))
+    assert out["g1_t1"] == ["g1.t1"] and rep["matched_exact"] == 1
+    assert out["g2"] == ["g2.t1"] and rep["matched_gene"] == 1
+
+
+def test_an_ambiguous_suffix_is_dropped_not_guessed(tmp_path):
+    """Si deux scaffolds portent chacun un g1, le suffixe ne tranche pas : mieux vaut
+    ne pas annoter que d'attribuer l'annotation du mauvais gène."""
+    from annotation_import import match_to_fasta
+    fa = tmp_path / "prot.fa"
+    fa.write_text(">g1.t1\nMK\n>g5.t1\nMA\n")
+    out, rep = match_to_fasta(["scaffold1_g1", "scaffold2_g1", "scaffold1_g5"], str(fa))
+    assert "scaffold1_g1" not in out and "scaffold2_g1" not in out
+    assert rep["ambiguous_dropped"] == 2
+    assert out["scaffold1_g5"] == ["g5.t1"] and rep["matched_suffix"] == 1
+
+
+def test_an_evalue_column_is_recognised_by_its_shape(tmp_path):
+    """Trinotate nomme son e-value 'p-value'. Une colonne qui descend à 1e-125 et
+    plafonne à 10 ne peut être qu'une e-value : ni une identité (0-100), ni un
+    bitscore. On la reconnaît à sa forme, pas à son nom."""
+    import numpy as np
+    import pandas as pd
+    from annotation_import import find_evalue_column, looks_like_evalue
+
+    ev = pd.Series(list(np.logspace(-125, 1, 60)) + [0.0] * 5)
+    assert looks_like_evalue(ev)
+    assert not looks_like_evalue(pd.Series(np.linspace(20, 99, 60)))      # % identité
+    assert not looks_like_evalue(pd.Series(np.linspace(50, 2000, 60)))    # bitscore
+    assert not looks_like_evalue(pd.Series([0.04, 0.2, 0.9] * 30))        # vraie p-value
+    assert not looks_like_evalue(pd.Series([1e-30, 2.0]))                 # trop peu de lignes
+
+    df = pd.DataFrame({"Seq.Name": [f"g{i}" for i in range(65)], "p-value": ev,
+                       "Biological": ["GO:0008150 [Name: biological_process]"] * 65})
+    col, maybe = find_evalue_column(df)
+    assert col == "p-value" and maybe == []                 # retenue d'office
+    df2 = df.assign(**{"p-value": np.linspace(20, 99, 65)})
+    col2, maybe2 = find_evalue_column(df2)
+    assert col2 is None and maybe2 == ["p-value"]           # signalée, pas devinée

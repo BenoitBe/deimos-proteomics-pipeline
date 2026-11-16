@@ -124,6 +124,13 @@ _DEFAULTS = {
     # de nom ; un chemin force ce FASTA ; false désactive. Seules les cellules vides
     # sont remplies, et aucun fichier n'est écrit.
     "annotation_fasta":    "__auto__",
+    # Nom du dashboard HTML dans out_dir. Un chemin est réduit à son nom de
+    # fichier ; .html est ajouté s'il manque. Nom d'avant le 12/11/2026 :
+    # "proteogen_dashboard.html", à remettre ici pour le retrouver.
+    "dashboard_filename":  "Proteomic_dashboard.html",
+    # Sous-dossier de out_dir où sont écrits les volcanos (individuels + facet).
+    # "" ou false = à la racine de out_dir, comportement d'avant le 12/11/2026.
+    "volcano_subdir":      "Volcanos",
     # ANOVA par strate, EN PLUS de l'ANOVA globale. Une regex sur les noms de
     # conditions ("^(T\\d+)_" -> une ANOVA par temps), ou un mapping
     # {étiquette: [conditions]}, ou false. Le BH est propre à chaque strate.

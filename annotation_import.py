@@ -84,6 +84,78 @@ def default_display_id(x) -> str:
     return f"{m.group(1)}.{m.group(2)}.t{m.group(3)}" if m else s
 
 
+def _gene_key(canon: str) -> str:
+    """Clé de gène : la clé canonique sans son suffixe d'isoforme (g1_t2 -> g1)."""
+    return re.sub(r"_t\d+$", "", canon)
+
+
+def match_to_fasta(keys, fasta):
+    """Associe chaque clé d'annotation aux identifiants du FASTA, par trois voies.
+
+    Une annotation et un FASTA décrivent souvent les mêmes gènes avec des
+    identifiants qui ne se recouvrent pas tout à fait : l'annotation peut être au
+    niveau du GÈNE (scaffold1.g1) quand le FASTA est au niveau du TRANSCRIT
+    (g1.t1, g1.t2), et l'un des deux peut porter un préfixe que l'autre n'a pas.
+
+      1. exacte   : même clé canonique -> cet identifiant.
+      2. gène     : la clé est celle d'un gène du FASTA -> TOUTES ses isoformes,
+                    puisque l'annotation d'un gène vaut pour ses transcrits.
+      3. suffixe  : la clé se termine par une clé de gène du FASTA (scaffold1_g1
+                    -> g1), ou l'inverse. Cette voie n'est retenue que si elle est
+                    UNIVOQUE : si deux clés d'annotation revendiquent le même gène
+                    (un g1 par scaffold, par exemple), le gène est abandonné —
+                    mieux vaut ne pas annoter que mal annoter.
+
+    Rend ({clé: [identifiants FASTA]}, compte rendu par voie).
+    """
+    fids = fasta_ids(fasta)
+    exact, by_gene = {}, {}
+    for fid in fids:
+        c = canonical_id(fid)
+        exact.setdefault(c, fid)
+        by_gene.setdefault(_gene_key(c), []).append(fid)
+    out = {}
+    rep = {"fasta_ids": len(fids), "matched_exact": 0, "matched_gene": 0,
+           "matched_suffix": 0, "ambiguous_dropped": 0}
+    pending = []                                   # voie 3, à valider après coup
+    for k in keys:
+        if k in exact:
+            out[k] = [exact[k]]
+            rep["matched_exact"] += 1
+            continue
+        g = _gene_key(k)
+        if g in by_gene:
+            out[k] = sorted(by_gene[g])
+            rep["matched_gene"] += 1
+            continue
+        pending.append((k, g))
+    if pending:
+        # index des queues : 'scaffold1_g1' -> 'g1' en retirant les têtes de clé
+        claims = {}
+        for k, g in pending:
+            parts = g.split("_")
+            hit = None
+            for i in range(1, len(parts)):         # plus longue queue d'abord
+                tail = "_".join(parts[i:])
+                if tail in by_gene:
+                    hit = tail
+                    break
+            if hit is None:                        # l'inverse : le FASTA est plus long
+                cand = [gk for gk in by_gene if gk.endswith("_" + g)]
+                hit = cand[0] if len(cand) == 1 else None
+            if hit is not None:
+                claims.setdefault(hit, []).append(k)
+        for gk, ks in claims.items():
+            if len(ks) == 1:
+                out[ks[0]] = sorted(by_gene[gk])
+                rep["matched_suffix"] += 1
+            else:
+                rep["ambiguous_dropped"] += len(ks)
+    rep["matched_to_fasta"] = sum(1 for v in out.values() if v)
+    rep["proteins_annotated"] = sum(len(v) for v in out.values())
+    return out, rep
+
+
 def fasta_ids(path: str) -> list:
     out = []
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -119,13 +191,59 @@ def _blast_like(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def parse_table(df: pd.DataFrame, evalue_max=None, id_col=None):
+def looks_like_evalue(v) -> bool:
+    """Une colonne d'e-value se reconnaît à sa forme, pas à son nom.
+
+    BLAST borne ses e-values à 10 et les étale sur des dizaines d'ordres de
+    grandeur jusqu'à 0. Un pourcentage d'identité vit dans 0-100, un bitscore
+    monte bien au-delà de 10, et ni l'un ni l'autre ne descend à 1e-30 : aucun
+    ne peut imiter cette forme. On ne devine donc rien, on constate.
+    """
+    v = pd.to_numeric(v, errors="coerce").dropna()
+    if len(v) < 20 or float(v.min()) < 0 or float(v.max()) > 10:
+        return False
+    tiny = float((v < 1e-3).mean())
+    smallest = float(v[v > 0].min()) if (v > 0).any() else 0.0
+    return tiny > 0.2 and smallest < 1e-10         # étalement sur >= 10 ordres
+
+
+def find_evalue_column(df: pd.DataFrame, name=None):
+    """Colonne d'e-value : celle demandée, sinon un en-tête reconnu.
+
+    Rend (colonne, candidates_ignorées). Les candidates sont les colonnes
+    numériques dont l'en-tête évoque un score de similarité sans être reconnu
+    (« p-value » de Trinotate, par exemple) : on ne devine pas à leur place, mais
+    on les signale, sinon un tableau entier passe sans filtre en silence.
+    """
+    if name:
+        for c in df.columns:
+            if str(c).strip().lower() == str(name).strip().lower():
+                return c, []
+        raise SystemExit(f"--evalue-col '{name}' absente du tableau "
+                         f"(colonnes : {', '.join(map(str, df.columns))})")
+    col = next((c for c in df.columns if _EVALUE_HEADERS.match(str(c).strip())), None)
+    if col is not None:
+        return col, []
+    maybe = []
+    for c in df.columns:
+        h = str(c).strip().lower()
+        if not re.search(r"p[-_ ]?val|score|expect|prob", h):
+            continue
+        v = pd.to_numeric(df[c], errors="coerce")
+        if v.notna().mean() > 0.9 and float(v.min(skipna=True)) >= 0:
+            if looks_like_evalue(v):
+                return c, []                       # la distribution tranche
+            maybe.append(str(c))
+    return None, maybe
+
+
+def parse_table(df: pd.DataFrame, evalue_max=None, id_col=None, evalue_col=None):
     """-> (records {id_brut: {GO:set, KEGG:set, Pfam:set}}, names {GO: name},
     namespaces {GO: ns}, stats)."""
     df = _blast_like(df)
     id_col = id_col or df.columns[0]
     stats = {"rows": len(df), "dropped_evalue": 0}
-    ecol = next((c for c in df.columns if _EVALUE_HEADERS.match(str(c).strip())), None)
+    ecol, ecol_maybe = find_evalue_column(df, evalue_col)
     if evalue_max is not None and ecol is not None:
         e = pd.to_numeric(df[ecol], errors="coerce")
         keep = e.le(float(evalue_max)).fillna(False)       # pas de hit -> pas de transfert
@@ -163,6 +281,7 @@ def parse_table(df: pd.DataFrame, evalue_max=None, id_col=None):
     roots = {"GO:0008150", "GO:0003674", "GO:0005575"}
     with_go = [v["GO"] for v in rec.values() if v["GO"]]
     stats.update(ids=len(rec), with_go=len(with_go), go_columns=go_cols, evalue_column=ecol,
+                 evalue_candidates=ecol_maybe,
                  # part des protéines portant une racine GO : ~1 si déjà propagé
                  root_share=(sum(1 for g in with_go if g & roots) / len(with_go))
                  if with_go else 0.0)
@@ -250,11 +369,13 @@ def propagate(gos: set, parents: dict, alt: dict, cache: dict) -> set:
 
 # ── Assemblage ────────────────────────────────────────────────────────────────
 
-def build(tables, evalue_max=1e-5, fasta=None, obo=None, do_propagate=True, verbose=True):
+def build(tables, evalue_max=1e-5, fasta=None, obo=None, do_propagate=True, verbose=True,
+          evalue_col=None):
     """-> (annotation DataFrame, terms DataFrame, report dict)."""
     merged, names, nss, report = {}, {}, {}, {"tables": []}
     for path in tables:
-        rec, nm, ns, st = parse_table(read_table(path), evalue_max=evalue_max)
+        rec, nm, ns, st = parse_table(read_table(path), evalue_max=evalue_max,
+                                      evalue_col=evalue_col)
         st["file"] = os.path.basename(path)
         report["tables"].append(st)
         for k, v in nm.items():
@@ -292,21 +413,19 @@ def build(tables, evalue_max=1e-5, fasta=None, obo=None, do_propagate=True, verb
         report["obsolete_dropped"] = len(dropped)
     # identifiants de sortie : ceux du FASTA de référence si fourni
     if fasta:
-        fmap = {}
-        for fid in fasta_ids(fasta):
-            fmap.setdefault(canonical_id(fid), fid)
-        out_id = {k: fmap.get(k) for k in merged}
-        report["fasta_ids"] = len(fmap)
-        report["matched_to_fasta"] = sum(1 for v in out_id.values() if v)
+        out_id, report_ids = match_to_fasta(list(merged), fasta)
+        report.update(report_ids)
     else:
-        out_id = {k: default_display_id(m["raw"]) for k, m in merged.items()}
+        out_id = {k: [default_display_id(m["raw"])] for k, m in merged.items()}
     rows = []
     for k, m in merged.items():
         if not out_id.get(k) or not (m["GO"] or m["KEGG"] or m["Pfam"]):
             continue
-        rows.append({"protein_id": out_id[k], "GO": ";".join(sorted(m["GO"])),
-                     "KEGG": ";".join(sorted(m["KEGG"])), "Pfam": ";".join(sorted(m["Pfam"])),
-                     "source": "+".join(dict.fromkeys(m["src"])) or "table"})
+        for pid in out_id[k]:
+            rows.append({"protein_id": pid, "GO": ";".join(sorted(m["GO"])),
+                         "KEGG": ";".join(sorted(m["KEGG"])),
+                         "Pfam": ";".join(sorted(m["Pfam"])),
+                         "source": "+".join(dict.fromkeys(m["src"])) or "table"})
     ann = pd.DataFrame(rows, columns=["protein_id", "GO", "KEGG", "Pfam", "source"])
     ann = ann.drop_duplicates("protein_id").sort_values("protein_id").reset_index(drop=True)
     all_go = sorted({g for gos in ann.GO for g in gos.split(";") if g})
@@ -322,12 +441,23 @@ def build(tables, evalue_max=1e-5, fasta=None, obo=None, do_propagate=True, verb
 
 def print_report(rep):
     for t in rep["tables"]:
-        ev = (f", {t['dropped_evalue']} rows dropped (e-value > threshold, column "
-              f"'{t['evalue_column']}')" if t.get("evalue_column") else ", no e-value column")
+        if t.get("evalue_column"):
+            ev = (f", {t['dropped_evalue']} rows dropped (e-value > threshold, column "
+                  f"'{t['evalue_column']}')")
+        elif t.get("evalue_candidates"):
+            ev = (", NO e-value filter applied — column(s) "
+                  + ", ".join(f"'{c}'" for c in t["evalue_candidates"])
+                  + " look like a similarity score; pass --evalue-col to use one")
+        else:
+            ev = ", no e-value column"
         print(f"  [READ] {t['file']}: {t['rows']} rows, {t['ids']} IDs, {t['with_go']} with GO{ev}")
     if "fasta_ids" in rep:
         print(f"  [IDS]  {rep['matched_to_fasta']} annotated IDs found in the FASTA "
-              f"({rep['fasta_ids']} sequences)")
+              f"({rep['fasta_ids']} sequences) -> {rep['proteins_annotated']} proteins")
+        print(f"         exact {rep['matched_exact']} | gene-level {rep['matched_gene']} "
+              f"| by suffix {rep['matched_suffix']}"
+              + (f" | ambiguous dropped {rep['ambiguous_dropped']}"
+                 if rep["ambiguous_dropped"] else ""))
     if rep.get("depth_warning"):
         print("  [WARN] one table lists GO terms with all their ancestors (propagated), another "
               "only the direct terms: mixing them biases the enrichment towards the propagated "
@@ -349,6 +479,9 @@ def main(argv=None):
                          "annotations of the same protein are merged")
     ap.add_argument("--out", required=True, help="annotation TSV (protein_id, GO, KEGG, Pfam)")
     ap.add_argument("--terms-out", default=None, help="GO names TSV (GO, name, namespace)")
+    ap.add_argument("--evalue-col", default=None,
+                    help="name of the e-value column, when its header is not recognised "
+                         "(Trinotate writes it 'p-value')")
     ap.add_argument("--evalue-max", type=float, default=1e-5,
                     help="drop rows whose e-value column is above (default 1e-5; tables "
                          "without e-value are kept)")
@@ -359,7 +492,8 @@ def main(argv=None):
     ap.add_argument("--no-propagate", action="store_true",
                     help="with --obo: keep names/namespaces but do not add ancestors")
     a = ap.parse_args(argv)
-    ann, terms, rep = build(a.table, a.evalue_max, a.fasta, a.obo, not a.no_propagate)
+    ann, terms, rep = build(a.table, a.evalue_max, a.fasta, a.obo, not a.no_propagate,
+                            evalue_col=a.evalue_col)
     ann.to_csv(a.out, sep="\t", index=False)
     print_report(rep)
     print(f"  [OK] {a.out}")
