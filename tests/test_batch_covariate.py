@@ -316,3 +316,53 @@ def test_info_out_reste_vide_si_non_applique():
     info: dict = {}
     apply_batch_covariate(mat, cols, conds, _design(conds), {}, info_out=info)
     assert info == {}
+
+
+# --- Le contrat scientifique : la covariable rend la puissance perdue --------
+
+def test_la_covariable_restaure_la_puissance_sans_casser_le_fdr():
+    """Bout en bout : effet de lot fort, design croisé, 50 vraies positives.
+
+    Sans la covariable, le lot gonfle la variance résiduelle et noie l'effet
+    biologique. Avec, il est absorbé par le modèle. C'est la raison d'être de
+    la clé — un test qui vérifierait seulement que des colonnes ont été
+    ajoutées passerait aussi sur une implémentation inerte.
+    """
+    from limma_ebayes import lm_fit, contrasts_fit, ebayes, top_table
+
+    rng = np.random.default_rng(11)
+    n_prot, n_rep, n_true = 500, 4, 50
+    conds = ["Ctrl"] * (2 * n_rep) + ["Trt"] * (2 * n_rep)
+    bats = (["b1"] * n_rep + ["b2"] * n_rep) * 2      # chaque condition x 2 lots
+    expr = rng.normal(20, 0.35, size=(n_prot, len(conds)))
+    expr[:n_true, np.array(conds) == "Trt"] += 1.0    # effet biologique
+    expr[:, np.array(bats) == "b2"] += rng.normal(0, 1.5, n_prot)[:, None]
+    mat = pd.DataFrame(expr, index=[f"P{i}" for i in range(n_prot)],
+                       columns=[f"S{i+1}" for i in range(len(conds))])
+    d = _design(conds, bats)
+
+    def _run(params):
+        dm, groups = make_design_matrix(conds)
+        dm, cols = apply_batch_covariate(dm, list(groups), np.array(conds),
+                                         d, params)
+        cm, _ = make_all_contrasts(groups, n_total_cols=len(cols))
+        fit = ebayes(contrasts_fit(lm_fit(mat.values.astype(float), dm), cm))
+        return top_table(fit, 0, mat.index.tolist())
+
+    tt_sans = _run({})
+    tt_avec = _run({"batch_column": "batch"})
+
+    tp_sans = int((tt_sans["adj.P.Val"].values[:n_true] < 0.05).sum())
+    tp_avec = int((tt_avec["adj.P.Val"].values[:n_true] < 0.05).sum())
+    fp_avec = int((tt_avec["adj.P.Val"].values[n_true:] < 0.05).sum())
+
+    assert tp_avec > 2 * tp_sans, (
+        f"la covariable doit restaurer la puissance : {tp_sans} -> {tp_avec}")
+    assert tp_avec >= 45
+    assert fp_avec <= 0.05 * (n_prot - n_true)        # FDR toujours contrôlé
+
+    # L'estimation de l'effet, elle, ne doit PAS bouger : le lot est orthogonal
+    # à la condition dans un design croisé, il ne déplace que la variance.
+    assert np.isclose(np.median(np.abs(tt_sans["logFC"].values[:n_true])),
+                      np.median(np.abs(tt_avec["logFC"].values[:n_true])),
+                      rtol=0.02)
