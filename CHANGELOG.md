@@ -109,7 +109,39 @@ and dashboard improvements accumulated since the previous public version.
     degrees of freedom globally against 9 per time point.
   - `tests/test_anova_strata.py` (11 tests).
 
+### Added
+
+- **Continuous integration** (`.github/workflows/tests.yml`), modelled on Pathfinder's.
+  Three jobs:
+  - `test` — the suite on Python 3.11, 3.12 and 3.13. 3.11 is the platform's version and
+    the project's floor; since 3.12 (PEP 701) an f-string may hold a newline inside its
+    expression, so a file written on a recent machine stops compiling on 3.11 and the
+    error only shows at run time. Testing 3.11 outright beats the cross-compilation test,
+    which merely skips when no older interpreter is on PATH.
+  - `test-optional` — the same suite with gseapy, inmoose and DIAMOND installed. Those are
+    not in `requirements.txt`, so 8 tests skip locally and had never run anywhere; they
+    now do, and all 21 of them pass.
+  - `smoke` — a full offline run on `example_data/`, asserting the output files: the
+    workbook, `Proteomic_dashboard.html` (not the old name), `last_config.yaml`, the
+    `Volcanos/` folder with no leftover `_xl` copies, the batch covariate being absorbed
+    on a crossed design with its diagnostic figure left behind, and the run being
+    **refused** on a confounded design. `go_organism: null` turns gProfiler off, so a red
+    CI always points at the code and never at a third-party API.
+
 ### Fixed
+
+- **`diagnostic_batch.png` was written and then deleted.** Step 16 sweeps the loose PNGs
+  because every figure is embedded in the workbook — but the batch diagnostic never was,
+  so the sweep lost it outright, and the README and the delivery note both promised a file
+  that no run left behind. Found by the first end-to-end run of the feature, one day after
+  shipping it; no unit test could have caught it, which is the same lesson `batch_column`
+  taught. The name now lives in a single constant, `BATCH_DIAGNOSTIC_NAME`, shared by the
+  figure's writer and the sweep's keep-list — two separate literals is exactly the drift
+  that let `proteogen_dashboard.html` through. The keep-rule itself moved into
+  `figures_to_keep()` so it can be tested at all, and `keep_prefixes`, declared but never
+  read, is now actually used.
+  (`diagnostic_missingness.png` and `diagnostic_deqms.png` are a different case: their
+  `_xl` resized copies prove they do reach the workbook, so sweeping them is intended.)
 
 - **`batch_column` was read but never modelled.** The key was parsed by `config.py`,
   exposed as `--batch-column` and documented in the README, yet no code path ever used

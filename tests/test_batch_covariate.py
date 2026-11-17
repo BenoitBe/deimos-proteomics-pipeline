@@ -366,3 +366,33 @@ def test_la_covariable_restaure_la_puissance_sans_casser_le_fdr():
     assert np.isclose(np.median(np.abs(tt_sans["logFC"].values[:n_true])),
                       np.median(np.abs(tt_avec["logFC"].values[:n_true])),
                       rtol=0.02)
+
+
+# --- La figure doit survivre au nettoyage de fin de run ---------------------
+
+def test_le_diagnostic_survit_au_nettoyage():
+    """Écrite puis supprimée : le défaut constaté le 17/11/2026.
+
+    `diagnostic_batch.png` n'est embarqué ni dans l'Excel ni dans le dashboard,
+    contrairement à `diagnostic_missingness.png` dont la copie `_xl` prouve
+    l'insertion. Le supprimer le perd donc définitivement.
+    """
+    from deimos import figures_to_keep, BATCH_DIAGNOSTIC_NAME
+    prefixes, exact = figures_to_keep({})
+    assert BATCH_DIAGNOSTIC_NAME in exact
+    assert BATCH_DIAGNOSTIC_NAME == "diagnostic_batch.png"
+    # la règle doit aussi continuer d'épargner les volcanos et les deux noms
+    # de dashboard, sinon on a réparé une fuite en ouvrant une autre
+    assert prefixes == ("volc_",)
+    assert "Proteomic_dashboard.html" in exact
+    assert "proteogen_dashboard.html" in exact
+    assert "ProteomicAnalysis_Results.xlsx" in exact
+
+
+def test_le_producteur_et_le_nettoyage_partagent_la_constante():
+    """Deux littéraux séparés, c'est la dérive de proteogen_dashboard.html."""
+    import inspect
+    import deimos
+    src = inspect.getsource(deimos.plot_batch_diagnostic)
+    assert "BATCH_DIAGNOSTIC_NAME" in src
+    assert '"diagnostic_batch.png"' not in src   # jamais le littéral en dur

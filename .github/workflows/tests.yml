@@ -1,0 +1,167 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Suite unitaire sur les versions réellement utilisées ─────────────────────
+  # Plancher 3.11 : c'est la version de la plateforme. Depuis 3.12 (PEP 701) une
+  # f-string peut contenir un saut de ligne dans son expression, et le fichier
+  # écrit sur une machine récente ne compile plus en 3.11 — l'erreur ne se voit
+  # qu'à l'exécution. Tester 3.11 explicitement vaut mieux que le test de
+  # compilation croisée, qui se contente de sauter quand aucun interpréteur
+  # plus ancien n'est présent.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run the test suite
+        run: pytest -q
+
+  # ── Les chemins optionnels, que la suite locale saute ────────────────────────
+  # gseapy, inmoose et DIAMOND ne sont pas dans requirements.txt : 8 tests se
+  # sautent en local et ne sont donc jamais exécutés. Ce job les installe pour
+  # que ces chemins soient réellement couverts quelque part.
+  test-optional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies and optional extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest gseapy inmoose
+
+      # Binaire, pas un paquet pip. Non bloquant : le test RBH se saute
+      # proprement quand DIAMOND est absent, et une indisponibilité d'apt ne
+      # doit pas faire échouer la CI du code.
+      - name: Install DIAMOND (RBH, non-blocking)
+        continue-on-error: true
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq diamond-aligner
+
+      # Le pont vers Pathfinder est une vraie surface d'integration : 5 tests
+      # se sautent partout faute d'un clone voisin, donc ne tournent jamais.
+      - name: Clone Pathfinder as a sibling (bridge tests)
+        continue-on-error: true
+        run: git clone --depth 1 https://github.com/BenoitBe/Pathfinder ../Pathfinder
+
+      - name: Run the test suite with every optional path available
+        run: pytest -q -rs
+
+  # ── Run complet, hors ligne, sur le jeu d'exemple ───────────────────────────
+  # Les tests unitaires ne traversent pas le pipeline : le défaut du 17/11/2026
+  # — diagnostic_batch.png écrit puis supprimé par le nettoyage de l'étape 16 —
+  # ne se voyait que sur un run entier. D'où les assertions sur les fichiers de
+  # sortie, nom de dashboard et sous-dossier des volcanos compris.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"        # le plancher, là où ça compte
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # go_organism null désactive l'enrichissement gProfiler : aucun appel
+      # réseau, donc un échec de CI signale le code et jamais une API tierce.
+      - name: Write an offline configuration
+        run: |
+          cat > smoke.yaml <<'EOF'
+          tsv_path:    example_data/report.pg_matrix.tsv
+          design_path: example_data/ExperimentalDesign.csv
+          out_dir:     smoke_out
+          go_organism: null
+          run_gsea: false
+          run_perseverance: false
+          make_wgcna: false
+          make_pathfinder: false
+          make_insight: false
+          make_dashboard: true
+          n_iter_robustness: 10
+          seed: 42
+          EOF
+
+      - name: Run the pipeline end to end
+        run: python deimos.py --config smoke.yaml
+
+      - name: Check the expected outputs
+        run: |
+          test -f smoke_out/ProteomicAnalysis_Results.xlsx
+          test -f smoke_out/Proteomic_dashboard.html   # pas proteogen_dashboard
+          test -f smoke_out/last_config.yaml
+          test -d smoke_out/Volcanos
+          test -f smoke_out/Volcanos/all_volcano_plots_grid.png
+          ls smoke_out/Volcanos/volc_*.png > /dev/null
+          # aucune copie redimensionnée ne doit subsister dans le sous-dossier
+          test -z "$(ls smoke_out/Volcanos/*_xl*.png 2>/dev/null)"
+
+      # Le lot croisé doit être absorbé ET laisser sa figure derrière lui.
+      - name: Batch covariate — crossed design is absorbed
+        run: |
+          python - <<'EOF'
+          import csv
+          rows = list(csv.DictReader(open("example_data/ExperimentalDesign.csv"), delimiter=";"))
+          for r in rows:
+              r["batch"] = "b1" if int(r["replicate"]) <= 2 else "b2"
+          with open("design_crossed.csv", "w", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=["label","condition","replicate","batch"], delimiter=";")
+              w.writeheader(); w.writerows(rows)
+          EOF
+          python deimos.py --config smoke.yaml --design design_crossed.csv \
+                           --out-dir batch_out --batch-column batch | tee batch.log
+          grep -q "Covariable de lot 'batch'" batch.log
+          test -f batch_out/diagnostic_batch.png   # survit au nettoyage
+
+      # Un lot imbriqué dans la condition rend le modèle singulier : le run doit
+      # REFUSER, pas produire des coefficients inutilisables en silence.
+      - name: Batch covariate — confounded design is refused
+        run: |
+          python - <<'EOF'
+          import csv
+          rows = list(csv.DictReader(open("example_data/ExperimentalDesign.csv"), delimiter=";"))
+          lv = sorted({r["condition"] for r in rows})
+          for r in rows:
+              r["batch"] = "b%d" % (1 + lv.index(r["condition"]))
+          with open("design_confounded.csv", "w", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=["label","condition","replicate","batch"], delimiter=";")
+              w.writeheader(); w.writerows(rows)
+          EOF
+          if python deimos.py --config smoke.yaml --design design_confounded.csv \
+                              --out-dir conf_out --batch-column batch > conf.log 2>&1; then
+            echo "ÉCHEC : un lot confondu avec la condition a été accepté"
+            exit 1
+          fi
+          grep -q "est confondu avec la condition" conf.log
