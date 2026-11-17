@@ -111,6 +111,26 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **An audit that fails the build on an inert configuration key**
+  (`tests/test_config_keys_are_live.py`). `batch_column` was parsed, exposed as a flag and
+  documented, and entered no model; counting occurrences would not have found it, because
+  the key did appear in the code — in the command-line plumbing. The audit follows the
+  value one step from where it is read: assigned to a variable, that variable must be read
+  again; passed as a keyword argument, the callee must read that parameter; used in an
+  expression, a test or a return, it counts as consumed. One step is enough for this
+  defect, because what is dead is dead at the point of reading; a value that travels
+  further before dying needs a full run, which is what the `smoke` job is for.
+  - The same audit covers the command-line options: a flag announced in `--help` and never
+    read again is the same defect. It must know both reading forms — Deimos reads most of
+    its flags through `getattr(args, "qc_only", False)` rather than `args.qc_only`, and an
+    attribute-only version declared three live flags dead.
+  - **The detector validates itself.** Five tests feed it known-inert and known-live
+    samples, including the exact shape `batch_column` had. A detector that quietly stops
+    working is worse than none, since it issues a clean bill of health.
+  - Result on this repo: 72 config keys and 44 command-line options, none inert. The same
+    audit run against the commit before the fix reports `batch_column`, which is how the
+    detector was shown to work on the real case rather than only on samples.
+
 - **Continuous integration** (`.github/workflows/tests.yml`), modelled on Pathfinder's.
   Three jobs:
   - `test` — the suite on Python 3.11, 3.12 and 3.13. 3.11 is the platform's version and
