@@ -753,6 +753,13 @@ def dashboard_filename(params: dict) -> str:
 
 VOLCANO_DEFAULT_SUBDIR = "Volcanos"
 
+# Nom de la figure de diagnostic de lot. Constante partagee par le producteur
+# (plot_batch_diagnostic) et le nettoyage de l'etape 16, qui doit l'epargner :
+# contrairement aux autres figures, elle n'est pas embarquee dans l'Excel ni
+# dans le dashboard, donc la supprimer la perd. Deux litteraux separes, c'est
+# exactement la derive qui avait laisse passer proteogen_dashboard.html.
+BATCH_DIAGNOSTIC_NAME = "diagnostic_batch.png"
+
 
 def volcano_dir(params: dict, out_dir: str, create: bool = True) -> str:
     """Dossier où écrire les volcanos, depuis `volcano_subdir`.
@@ -2139,6 +2146,22 @@ def warn_design(design: pd.DataFrame) -> "dict | None":
     return pr
 
 
+def figures_to_keep(params: dict) -> tuple:
+    """Quelles figures le nettoyage de fin de run doit epargner.
+
+    Extraite de l'etape 16 pour etre testable : une figure ajoutee au pipeline
+    mais oubliee ici est ecrite puis supprimee, et le defaut ne se voit que sur
+    un run complet. C'est ce qui est arrive a diagnostic_batch.png.
+
+    Returns (prefixes, noms_exacts). Une figure est conservee si son nom
+    commence par un prefixe (sauf copie redimensionnee `_xlNNNxNNN`) ou s'il
+    figure dans les noms exacts.
+    """
+    return ("volc_",), {dashboard_filename(params), DASHBOARD_DEFAULT_NAME,
+                        DASHBOARD_LEGACY_NAME, "ProteomicAnalysis_Results.xlsx",
+                        BATCH_DIAGNOSTIC_NAME}
+
+
 def apply_batch_covariate(design_mat, all_cols, conditions,
                           design: pd.DataFrame, params: dict,
                           info_out: "dict | None" = None):
@@ -3051,7 +3074,7 @@ def plot_batch_diagnostic(mat_imp: pd.DataFrame, design: pd.DataFrame,
              "terme de nuisance, pas soustrait de la matrice.",
              ha="center", fontsize=7.5, style="italic", color="0.35")
     fig.tight_layout()
-    f = os.path.join(out_dir, "diagnostic_batch.png")
+    f = os.path.join(out_dir, BATCH_DIAGNOSTIC_NAME)
     fig.savefig(f, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return f
@@ -6812,16 +6835,14 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     # encombrer le dossier. EXCEPTION : les volcanos (volc_*.png) sont conservés
     # car souvent réutilisés individuellement pour les figures d'article.
     print("\n[CLEAN] Removing temporary figures...")
-    keep_prefixes = ("volc_",)              # volcanos individuels conservés
-    keep_exact = {dashboard_filename(params), DASHBOARD_DEFAULT_NAME,
-                  DASHBOARD_LEGACY_NAME, "ProteomicAnalysis_Results.xlsx"}
+    keep_prefixes, keep_exact = figures_to_keep(params)
     removed = 0
     for fn in os.listdir(out_dir):
         if not fn.lower().endswith((".png", ".tiff", ".tif")):
             continue
         # Conserver les volcanos ORIGINAUX (volc_*.png) mais pas leurs copies
         # redimensionnées pour l'Excel (suffixe _xlNNNxNNN).
-        is_volcano = fn.startswith("volc_")
+        is_volcano = fn.startswith(keep_prefixes)
         is_resized = "_xl" in fn and "x" in fn.split("_xl")[-1]
         if (is_volcano and not is_resized) or fn in keep_exact:
             continue

@@ -59,9 +59,21 @@ def test_the_config_default_matches_the_code_default():
 
 def test_the_cleanup_keeps_the_renamed_dashboard():
     """Le ménage de fin de run ne doit pas supprimer un dashboard renommé,
-    ni celui qu'un run antérieur avait écrit sous l'ancien nom."""
-    src = open("deimos.py", encoding="utf-8").read()
-    i = src.index("keep_exact = {")
-    block = src[i:i + 220]
-    assert "dashboard_filename(params)" in block
-    assert "DASHBOARD_LEGACY_NAME" in block
+    ni celui qu'un run antérieur avait écrit sous l'ancien nom.
+
+    Vérifié en EXÉCUTANT la règle de conservation, pas en lisant le source :
+    la version précédente de ce test cherchait `keep_exact = {` dans
+    `deimos.py` et serait passée sur n'importe quel bloc contenant les bons
+    mots, même inatteignable.
+    """
+    from deimos import figures_to_keep, DASHBOARD_LEGACY_NAME
+
+    _, exact = figures_to_keep({})
+    assert "Proteomic_dashboard.html" in exact        # défaut courant
+    assert DASHBOARD_LEGACY_NAME in exact             # écrit par un run antérieur
+
+    # un nom choisi par l'utilisateur doit être épargné lui aussi
+    _, exact = figures_to_keep({"dashboard_filename": "mon_rapport.html"})
+    assert "mon_rapport.html" in exact
+    assert "Proteomic_dashboard.html" in exact
+    assert DASHBOARD_LEGACY_NAME in exact

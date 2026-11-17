@@ -4,6 +4,8 @@
 
 # Deimos
 
+[![tests](https://github.com/BenoitBe/deimos-proteomics-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/BenoitBe/deimos-proteomics-pipeline/actions/workflows/tests.yml)
+
 **DIA Expression Integrated Multi-Omics Suite**
 
 Complete LFQ DIA proteomics pipeline — from a DIA-NN matrix to an interactive dashboard.
