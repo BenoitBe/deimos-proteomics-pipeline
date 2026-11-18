@@ -226,7 +226,8 @@ perseverance_min_coverage: 50.0   # % coverage for a Reciprocal Best Hit
 # (hypergeometric + BH, no network), independently of go_organism.
 # Tested columns: GO and, when filled, KEGG (pathway IDs, e.g. map00900) as a
 # separate family — own universe (proteins annotated in KEGG) and own BH, so the
-# GO results are identical with or without the KEGG column. Pfam is not tested.
+# GO results are identical with or without the KEGG column. KO numbers (K00001)
+# are not pathways and are ignored; Pfam is not tested.
 # A .tsv.gz file is read as well.
 perseverance_annotation_path: null  # e.g. "perseverance_annotation_protein_group.tsv"
 # Names and namespaces of the GO terms of that annotation (TSV GO, name, namespace, e.g.

@@ -5674,6 +5674,10 @@ def main():
                     "custom_annotation": _perseverance_annot, "background": None}
         _n_fam = {c: int(_perseverance_annot[c].notna().sum())
                   for c in ("GO", "KEGG") if c in _perseverance_annot.columns}
+        if "KEGG" in _n_fam:                 # voies seulement (pas les KO K00001)
+            from go_enrichment import KEGG_PATHWAY_RE
+            _n_fam["KEGG"] = int(_perseverance_annot["KEGG"].astype(str).str.contains(
+                rf"(?<![A-Za-z0-9]){KEGG_PATHWAY_RE}(?![0-9])").sum())
         params["_local_annotation"] = {"path": os.path.basename(str(_perseverance_path)),
                                        **{f"n_{c.lower()}": n for c, n in _n_fam.items()}}
         print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "

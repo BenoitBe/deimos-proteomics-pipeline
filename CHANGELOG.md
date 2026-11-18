@@ -40,7 +40,10 @@ and dashboard improvements accumulated since the previous public version.
   without a KEGG column (checked on 40 queries of a real annotation, order of ties included).
   Pathways are named through `perseverance_go_terms_path` (namespace `KEGG`) and come out as
   source `KEGG` in the sheets, dotplots/lollipops and dashboard. Group leaders without KEGG
-  take the pathways of another member of their group, as for GO.
+  take the pathways of another member of their group, as for GO. Only pathway IDs are
+  tested (`map00900`, `ko00900`, `ath00900`): KO numbers (`K00001`), which
+  `annotation_import.py` keeps in the same column, are gene families, not pathways, and are
+  ignored — an annotation carrying KO numbers only gets no KEGG family at all.
 
 ### Fixed
 

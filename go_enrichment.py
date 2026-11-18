@@ -253,6 +253,8 @@ def load_go_terms(path: str) -> dict:
 
 # Colonnes de l'annotation locale testées par run_local_ora, une famille BH chacune.
 LOCAL_ORA_COLUMNS = ("GO", "KEGG")
+# Identifiant de voie KEGG : carte générique (map), KO (ko) ou espèce (ath, hsa...).
+KEGG_PATHWAY_RE = r"[a-z]{2,4}\d{5}"
 
 
 def annotation_to_group_leaders(annotation: pd.DataFrame, df: pd.DataFrame,
@@ -376,6 +378,10 @@ def _local_ora_family(query, background_set, annotation_long, col, min_term_size
         df = df.assign(term=df["term"].str.split(";")).explode("term")
     df["term"] = df["term"].str.strip()
     df = df[df["term"] != ""]
+    if col == "KEGG":
+        # Voies seulement (map00900, ko00900, ath00900) : les numéros KO (K00001,
+        # gardés par annotation_import.py) sont des familles de gènes, pas des voies.
+        df = df[df["term"].str.fullmatch(KEGG_PATHWAY_RE)]
 
     df = df[df["protein_id"].isin(background_set)]
     if df.empty:

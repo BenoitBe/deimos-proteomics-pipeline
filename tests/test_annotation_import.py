@@ -219,6 +219,18 @@ def test_local_ora_tests_kegg_as_its_own_family(tmp_path):
     assert r0.at["map00900", "source"] == "KEGG" and r0.at["map00900", "name"] == "map00900"
 
 
+def test_kegg_orthology_numbers_are_not_tested_as_pathways():
+    """annotation_import.py garde les KO (K00001) dans la colonne KEGG : ce ne sont
+    pas des voies, ils ne doivent pas former de termes KEGG."""
+    bgp, ann = _go_kegg_annotation()
+    ann["KEGG"] = ann["KEGG"].map(lambda v: f"K00001;{v}" if isinstance(v, str) else "K00002")
+    res = run_local_ora(bgp[:10], bgp, ann)
+    kegg = set(res.loc[res.source == "KEGG", "native"])
+    assert "map00900" in kegg and not any(k.startswith("K") for k in kegg)
+    only_ko = ann.assign(KEGG="K00001")
+    assert not (run_local_ora(bgp[:10], bgp, only_ko).source == "KEGG").any()
+
+
 def test_kegg_column_leaves_go_results_unchanged():
     """Familles BH séparées : la présence du KEGG ne doit changer aucune ligne GO."""
     bgp, ann = _go_kegg_annotation()
