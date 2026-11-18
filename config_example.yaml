@@ -224,10 +224,15 @@ perseverance_min_coverage: 50.0   # % coverage for a Reciprocal Best Hit
 # protein groups with deimos_to_perseverance.remap_annotation_to_protein_groups().
 # If set, replaces the gProfiler call by a LOCAL enrichment test
 # (hypergeometric + BH, no network), independently of go_organism.
+# Tested columns: GO and, when filled, KEGG (pathway IDs, e.g. map00900) as a
+# separate family — own universe (proteins annotated in KEGG) and own BH, so the
+# GO results are identical with or without the KEGG column. Pfam is not tested.
+# A .tsv.gz file is read as well.
 perseverance_annotation_path: null  # e.g. "perseverance_annotation_protein_group.tsv"
 # Names and namespaces of the GO terms of that annotation (TSV GO, name, namespace, e.g.
 # written by annotation_import.py --terms-out): terms named and split into GO:BP / GO:CC /
 # GO:MF in the GO sheets, dashboard, Pathfinder and InSight (otherwise: GO IDs, one source).
+# KEGG pathways are named in the same table: ID in the first column, namespace "KEGG".
 # Protein groups whose leader is not annotated take the annotation of another member.
 perseverance_go_terms_path: null    # e.g. "ostrea_go_terms.tsv"
 perseverance_threads:       null    # DIAMOND threads for the RBH; null = all cores minus one

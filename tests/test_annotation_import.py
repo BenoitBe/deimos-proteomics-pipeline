@@ -187,6 +187,57 @@ def test_local_ora_named_and_split(tmp_path):
     assert set(res0.source) == {"GO:PERSEVERANCE"} and set(res0.name) == set(res0.native)
 
 
+def _go_kegg_annotation():
+    bgp = [f"P{i}" for i in range(60)]
+    ann = pd.DataFrame({
+        "protein_id": bgp,
+        "GO": ["GO:1;GO:2" if i < 10 else ("GO:3" if i < 50 else None) for i in range(60)],
+        # map00900 sur-représenté dans la requête (P0-P9) ; map00010 non
+        "KEGG": ["map00900" if i < 9 else ("map00010" if i % 3 == 0 else None)
+                 for i in range(60)]})
+    return bgp, ann
+
+
+def test_local_ora_tests_kegg_as_its_own_family(tmp_path):
+    terms = tmp_path / "t.tsv"
+    pd.DataFrame({"GO": ["GO:1", "map00900"],
+                  "name": ["alpha process", "Terpenoid backbone biosynthesis"],
+                  "namespace": ["biological_process", "KEGG"]}) \
+        .to_csv(terms, sep="\t", index=False)
+    info = load_go_terms(str(terms))
+    assert info["map00900"] == ("Terpenoid backbone biosynthesis", "KEGG")
+    bgp, ann = _go_kegg_annotation()
+    res = run_local_ora(bgp[:10], bgp, ann, term_info=info)
+    r = res.set_index("native")
+    assert r.at["map00900", "source"] == "KEGG"
+    assert r.at["map00900", "name"] == "Terpenoid backbone biosynthesis"
+    # requête KEGG = P0-P9 annotées en KEGG (P9 porte map00010) ; univers = 26, pas 60
+    assert r.at["map00900", "query_size"] == 10 and r.at["map00900", "term_size"] == 9
+    assert r.at["GO:1", "source"] == "GO:BP"
+    # sans table de noms : source KEGG quand même (vient de la colonne)
+    r0 = run_local_ora(bgp[:10], bgp, ann).set_index("native")
+    assert r0.at["map00900", "source"] == "KEGG" and r0.at["map00900", "name"] == "map00900"
+
+
+def test_kegg_column_leaves_go_results_unchanged():
+    """Familles BH séparées : la présence du KEGG ne doit changer aucune ligne GO."""
+    bgp, ann = _go_kegg_annotation()
+    with_kegg = run_local_ora(bgp[:10], bgp, ann)
+    go_only = run_local_ora(bgp[:10], bgp, ann.drop(columns="KEGG"))
+    pd.testing.assert_frame_equal(
+        with_kegg[with_kegg.source != "KEGG"].reset_index(drop=True), go_only)
+
+
+def test_group_leaders_get_member_kegg():
+    df = pd.DataFrame({"name": ["A1", "B1"], "Protein.Group": ["A1;C1", "B1"]})
+    ann = pd.DataFrame({"protein_id": ["A1", "C1"], "GO": ["GO:1", "GO:2"],
+                        "KEGG": [None, "map00900"]})
+    out = annotation_to_group_leaders(ann, df)
+    kegg = out.dropna(subset=["KEGG"])
+    assert set(zip(kegg.protein_id, kegg.KEGG)) == {("C1", "map00900"), ("A1", "map00900")}
+    assert out.dropna(subset=["GO"]).query("protein_id == 'A1'").GO.tolist() == ["GO:1"]
+
+
 def test_group_leaders_get_member_annotation():
     df = pd.DataFrame({"name": ["XP_1", "XP_3", "XP_5"],
                        "Protein.Group": ["XP_1;XP_2", "XP_3;XP_4", "XP_5"]})

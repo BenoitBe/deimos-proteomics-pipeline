@@ -4527,7 +4527,44 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     if go_enabled:
         put_section("8. FUNCTIONAL ENRICHMENT (GO)")
         put_header()
-        if params.get("go_backend", "gprofiler") == "string":
+        _la = params.get("_local_annotation")
+        if _la:
+            # ORA locale (perseverance_annotation_path) : prioritaire sur g:Profiler et
+            # STRING pour les contrastes (go_enrichment.run_go_enrichment, use_local).
+            _nk = _la.get("n_kegg", 0)
+            put_kv("Tool", "Local over-representation test (hypergeometric)",
+                   "No network call; annotation supplied by the user "
+                   "(perseverance_annotation_path)")
+            put_kv("Annotation", _la["path"],
+                   f"{_la.get('n_go', 0)} proteins with GO terms"
+                   + (f", {_nk} with KEGG pathways" if _nk else "")
+                   + ("; term names and namespaces from "
+                      f"{os.path.basename(str(params['perseverance_go_terms_path']))}"
+                      if params.get("perseverance_go_terms_path") else ""))
+            put_kv("Sources", "GO:BP, GO:CC, GO:MF" + (", KEGG" if _nk else ""),
+                   "GO terms as supplied (propagation to ancestors is the annotation's "
+                   "own)" + ("; KEGG pathways from the KEGG column" if _nk else ""))
+            put_kv("Input list", "DEP per contrast",
+                   f"Proteins passing {p_volc} < {params['volcano_p_thresh']} "
+                   f"& ratio >= {params['volcano_ratio_min']} (volcano thresholds)")
+            put_kv("Background", "quantified proteins, annotated",
+                   "Per family: proteins tested in the differential analysis carrying "
+                   "at least one term of that family (GO, KEGG); an unannotated group "
+                   "leader takes the annotation of another member of its group")
+            put_kv("Multiple correction",
+                   "FDR (Benjamini-Hochberg)" + (", GO and KEGG separately" if _nk else ""),
+                   "Threshold 0.05; terms with fewer than 3 annotated proteins in the "
+                   "background are not tested"
+                   + ("; GO (BP+CC+MF) and KEGG are two families, as g:Profiler corrects "
+                      "source by source" if _nk else ""))
+            if params.get("run_perseverance") is True and params.get(
+                    "perseverance_reference_organism"):
+                put_kv("ANOVA clusters / GSEA",
+                       f"{params['perseverance_reference_organism']} via orthologues",
+                       "Not the local annotation: g:Profiler (clusters) and g:Profiler "
+                       "gene sets (GSEA) of the reference species, proteins translated "
+                       "by reciprocal best hits (Perseverance)")
+        elif params.get("go_backend", "gprofiler") == "string":
             _bg = params.get("string_background") or params.get("enrichment_background",
                                                                   "quantified")
             _cats = params.get("string_categories") or ["Process", "Function",
@@ -5635,8 +5672,13 @@ def main():
         _perseverance_annot = pd.read_csv(_perseverance_path, sep="\t")
         go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
                     "custom_annotation": _perseverance_annot, "background": None}
+        _n_fam = {c: int(_perseverance_annot[c].notna().sum())
+                  for c in ("GO", "KEGG") if c in _perseverance_annot.columns}
+        params["_local_annotation"] = {"path": os.path.basename(str(_perseverance_path)),
+                                       **{f"n_{c.lower()}": n for c, n in _n_fam.items()}}
         print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "
-              f"({len(_perseverance_annot)} proteines annotees)")
+              f"({len(_perseverance_annot)} proteines annotees : "
+              f"{_n_fam.get('GO', 0)} GO, {_n_fam.get('KEGG', 0)} KEGG)")
         # Noms et espaces (BP/CC/MF) des termes : table GO, name, namespace
         _terms_path = params.get("perseverance_go_terms_path")
         if _terms_path:
