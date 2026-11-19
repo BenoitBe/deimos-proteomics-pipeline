@@ -425,7 +425,9 @@ proteomics_output/
 ├── matrices/                        # export_matrices: protein x sample TSV matrices + README
 ├── string_orthologs/                # STRING orthology mode: proteome cache + DIAMOND files
 ├── perseverance/                    # Perseverance: DIAMOND outputs, orthologue table
-├── pathfinder/                      # make_pathfinder: report, synthesis workbook, summary,
+├── pathfinder_report.html           # make_pathfinder: the report itself, moved up to the
+│                                    #   root — the only Pathfinder output a reader opens
+├── pathfinder/                      # make_pathfinder: synthesis workbook, summary,
 │                                    #   design used, full log
 ├── insight/                         # make_insight: figures 01-06 (PNG + SVG),
 │                                    #   insight_report.html, insight_log.txt

@@ -109,6 +109,19 @@ and dashboard improvements accumulated since the previous public version.
     degrees of freedom globally against 9 per time point.
   - `tests/test_anova_strata.py` (11 tests).
 
+### Changed
+
+- **`pathfinder_report.html` now sits at the root of `out_dir`.** It is the only Pathfinder
+  output a reader opens; the synthesis workbook, the summary, the log and the design stay
+  working material and stay in `pathfinder/`. One folder less for the one file people
+  actually read. Moved, not copied: the report embeds its figures in base64 and references
+  no sibling file, verified on a real report. `pathfinder_report_at_root: false` restores
+  the previous layout, and a failed move leaves the report where Pathfinder wrote it with
+  a warning — this step must never fail a run that produced its report.
+  The end-of-run sweep only looks at `.png`/`.tiff`, so the report at the root is safe
+  there; a test pins that, because a sweep extended to HTML would lose it exactly as it
+  lost `diagnostic_batch.png`.
+
 ### Added
 
 - **An audit that fails the build on an inert configuration key**

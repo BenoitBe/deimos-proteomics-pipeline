@@ -330,12 +330,46 @@ def build_pathfinder_argv(pf_dir, xlsx_path, design_csv, pf_out, params, *,
     return argv
 
 
+PATHFINDER_REPORT_NAME = "pathfinder_report.html"
+
+
+def surface_pathfinder_report(html, out_dir, params):
+    """Remonte le rapport à la racine de out_dir ; le reste demeure dans pathfinder/.
+
+    Le rapport est la seule sortie que le destinataire ouvre ; le classeur de
+    synthèse, le résumé, le log et le design restent du matériel de travail. Un
+    niveau de dossier de moins pour le seul fichier qu'on lit vraiment.
+
+    Déplacement et non copie : le rapport embarque ses figures en base64 et ne
+    référence aucun fichier voisin (vérifié sur un rapport réel : aucun src/href
+    relatif). Le dupliquer coûterait quelques mégaoctets pour rien.
+
+    `pathfinder_report_at_root: false` rétablit l'ancienne disposition. En cas
+    d'échec du déplacement, le rapport reste où Pathfinder l'a écrit et le
+    chemin retourné reste valide — cette étape ne doit jamais faire échouer un
+    run qui a produit son rapport.
+    """
+    if not (params or {}).get("pathfinder_report_at_root", True):
+        return html
+    dest = os.path.join(out_dir, PATHFINDER_REPORT_NAME)
+    if os.path.abspath(dest) == os.path.abspath(html):
+        return html
+    try:
+        os.replace(html, dest)      # même volume : atomique, écrase un run antérieur
+        return dest
+    except OSError as e:
+        print(f"  [WARN] Report left in pathfinder/ ({type(e).__name__}: {e})")
+        return html
+
+
 def run_pathfinder_step(xlsx_path, design, params, out_dir, *, go_ran=True,
                         perseverance=False):
     """Lance Pathfinder sur le classeur qui vient d'être écrit.
 
     Ne lève jamais : retourne le chemin du rapport HTML, ou None (raison affichée).
-    Sorties dans <out_dir>/pathfinder/, sortie complète dans pathfinder_log.txt."""
+    Sorties dans <out_dir>/pathfinder/, sortie complète dans pathfinder_log.txt.
+    Le rapport lui-même remonte ensuite à la racine de out_dir, sauf si
+    `pathfinder_report_at_root` vaut false (voir surface_pathfinder_report)."""
     try:
         pf_dir = locate_pathfinder(params)
         if pf_dir is None:
@@ -378,7 +412,7 @@ def run_pathfinder_step(xlsx_path, design, params, out_dir, *, go_ran=True,
                 print(f"  [WARN] Pathfinder stopped (timeout of {timeout} s exceeded) "
                       f"— see {log_path}")
                 return None
-        html = os.path.join(pf_out, "pathfinder_report.html")
+        html = os.path.join(pf_out, PATHFINDER_REPORT_NAME)
         if r.returncode != 0 or not os.path.exists(html):
             print(f"  [WARN] Pathfinder failed (exit code {r.returncode}) — see {log_path}")
             for line in _tail(log_path):
@@ -390,7 +424,7 @@ def run_pathfinder_step(xlsx_path, design, params, out_dir, *, go_ran=True,
         # du rapport sans que rien ne le signale dans la sortie de Deimos.
         for line in _skipped_steps(log_path):
             print(f"  [WARN] Pathfinder: {line}")
-        return html
+        return surface_pathfinder_report(html, out_dir, params)
     except Exception as e:      # garde-fou : Pathfinder ne doit jamais interrompre Deimos
         print(f"  [WARN] Pathfinder not run ({type(e).__name__}: {e})")
         return None
