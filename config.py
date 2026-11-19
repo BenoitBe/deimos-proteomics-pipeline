@@ -105,6 +105,8 @@ _DEFAULTS = {
     "pathfinder_publications": False,  # True = axe Publications (STRING PMID, réseau)
     "pathfinder_options":  {},      # ex: {pthr: 0.05, jaccard: 0.5, no_umap: true, k: 6, groups_from: auto}
     "pathfinder_timeout":  1800,    # secondes
+    "pathfinder_report_at_root": True,  # rapport à la racine de out_dir ;
+                                   # les autres sorties restent dans pathfinder/
     # InSight (lecture biologique : figures + page récit, après Pathfinder, processus séparé)
     "make_insight":        False,   # True = lancer InSight en toute fin de run
     "insight_path":        None,    # clone InSight ; None = $INSIGHT_HOME puis ../InSight

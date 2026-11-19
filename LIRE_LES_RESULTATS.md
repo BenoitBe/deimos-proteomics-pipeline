@@ -8,9 +8,9 @@ par où commencer.
 proteomics_output/
 ├── ProteomicAnalysis_Results.xlsx   les chiffres, c'est la source
 ├── Proteomic_dashboard.html         explorer, filtrer, exporter  (nom réglable)
-├── pathfinder/pathfinder_report.html   la lecture d'ensemble
-├── pathfinder/pathfinder_synthesis.xlsx
-├── pathfinder/pathfinder_summary.md
+├── pathfinder_report.html           la lecture d'ensemble
+├── pathfinder/                      le matériel de travail de Pathfinder :
+│                                    synthesis.xlsx, summary.md, log, design
 ├── Volcanos/                        volcanos individuels + facet, pour les figures
 ├── matrices/                        tables brutes pour R / Perseus
 └── last_config.yaml                 ce qui a été demandé — à joindre à toute question
@@ -119,7 +119,7 @@ biologique :
 
 ---
 
-## 4. Le rapport `pathfinder/pathfinder_report.html`
+## 4. Le rapport `pathfinder_report.html`
 
 Là où Deimos liste, Pathfinder **rapproche** : il croise les contrastes, regroupe
 les termes redondants et écrit des phrases. Lui aussi s'ouvre hors ligne, en

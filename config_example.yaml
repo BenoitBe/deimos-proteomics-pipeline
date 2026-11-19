@@ -266,6 +266,13 @@ pathfinder_options:      {}      # e.g. {jaccard: 0.5, no_umap: true}; proteins 
                                  # unset keys fall back to insight_options
 pathfinder_timeout:      1800    # seconds
 
+# The report is the only output a reader opens; the synthesis workbook, the
+# summary, the log and the design stay working material. So pathfinder_report.html
+# is moved up to <out_dir>/ and everything else stays in <out_dir>/pathfinder/.
+# Moved, not copied: the report embeds its figures in base64 and references no
+# sibling file. false restores the previous layout.
+pathfinder_report_at_root: true
+
 # InSight — biological-reading figures + narrative report at the very end (also: --insight)
 # Separate process on the saved workbook and matrices/, after Pathfinder: no question, no
 # recomputation, never stops Deimos. Works for any design (time course or not).

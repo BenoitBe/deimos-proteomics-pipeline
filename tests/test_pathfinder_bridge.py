@@ -222,7 +222,12 @@ class TestRunPathfinderStep:
         params = {"pathfinder_path": str(pf), "go_backend": "string",
                   "go_species_taxid": "1304", "pathfinder_options": {"pthr": 0.01}}
         html = pb.run_pathfinder_step(xlsx, DESIGN, params, str(tmp_path), go_ran=False)
-        assert html and html.endswith(os.path.join("pathfinder", "pathfinder_report.html"))
+        # Depuis le 19/11/2026 le rapport remonte à la racine de out_dir ; le reste
+        # des sorties demeure dans pathfinder/.
+        assert html == str(tmp_path / "pathfinder_report.html")
+        assert (tmp_path / "pathfinder_report.html").exists()
+        assert not (tmp_path / "pathfinder" / "pathfinder_report.html").exists()
+        assert (tmp_path / "pathfinder" / "pathfinder_log.txt").exists()
         import json
         info = json.loads((tmp_path / "pathfinder" / "argv.json").read_text())
         a = info["argv"]
@@ -362,3 +367,97 @@ def test_make_insight_is_absorbed_by_pathfinder_13(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(pb, "locate_pathfinder", lambda params: None)
     p = {"make_insight": True}
     assert pb.resolve_reading(p) == "insight" and not p.get("make_pathfinder")
+
+
+# --- Le rapport remonte à la racine, le reste demeure dans pathfinder/ -------
+
+def _pf_out(tmp_path):
+    """Un dossier pathfinder/ tel que Pathfinder le laisse."""
+    out = tmp_path / "out"
+    pf = out / "pathfinder"
+    pf.mkdir(parents=True)
+    (pf / "pathfinder_report.html").write_text("<html>rapport</html>", encoding="utf-8")
+    for other in ("pathfinder_synthesis.xlsx", "pathfinder_summary.md",
+                  "pathfinder_log.txt", "design_pathfinder.csv"):
+        (pf / other).write_text("x", encoding="utf-8")
+    return out, pf
+
+
+def test_le_rapport_remonte_a_la_racine(tmp_path):
+    from pathfinder_bridge import surface_pathfinder_report
+
+    out, pf = _pf_out(tmp_path)
+    dest = surface_pathfinder_report(str(pf / "pathfinder_report.html"), str(out), {})
+
+    assert dest == str(out / "pathfinder_report.html")
+    assert (out / "pathfinder_report.html").exists()
+    assert (out / "pathfinder_report.html").read_text(encoding="utf-8") == "<html>rapport</html>"
+    # déplacement, pas copie : pas de doublon de plusieurs mégaoctets
+    assert not (pf / "pathfinder_report.html").exists()
+
+
+def test_les_autres_sorties_restent_dans_pathfinder(tmp_path):
+    from pathfinder_bridge import surface_pathfinder_report
+
+    out, pf = _pf_out(tmp_path)
+    surface_pathfinder_report(str(pf / "pathfinder_report.html"), str(out), {})
+
+    for other in ("pathfinder_synthesis.xlsx", "pathfinder_summary.md",
+                  "pathfinder_log.txt", "design_pathfinder.csv"):
+        assert (pf / other).exists(), other
+    assert sorted(p.name for p in out.iterdir()) == ["pathfinder", "pathfinder_report.html"]
+
+
+def test_la_cle_false_retablit_l_ancienne_disposition(tmp_path):
+    from pathfinder_bridge import surface_pathfinder_report
+
+    out, pf = _pf_out(tmp_path)
+    src = str(pf / "pathfinder_report.html")
+    dest = surface_pathfinder_report(src, str(out), {"pathfinder_report_at_root": False})
+
+    assert dest == src
+    assert (pf / "pathfinder_report.html").exists()
+    assert not (out / "pathfinder_report.html").exists()
+
+
+def test_un_rapport_d_un_run_anterieur_est_ecrase(tmp_path):
+    from pathfinder_bridge import surface_pathfinder_report
+
+    out, pf = _pf_out(tmp_path)
+    (out / "pathfinder_report.html").write_text("ancien run", encoding="utf-8")
+    surface_pathfinder_report(str(pf / "pathfinder_report.html"), str(out), {})
+
+    assert (out / "pathfinder_report.html").read_text(encoding="utf-8") == "<html>rapport</html>"
+
+
+def test_un_echec_de_deplacement_ne_perd_pas_le_rapport(tmp_path, monkeypatch, capsys):
+    """Cette étape ne doit jamais faire échouer un run qui a produit son rapport."""
+    import pathfinder_bridge
+
+    out, pf = _pf_out(tmp_path)
+    src = str(pf / "pathfinder_report.html")
+
+    def _boom(a, b):
+        raise OSError("volume plein")
+    monkeypatch.setattr(pathfinder_bridge.os, "replace", _boom)
+
+    dest = pathfinder_bridge.surface_pathfinder_report(src, str(out), {})
+    assert dest == src                       # chemin retourné toujours valide
+    assert (pf / "pathfinder_report.html").exists()
+    assert "[WARN]" in capsys.readouterr().out
+
+
+def test_le_nettoyage_ne_balaie_pas_le_rapport(tmp_path):
+    """Le ménage de l'étape 16 ne regarde que les images — mais si cela changeait,
+    le rapport à la racine disparaîtrait comme diagnostic_batch.png l'avait fait."""
+    import inspect
+    import deimos
+
+    src = inspect.getsource(deimos.main) if hasattr(deimos, "main") else ""
+    if "Removing temporary figures" not in src:
+        src = open("deimos.py", encoding="utf-8").read()
+    i = src.index("Removing temporary figures")
+    bloc = src[i:i + 600]
+    assert ".png" in bloc and ".html" not in bloc, (
+        "le nettoyage touche désormais au HTML : pathfinder_report.html doit "
+        "être ajouté à figures_to_keep()")
