@@ -5,6 +5,7 @@ import sys
 import textwrap
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -187,6 +188,69 @@ def test_local_ora_named_and_split(tmp_path):
     assert set(res0.source) == {"GO:PERSEVERANCE"} and set(res0.name) == set(res0.native)
 
 
+def _go_kegg_annotation():
+    bgp = [f"P{i}" for i in range(60)]
+    ann = pd.DataFrame({
+        "protein_id": bgp,
+        "GO": ["GO:1;GO:2" if i < 10 else ("GO:3" if i < 50 else None) for i in range(60)],
+        # map00900 sur-représenté dans la requête (P0-P9) ; map00010 non
+        "KEGG": ["map00900" if i < 9 else ("map00010" if i % 3 == 0 else None)
+                 for i in range(60)]})
+    return bgp, ann
+
+
+def test_local_ora_tests_kegg_as_its_own_family(tmp_path):
+    terms = tmp_path / "t.tsv"
+    pd.DataFrame({"GO": ["GO:1", "map00900"],
+                  "name": ["alpha process", "Terpenoid backbone biosynthesis"],
+                  "namespace": ["biological_process", "KEGG"]}) \
+        .to_csv(terms, sep="\t", index=False)
+    info = load_go_terms(str(terms))
+    assert info["map00900"] == ("Terpenoid backbone biosynthesis", "KEGG")
+    bgp, ann = _go_kegg_annotation()
+    res = run_local_ora(bgp[:10], bgp, ann, term_info=info)
+    r = res.set_index("native")
+    assert r.at["map00900", "source"] == "KEGG"
+    assert r.at["map00900", "name"] == "Terpenoid backbone biosynthesis"
+    # requête KEGG = P0-P9 annotées en KEGG (P9 porte map00010) ; univers = 26, pas 60
+    assert r.at["map00900", "query_size"] == 10 and r.at["map00900", "term_size"] == 9
+    assert r.at["GO:1", "source"] == "GO:BP"
+    # sans table de noms : source KEGG quand même (vient de la colonne)
+    r0 = run_local_ora(bgp[:10], bgp, ann).set_index("native")
+    assert r0.at["map00900", "source"] == "KEGG" and r0.at["map00900", "name"] == "map00900"
+
+
+def test_kegg_orthology_numbers_are_not_tested_as_pathways():
+    """annotation_import.py garde les KO (K00001) dans la colonne KEGG : ce ne sont
+    pas des voies, ils ne doivent pas former de termes KEGG."""
+    bgp, ann = _go_kegg_annotation()
+    ann["KEGG"] = ann["KEGG"].map(lambda v: f"K00001;{v}" if isinstance(v, str) else "K00002")
+    res = run_local_ora(bgp[:10], bgp, ann)
+    kegg = set(res.loc[res.source == "KEGG", "native"])
+    assert "map00900" in kegg and not any(k.startswith("K") for k in kegg)
+    only_ko = ann.assign(KEGG="K00001")
+    assert not (run_local_ora(bgp[:10], bgp, only_ko).source == "KEGG").any()
+
+
+def test_kegg_column_leaves_go_results_unchanged():
+    """Familles BH séparées : la présence du KEGG ne doit changer aucune ligne GO."""
+    bgp, ann = _go_kegg_annotation()
+    with_kegg = run_local_ora(bgp[:10], bgp, ann)
+    go_only = run_local_ora(bgp[:10], bgp, ann.drop(columns="KEGG"))
+    pd.testing.assert_frame_equal(
+        with_kegg[with_kegg.source != "KEGG"].reset_index(drop=True), go_only)
+
+
+def test_group_leaders_get_member_kegg():
+    df = pd.DataFrame({"name": ["A1", "B1"], "Protein.Group": ["A1;C1", "B1"]})
+    ann = pd.DataFrame({"protein_id": ["A1", "C1"], "GO": ["GO:1", "GO:2"],
+                        "KEGG": [None, "map00900"]})
+    out = annotation_to_group_leaders(ann, df)
+    kegg = out.dropna(subset=["KEGG"])
+    assert set(zip(kegg.protein_id, kegg.KEGG)) == {("C1", "map00900"), ("A1", "map00900")}
+    assert out.dropna(subset=["GO"]).query("protein_id == 'A1'").GO.tolist() == ["GO:1"]
+
+
 def test_group_leaders_get_member_annotation():
     df = pd.DataFrame({"name": ["XP_1", "XP_3", "XP_5"],
                        "Protein.Group": ["XP_1;XP_2", "XP_3;XP_4", "XP_5"]})
@@ -252,3 +316,55 @@ def test_an_evalue_column_is_recognised_by_its_shape(tmp_path):
     df2 = df.assign(**{"p-value": np.linspace(20, 99, 65)})
     col2, maybe2 = find_evalue_column(df2)
     assert col2 is None and maybe2 == ["p-value"]           # signalée, pas devinée
+
+
+def test_resolve_input_path_falls_back_to_pg_matrix_folder(tmp_path, monkeypatch):
+    import deimos as D
+    data = tmp_path / "data"; data.mkdir()
+    (data / "ann.tsv.gz").write_bytes(b"")
+    run = tmp_path / "run"; run.mkdir()
+    monkeypatch.chdir(run)
+    params = {"tsv_path": str(data / "report.pg_matrix.tsv")}
+    assert D._resolve_input_path("ann.tsv.gz", params) == str(data / "ann.tsv.gz")
+    assert D._resolve_input_path("absent.tsv", params) is None
+    (run / "ann.tsv.gz").write_bytes(b"")              # le dossier courant reste prioritaire
+    assert D._resolve_input_path("ann.tsv.gz", params) == "ann.tsv.gz"
+
+
+def _darmor_like_pg_matrix(path, n=30):
+    """pg_matrix DIA-NN sur un FASTA sans noms UniProt (Darmor-bzh) : Protein.Names,
+    Genes et description vides, sauf sur les contaminants cRAP."""
+    rows = [[f"A01p{i:05d}.1_BnaDAR"] * 2 + ["", "", "", 1] for i in range(n)]
+    rows += [["cRAP-KRT1", "cRAP-KRT1", "K2C1_HUMAN", "KRT1", "Keratin", 1]]
+    meta = ["Protein.Group", "Protein.Ids", "Protein.Names", "Genes",
+            "First.Protein.Description", "N.Seq"]
+    df = pd.DataFrame(rows, columns=meta)
+    for i in range(1, 5):
+        df[f"D:\\raw\\x_Sple-{i}_DIA.raw"] = np.random.default_rng(i).lognormal(10, 1, len(df))
+    df.to_csv(path, sep="\t", index=False)
+
+
+def test_empty_protein_names_do_not_crash_loading(tmp_path):
+    """Régression (pandas 3) : Protein.Names entièrement vide après retrait des cRAP
+    -> AttributeError '.str accessor ... not floating' dans detect_species_tags."""
+    import deimos as D
+    tsv_p, des_p = tmp_path / "report.pg_matrix.tsv", tmp_path / "design.csv"
+    _darmor_like_pg_matrix(tsv_p)
+    pd.DataFrame({"label": [f"Sple-{i}" for i in range(1, 5)],
+                  "condition": ["A", "A", "B", "B"], "replicate": [1, 2, 1, 2]}) \
+        .to_csv(des_p, sep=";", index=False)
+    tsv, _ = D.load_data(str(tsv_p), str(des_p), annotation_fasta=False)
+    assert len(tsv) == 30 and tsv["name"].str.endswith("_BnaDAR").all()
+    tags = D.detect_species_tags(tsv)
+    assert tags.isna().all()
+
+
+def test_gsea_gene_keys_with_empty_genes_column():
+    """pandas 3 : astype(str) garde NaN -> ni plantage, ni clé NaN dans les tables."""
+    from gsea_enrichment import _key_proteins, gprofiler_gene_keys
+    df = pd.DataFrame({"name": ["P1", "P2", "P3"], "Genes": [np.nan, np.nan, "rbcL;rbcS"]})
+    assert _key_proteins(df) == {"RBCL": ["P3"]}
+    assert _key_proteins(df.assign(Genes=np.nan)) == {}
+    key_map, *_ = gprofiler_gene_keys(df, "athaliana", convert_fn=lambda ids, code: [],
+                                      verbose=False)
+    assert key_map == {"P3": "RBCL"}

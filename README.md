@@ -135,7 +135,8 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     (XP_…), which STRING cannot place, set `string_reference_taxid` to a related species indexed
     in STRING: the orthology mode is then used directly
   - **Your own annotation** (`perseverance_annotation_path`): local enrichment (hypergeometric +
-    BH, no network) on a `protein_id, GO` table. An annotation delivered by a collaborator (Excel
+    BH, no network) on a `protein_id, GO` table; a `KEGG` column (pathway IDs, e.g. `map00900`)
+    is tested too, as its own family (own universe, own BH). An annotation delivered by a collaborator (Excel
     Trinotate/Blast2GO, topGO background file) is converted by `annotation_import.py` and, when it
     is keyed on another gene model set, transferred to your search IDs with `perseverance.py`
     (see `README_PERSEVERANCE.md`). `perseverance_go_terms_path` (table `GO, name, namespace`,

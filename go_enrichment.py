@@ -227,13 +227,16 @@ def _benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
 
 _NAMESPACE_SOURCE = {"biological_process": "GO:BP", "cellular_component": "GO:CC",
                      "molecular_function": "GO:MF", "bp": "GO:BP", "cc": "GO:CC",
-                     "mf": "GO:MF", "go:bp": "GO:BP", "go:cc": "GO:CC", "go:mf": "GO:MF"}
+                     "mf": "GO:MF", "go:bp": "GO:BP", "go:cc": "GO:CC", "go:mf": "GO:MF",
+                     "kegg": "KEGG"}
 
 
 def load_go_terms(path: str) -> dict:
     """Table GO, name, namespace (annotation_import.py --terms-out, ou toute table
     équivalente) -> {GO: (nom, source GO:BP/CC/MF ou None)}. Colonnes reconnues
-    sans tenir compte de la casse ; namespace optionnel."""
+    sans tenir compte de la casse ; namespace optionnel. Les voies KEGG de la
+    colonne KEGG de l'annotation se nomment dans la même table (identifiant dans
+    la 1re colonne, ex. map00900, namespace « KEGG »)."""
     t = pd.read_csv(path, sep="\t", dtype=str).fillna("")
     cols = {c.lower(): c for c in t.columns}
     gcol = cols.get("go") or cols.get("term_id") or cols.get("go_id") or t.columns[0]
@@ -248,34 +251,45 @@ def load_go_terms(path: str) -> dict:
     return out
 
 
+# Colonnes de l'annotation locale testées par run_local_ora, une famille BH chacune.
+LOCAL_ORA_COLUMNS = ("GO", "KEGG")
+# Identifiant de voie KEGG : carte générique (map), KO (ko) ou espèce (ath, hsa...).
+KEGG_PATHWAY_RE = r"[a-z]{2,4}\d{5}"
+
+
 def annotation_to_group_leaders(annotation: pd.DataFrame, df: pd.DataFrame,
                                 id_col: str = "name") -> pd.DataFrame:
     """L'ORA local apparie sur la protéine de tête de chaque groupe (1er accession
     de Protein.Group). Une annotation indexée par accession individuelle (sortie
     brute de Perseverance, isoformes RefSeq...) est ajoutée aux têtes de groupe à
-    partir des autres membres annotés : union des GO, rien n'est retiré. Sans
-    colonne Protein.Group, l'annotation est rendue telle quelle."""
+    partir des autres membres annotés : union des termes, rien n'est retiré. GO et
+    KEGG sont traités chacun de leur côté (une tête annotée en GO mais pas en KEGG
+    reçoit le KEGG d'un membre). Sans colonne Protein.Group, l'annotation est
+    rendue telle quelle."""
     if annotation is None or "Protein.Group" not in df.columns or annotation.empty:
         return annotation
-    ann = annotation.dropna(subset=["GO"])
-    by_id = {}
-    for pid, go in zip(ann["protein_id"].astype(str), ann["GO"].astype(str)):
-        by_id.setdefault(pid.strip(), set()).update(
-            g.strip() for g in go.split(";") if g.strip())
     leaders = (df[id_col] if id_col in df.columns else df["Protein.Group"]).astype(str) \
         .str.split(";").str[0].str.strip()
-    add = []
-    for lead, grp in zip(leaders, df["Protein.Group"].astype(str)):
-        if lead in by_id:
-            continue
-        gos = set()
-        for m in grp.split(";")[1:]:
-            gos |= by_id.get(m.strip(), set())
-        if gos:
-            add.append({"protein_id": lead, "GO": ";".join(sorted(gos))})
+    groups = df["Protein.Group"].astype(str)
+    add, filled = [], set()
+    for col in [c for c in LOCAL_ORA_COLUMNS if c in annotation.columns]:
+        ann = annotation.dropna(subset=[col])
+        by_id = {}
+        for pid, terms in zip(ann["protein_id"].astype(str), ann[col].astype(str)):
+            by_id.setdefault(pid.strip(), set()).update(
+                g.strip() for g in terms.split(";") if g.strip())
+        for lead, grp in zip(leaders, groups):
+            if lead in by_id:
+                continue
+            got = set()
+            for m in grp.split(";")[1:]:
+                got |= by_id.get(m.strip(), set())
+            if got:
+                add.append({"protein_id": lead, col: ";".join(sorted(got))})
+                filled.add(lead)
     if not add:
         return annotation
-    print(f"    [INFO] {len(add)} protein groups annotated from another member of the group "
+    print(f"    [INFO] {len(filled)} protein groups annotated from another member of the group "
           f"(leader without annotation).")
     return pd.concat([annotation, pd.DataFrame(add)], ignore_index=True)
 
@@ -303,9 +317,22 @@ def run_local_ora(query: list[str], background: list[str],
     query           : IDs des protéines significatives (sortie de
                       isolate_significant)
     background      : IDs de TOUTES les protéines quantifiées (univers)
+    Familles testées : la colonne GO (BP/CC/MF ensemble, comportement d'origine)
+    et, si l'annotation en a une, la colonne KEGG (voies, ex. map00900). Chaque
+    famille a son propre univers (protéines du background annotées dans CETTE
+    famille) et sa propre correction BH : ajouter le KEGG ne change donc aucune
+    p-value GO, et le KEGG (~100-150 voies) n'est pas pénalisé par les milliers
+    de termes GO — comme g:Profiler, qui corrige source par source.
+
+    Parameters
+    ----------
+    query           : IDs des protéines significatives (sortie de
+                      isolate_significant)
+    background      : IDs de TOUTES les protéines quantifiées (univers)
     annotation_long : DataFrame avec au moins les colonnes 'protein_id' et
                       'GO' (GO en liste ';'-séparée OU déjà explosée, une
-                      ligne par (protéine, terme))
+                      ligne par (protéine, terme)) ; colonne 'KEGG'
+                      optionnelle, même format
     min_term_size   : taille minimum d'un terme dans le background pour
                       être testé (évite les termes anecdotiques)
     source_label    : valeur de la colonne 'source' en sortie (permet de
@@ -313,7 +340,8 @@ def run_local_ora(query: list[str], background: list[str],
                       les mêmes graphiques/exports)
     term_info       : {GO: (nom, source)} (load_go_terms) : termes nommés et
                       répartis en GO:BP / GO:CC / GO:MF ; sans table, le nom
-                      est l'identifiant et la source source_label
+                      est l'identifiant et la source source_label. Les voies
+                      de la colonne KEGG ont toujours la source 'KEGG'.
 
     Returns
     -------
@@ -321,20 +349,45 @@ def run_local_ora(query: list[str], background: list[str],
     prêt à passer directement à process_enrichment(), ou None si rien de
     testable/significatif.
     """
+    background_set = set(background)
+    found = []
+    for col in LOCAL_ORA_COLUMNS:
+        if col not in annotation_long.columns:
+            continue
+        res = _local_ora_family(query, background_set, annotation_long, col,
+                                min_term_size, term_info,
+                                source_label if col == "GO" else col)
+        if res is not None:
+            found.append(res)
+    if not found:
+        return None
+    # tri stable : l'ordre interne de chaque famille (ex aequo compris) est conservé
+    return pd.concat(found, ignore_index=True).sort_values("p_value", kind="stable") \
+        .reset_index(drop=True)
+
+
+def _local_ora_family(query, background_set, annotation_long, col, min_term_size,
+                      term_info, default_source):
+    """Test hypergéométrique + BH d'UNE famille de termes (colonne GO ou KEGG)."""
     from scipy.stats import hypergeom
 
-    df = annotation_long[["protein_id", "GO"]].dropna(subset=["GO"]).copy()
-    df["GO"] = df["GO"].astype(str)
-    if df["GO"].str.contains(";").any():
-        df = df.assign(GO=df["GO"].str.split(";")).explode("GO")
-    df["GO"] = df["GO"].str.strip()
-    df = df[df["GO"] != ""]
+    df = annotation_long[["protein_id", col]].dropna(subset=[col]).copy()
+    df = df.rename(columns={col: "term"})
+    df["term"] = df["term"].astype(str)
+    if df["term"].str.contains(";").any():
+        df = df.assign(term=df["term"].str.split(";")).explode("term")
+    df["term"] = df["term"].str.strip()
+    df = df[df["term"] != ""]
+    if col == "KEGG":
+        # Voies seulement (map00900, ko00900, ath00900) : les numéros KO (K00001,
+        # gardés par annotation_import.py) sont des familles de gènes, pas des voies.
+        df = df[df["term"].str.fullmatch(KEGG_PATHWAY_RE)]
 
-    background_set = set(background)
     df = df[df["protein_id"].isin(background_set)]
     if df.empty:
-        print("    [WARN] Aucune protéine du background n'a d'annotation "
-              "GO fournie (Perseverance) — ORA local impossible.")
+        if col == "GO":
+            print("    [WARN] Aucune protéine du background n'a d'annotation "
+                  "GO fournie (Perseverance) — ORA local impossible.")
         return None
 
     annotated_background = set(df["protein_id"].unique())
@@ -342,13 +395,14 @@ def run_local_ora(query: list[str], background: list[str],
     query_annotated = [p for p in query if p in annotated_background]
     n = len(query_annotated)
     if n == 0:
-        print("    [INFO] Aucune protéine significative n'a d'annotation "
-              "GO transférée — pas de test possible pour ce contraste.")
+        if col == "GO":
+            print("    [INFO] Aucune protéine significative n'a d'annotation "
+                  "GO transférée — pas de test possible pour ce contraste.")
         return None
     query_set = set(query_annotated)
 
     rows = []
-    for go_id, members in df.groupby("GO")["protein_id"].apply(set).items():
+    for term_id, members in df.groupby("term")["protein_id"].apply(set).items():
         K = len(members)
         if K < min_term_size:
             continue
@@ -357,11 +411,12 @@ def run_local_ora(query: list[str], background: list[str],
         if k == 0:
             continue
         pval = hypergeom.sf(k - 1, N, K, n)
-        nm, src = (term_info or {}).get(go_id, (go_id, None))
+        nm, src = (term_info or {}).get(term_id, (term_id, None))
         rows.append({
-            "native": go_id, "name": nm or go_id, "p_value": pval,
+            "native": term_id, "name": nm or term_id, "p_value": pval,
             "term_size": K, "query_size": n, "intersection_size": k,
-            "source": src or source_label, "intersections": sorted(inter),
+            "source": (src if col == "GO" else None) or default_source,
+            "intersections": sorted(inter),
         })
 
     if not rows:

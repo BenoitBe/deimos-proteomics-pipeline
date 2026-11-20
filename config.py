@@ -361,7 +361,14 @@ def print_config_summary(params: dict) -> None:
                "mixed_legacy": "Mixed, legacy rule (QRILC + kNN per condition)",
                "auto": "Auto (Mixed if >= 20% MAR, else QRILC)"}.get(
                params.get("impute_method", "auto"), str(params.get("impute_method")))
-    if params.get("go_backend", "gprofiler") == "string":
+    if params.get("perseverance_annotation_path"):
+        # ORA locale : prioritaire sur g:Profiler / STRING pour les contrastes
+        _ref = params.get("perseverance_reference_organism")
+        go_txt = (f"local ORA on {os.path.basename(str(params['perseverance_annotation_path']))}"
+                  f" (GO, + KEGG if the column has pathways)"
+                  + (f"; ANOVA clusters: gProfiler {_ref} via orthologues"
+                     if params.get("run_perseverance") is True and _ref else ""))
+    elif params.get("go_backend", "gprofiler") == "string":
         go_txt = (f"STRING, taxid {params['go_species_taxid']} "
                   f"(background: {params.get('string_background') or params.get('enrichment_background', 'quantified')})"
                   if params.get("go_species_taxid") else "no (STRING without taxid)")

@@ -704,7 +704,7 @@ def annotate_from_fasta(tsv: pd.DataFrame, tsv_path: str, setting="__auto__") ->
     explicit = None if setting == "__auto__" else setting
     have = 0
     if "Genes" in tsv.columns:
-        g = tsv["Genes"].astype(str).str.strip()
+        g = tsv["Genes"].fillna("").astype(str).str.strip()   # pandas 3 : NaN != "nan"
         have = int((~g.isin(["", "|", "nan", "None", "NaN"])).sum())
     if explicit is None and len(tsv) and have > 0.5 * len(tsv):
         return None                                   # DIA-NN a déjà les noms
@@ -805,7 +805,9 @@ def load_data(tsv_path: str, design_path: str,
     tsv = tsv.rename(columns=rename_map)
 
     # Colonnes ID et name
-    tsv["ID"]   = tsv["Protein.Names"].astype(str).str.split(";").str[0]
+    # 1re entrée avant ";" sans chaîner .str : sous pandas 3, une colonne entièrement
+    # vide (FASTA sans noms UniProt, ex. Darmor-bzh) fait échouer .split().str[0].
+    tsv["ID"]   = tsv["Protein.Names"].astype(str).str.replace(r";.*", "", regex=True)
     tsv["name"] = tsv["Protein.Group"].astype(str).str.split(";").str[0]
 
     # Retirer contaminants cRAP
@@ -833,7 +835,7 @@ def detect_species_tags(tsv: pd.DataFrame, col: str = "Protein.Names") -> pd.Ser
     Retourne une Series alignée sur l'index de tsv, NaN si aucun suffixe
     reconnu (protéine sans tag exploitable — ni perdue ni mal classée).
     """
-    first_entry = tsv[col].astype(str).str.split(";").str[0]
+    first_entry = tsv[col].astype(str).str.replace(r";.*", "", regex=True)  # cf. load_data
     tags = first_entry.str.extract(r"_([A-Za-z0-9]{3,10})$")[0]
     # Contaminants (cRAP-, CON__, contam_...) : leurs suffixes _HUMAN/_BOVIN
     # (kératines, trypsine...) ne sont pas des organismes de l'étude —
@@ -1003,10 +1005,15 @@ def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
         else:
             fasta_a, fasta_b = ask_fasta_paths(candidates)
 
-    if not (os.path.isfile(fasta_a) and os.path.isfile(fasta_b)):
-        print(f"  [WARN] FASTA introuvable(s) ({fasta_a}, {fasta_b}) — "
-              f"Perseverance ignoré.")
+    _fa = _resolve_input_path(fasta_a, params)
+    _fb = _resolve_input_path(fasta_b, params)
+    if not (_fa and _fb):
+        _miss = [f for f, ok in ((fasta_a, _fa), (fasta_b, _fb)) if not ok]
+        print(f"  [WARN] FASTA introuvable(s) : {', '.join(map(str, _miss))} (cherché dans "
+              f"{os.getcwd()} et le dossier du pg_matrix) — Perseverance ignoré : pas "
+              f"d'orthologues, donc ni GSEA ni GO des clusters via l'espèce de référence.")
         return None, None
+    fasta_a, fasta_b = _fa, _fb
 
     id_col = "name" if "name" in df_results.columns else df_results.columns[0]
     protein_groups = df_results[id_col].astype(str).tolist()
@@ -4527,7 +4534,44 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
     if go_enabled:
         put_section("8. FUNCTIONAL ENRICHMENT (GO)")
         put_header()
-        if params.get("go_backend", "gprofiler") == "string":
+        _la = params.get("_local_annotation")
+        if _la:
+            # ORA locale (perseverance_annotation_path) : prioritaire sur g:Profiler et
+            # STRING pour les contrastes (go_enrichment.run_go_enrichment, use_local).
+            _nk = _la.get("n_kegg", 0)
+            put_kv("Tool", "Local over-representation test (hypergeometric)",
+                   "No network call; annotation supplied by the user "
+                   "(perseverance_annotation_path)")
+            put_kv("Annotation", _la["path"],
+                   f"{_la.get('n_go', 0)} proteins with GO terms"
+                   + (f", {_nk} with KEGG pathways" if _nk else "")
+                   + ("; term names and namespaces from "
+                      f"{os.path.basename(str(params['perseverance_go_terms_path']))}"
+                      if params.get("perseverance_go_terms_path") else ""))
+            put_kv("Sources", "GO:BP, GO:CC, GO:MF" + (", KEGG" if _nk else ""),
+                   "GO terms as supplied (propagation to ancestors is the annotation's "
+                   "own)" + ("; KEGG pathways from the KEGG column" if _nk else ""))
+            put_kv("Input list", "DEP per contrast",
+                   f"Proteins passing {p_volc} < {params['volcano_p_thresh']} "
+                   f"& ratio >= {params['volcano_ratio_min']} (volcano thresholds)")
+            put_kv("Background", "quantified proteins, annotated",
+                   "Per family: proteins tested in the differential analysis carrying "
+                   "at least one term of that family (GO, KEGG); an unannotated group "
+                   "leader takes the annotation of another member of its group")
+            put_kv("Multiple correction",
+                   "FDR (Benjamini-Hochberg)" + (", GO and KEGG separately" if _nk else ""),
+                   "Threshold 0.05; terms with fewer than 3 annotated proteins in the "
+                   "background are not tested"
+                   + ("; GO (BP+CC+MF) and KEGG are two families, as g:Profiler corrects "
+                      "source by source" if _nk else ""))
+            if params.get("run_perseverance") is True and params.get(
+                    "perseverance_reference_organism"):
+                put_kv("ANOVA clusters / GSEA",
+                       f"{params['perseverance_reference_organism']} via orthologues",
+                       "Not the local annotation: g:Profiler (clusters) and g:Profiler "
+                       "gene sets (GSEA) of the reference species, proteins translated "
+                       "by reciprocal best hits (Perseverance)")
+        elif params.get("go_backend", "gprofiler") == "string":
             _bg = params.get("string_background") or params.get("enrichment_background",
                                                                   "quantified")
             _cats = params.get("string_categories") or ["Process", "Function",
@@ -5587,6 +5631,22 @@ def export_wgcna_sheets(wb: openpyxl.Workbook, wgcna: dict,
 # MAIN
 # ==============================================================================
 
+def _resolve_input_path(path, params):
+    """Chemin d'un fichier d'entrée relatif : dossier courant d'abord, puis dossier du
+    pg_matrix (tsv_path) — on lance souvent Deimos depuis son propre dossier avec les
+    données ailleurs. None si introuvable dans les deux."""
+    if not path:
+        return None
+    if os.path.isfile(path):
+        return path
+    if not os.path.isabs(path):
+        alt = os.path.join(os.path.dirname(os.path.abspath(params.get("tsv_path", "."))), path)
+        if os.path.isfile(alt):
+            print(f"[INFO] {path} : pris dans le dossier du pg_matrix ({alt})")
+            return alt
+    return None
+
+
 def main():
     # --- Configuration : YAML / rechargement / interactif ---
     # resolve_config gère les trois modes sans modifier le comportement interactif :
@@ -5641,14 +5701,32 @@ def main():
     _go_target = params.get("go_species_taxid") if _go_backend == "string" else _go_org
     _perseverance_path = params.get("perseverance_annotation_path")
     if _perseverance_path:
+        _found = _resolve_input_path(_perseverance_path, params)
+        if _found is None:
+            print(f"[ERROR] perseverance_annotation_path introuvable : {_perseverance_path}\n"
+                  f"        cherché dans le dossier courant ({os.getcwd()}) et dans celui "
+                  f"du pg_matrix ({os.path.dirname(os.path.abspath(params.get('tsv_path', '.')))}).\n"
+                  f"        Copier le fichier dans l'un des deux ou donner un chemin absolu.")
+            sys.exit(1)
+        _perseverance_path = _found
         _perseverance_annot = pd.read_csv(_perseverance_path, sep="\t")
         go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
                     "custom_annotation": _perseverance_annot, "background": None}
+        _n_fam = {c: int(_perseverance_annot[c].notna().sum())
+                  for c in ("GO", "KEGG") if c in _perseverance_annot.columns}
+        if "KEGG" in _n_fam:                 # voies seulement (pas les KO K00001)
+            from go_enrichment import KEGG_PATHWAY_RE
+            _n_fam["KEGG"] = int(_perseverance_annot["KEGG"].astype(str).str.contains(
+                rf"(?<![A-Za-z0-9]){KEGG_PATHWAY_RE}(?![0-9])").sum())
+        params["_local_annotation"] = {"path": os.path.basename(str(_perseverance_path)),
+                                       **{f"n_{c.lower()}": n for c, n in _n_fam.items()}}
         print(f"[GO] Annotation custom Perseverance chargee : {_perseverance_path} "
-              f"({len(_perseverance_annot)} proteines annotees)")
+              f"({len(_perseverance_annot)} proteines annotees : "
+              f"{_n_fam.get('GO', 0)} GO, {_n_fam.get('KEGG', 0)} KEGG)")
         # Noms et espaces (BP/CC/MF) des termes : table GO, name, namespace
         _terms_path = params.get("perseverance_go_terms_path")
         if _terms_path:
+            _terms_path = _resolve_input_path(_terms_path, params) or _terms_path
             try:
                 from go_enrichment import load_go_terms
                 go_params["go_terms"] = load_go_terms(_terms_path)

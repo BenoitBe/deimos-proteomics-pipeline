@@ -57,6 +57,26 @@ and dashboard improvements accumulated since the previous public version.
 - **The facet volcano is kept.** `all_volcano_plots_grid.png` used to be deleted by the
   end-of-run cleanup, because it lives at the root and does not start with `volc_`.
   Inside `Volcanos/` it survives, alongside the individual plots.
+- **KEGG in the local ORA (`perseverance_annotation_path`).** The `KEGG` column of the
+  annotation table was carried but never tested: `run_local_ora` read `GO` only. It is now a
+  second family, with its own universe (background proteins annotated in KEGG) and its own
+  Benjamini-Hochberg correction — g:Profiler corrects source by source, and ~130 pathways
+  should not pay for thousands of GO terms. Consequence: the GO rows are byte-identical with or
+  without a KEGG column (checked on 40 queries of a real annotation, order of ties included).
+  Pathways are named through `perseverance_go_terms_path` (namespace `KEGG`) and come out as
+  source `KEGG` in the sheets, dotplots/lollipops and dashboard. Group leaders without KEGG
+  take the pathways of another member of their group, as for GO. Only pathway IDs are
+  tested (`map00900`, `ko00900`, `ath00900`): KO numbers (`K00001`), which
+  `annotation_import.py` keeps in the same column, are gene families, not pathways, and are
+  ignored — an annotation carrying KO numbers only gets no KEGG family at all.
+
+### Fixed
+
+- **Methods described the local ORA as g:Profiler.** With `perseverance_annotation_path`, the
+  enrichment section said "g:Profiler (gost)" and its background/correction rows. It now
+  describes the local test: annotation file and counts, sources, per-family background and
+  BH, and — when Perseverance runs — that the ANOVA clusters and the GSEA use the reference
+  species through orthologues, not the local annotation.
 
 ### Changed
 
