@@ -154,6 +154,38 @@ and dashboard improvements accumulated since the previous public version.
     degrees of freedom globally against 9 per time point.
   - `tests/test_anova_strata.py` (11 tests).
 
+### Added
+
+- **`project_dir`: one folder per project** (also `--project-dir`). It is the root for
+  every relative input and output path — matrices, design, project FASTA, `out_dir` —
+  so a project's files stay with the project instead of piling up next to `deimos.py`,
+  and `proteomics_output/` stops being overwritten from one project to the next.
+  - An **absolute** path is never touched: a reference shared between projects, a
+    proteome FASTA or a `go.obo`, stays outside the project folder. `~` and environment
+    variables are expanded.
+  - Automatic FASTA and pr_matrix detection follows along with no change, since it scans
+    the folder of `tsv_path`, which is now the project's.
+  - Tool clones (`pathfinder_path`, `insight_path`) and the shared `gsea_cache_dir` are
+    deliberately out of scope: binding them would mean one Pathfinder clone per project.
+  - A `project_dir` that does not exist **stops the run** with a clear message rather
+    than letting every input fail one by one as "file not found".
+  - `last_config.yaml` records the *resolved*, absolute paths: it is the record of what
+    ran. The YAML you author stays relative and travels with the folder.
+  - Resolved on all three configuration paths (`--config`, `last_config` reload,
+    interactive questions); a test pins that, since one missed path would make the key
+    work in some modes and silently not in others.
+
+### Fixed
+
+- **The inert-key audit cleared a key it should have flagged, and flagged one it should
+  have cleared.** It skipped `config.py` entirely, on the grounds that a key appearing
+  there is merely being parsed — but a key can genuinely do its work in that module, as
+  `project_dir` does by rewriting the other paths, and the audit called it inert. The
+  module is now scanned like any other, and `params["k"] = args.k` no longer counts as
+  a use: only `ast.Load` subscripts do, so a key wired solely to the command line — which
+  is exactly what `batch_column` was — still reads as dead. Re-checked against `af6c92b`:
+  the corrected audit still catches `batch_column` there.
+
 ### Changed
 
 - **`pathfinder_report.html` now sits at the root of `out_dir`.** It is the only Pathfinder

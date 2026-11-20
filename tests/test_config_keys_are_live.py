@@ -36,7 +36,12 @@ def _key_read_by(node):
             and isinstance(node.args[0], ast.Constant)
             and isinstance(node.args[0].value, str)):
         return node.args[0].value
-    if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+    # `ast.Load` seulement : `params["k"] = args.k` ÉCRIT la clé, c'est de la
+    # plomberie de ligne de commande, pas une consommation. Sans ce garde-fou,
+    # une clé purement câblée au CLI — exactement le cas de batch_column —
+    # passerait pour vivante.
+    if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+            and isinstance(node.slice, ast.Constant)
             and isinstance(node.slice.value, str)):
         return node.slice.value
     return None
@@ -108,6 +113,10 @@ def verdict(source: str, key: str):
 # ─────────────────── validation du détecteur lui-même ───────────────────────
 
 INERT_SAMPLES = {
+    "cle_seulement_ecrite_par_le_cli": textwrap.dedent("""
+        def build(args, params):
+            params["cle_seulement_ecrite_par_le_cli"] = args.quelque_chose
+    """),
     "cle_affectee_jamais_relue": textwrap.dedent("""
         def run(params):
             mort = params.get("cle_affectee_jamais_relue")
@@ -152,9 +161,13 @@ def test_le_detecteur_reconnait_le_defaut_historique():
 # ─────────────────────────── l'audit du dépôt ───────────────────────────────
 
 def _sources():
+    # config.py est inclus depuis le 20/11/2026 : une clé peut y être consommée
+    # pour de bon — `project_dir` y réécrit les autres chemins — et l'exclure la
+    # déclarait inerte à tort. Le garde-fou ast.Load ci-dessus empêche l'effet
+    # inverse, qu'une clé seulement écrite par le CLI y passe pour vivante.
     return [p for p in ROOT.rglob("*.py")
             if ".git" not in p.parts and "__pycache__" not in p.parts
-            and "tests" not in p.parts and p.name != "config.py"]
+            and "tests" not in p.parts]
 
 
 def test_aucune_cle_de_configuration_n_est_inerte():

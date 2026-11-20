@@ -6,9 +6,10 @@
 # Usage:
 #   python deimos.py --config config_example.yaml
 #   python deimos.py --config config_example.yaml --out-dir /data/project2
+#   python deimos.py --config config_example.yaml --project-dir /data/project2
 #
-# CLI arguments (--tsv, --design, --out-dir, --batch-column, --qc-only)
-# always override the YAML.
+# CLI arguments (--tsv, --design, --out-dir, --project-dir, --batch-column,
+# --qc-only) always override the YAML.
 #
 # Unattended runs (no terminal): keep run_perseverance as true/false and set
 # contrasts explicitly when there are more than 30 pairs — "__auto__" asks a
@@ -375,7 +376,36 @@ volcano_subdir:      "Volcanos"
 
 
 # ── Input file paths ──────────────────────────────────────────────────────────
-# Edit these paths if your files are not in the current directory.
+# One folder per project. project_dir is the root for every RELATIVE path
+# below: the matrices, the design, the project FASTA and the output folder.
+# Keep a project's inputs with the project instead of piling them next to
+# deimos.py, and stop overwriting proteomics_output/ from one project to the
+# next. Also: --project-dir
+#
+#   project_dir: D:/projets/ostrea_2026
+#   tsv_path:    report.pg_matrix.tsv    -> D:/projets/ostrea_2026/report.pg_matrix.tsv
+#   design_path: ExperimentalDesign.csv  -> D:/projets/ostrea_2026/ExperimentalDesign.csv
+#   out_dir:     output                  -> D:/projets/ostrea_2026/output
+#
+# An ABSOLUTE path is never touched, so a reference shared between projects —
+# a proteome FASTA, a go.obo — stays where it is, outside the project folder.
+# `~` and environment variables are expanded. Automatic FASTA and pr_matrix
+# detection follows along: it scans the folder of tsv_path, now the project's.
+#
+# Tool clones (pathfinder_path, insight_path) and the shared gsea_cache_dir are
+# deliberately out of scope: binding them here would mean one Pathfinder clone
+# per project. Every other path key of the configuration follows the project —
+# including a custom plasma_qc_panels — and a test fails the build on any path
+# key left unclassified, so a key added later cannot silently stay behind.
+#
+# null (the default) keeps the historical behaviour: relative paths start from
+# the current directory.
+#
+# The last_config.yaml written at the end of a run records the RESOLVED,
+# absolute paths — it is the record of what ran, not a template to copy. This
+# file, the one you author, stays relative and travels with the folder.
+project_dir:         null    # e.g. D:/projets/ostrea_2026
+
 # These values can also be overridden via: --tsv, --design, --out-dir
 tsv_path:            report.pg_matrix.tsv
 design_path:         ExperimentalDesign.csv
