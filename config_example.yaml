@@ -136,6 +136,28 @@ seed:                42
 batch_column:        null         # e.g. "batch" or "plate"; null = disabled
 
 
+# ── Plasma / serum sample quality ─────────────────────────────────────────────
+# Marker panels of Geyer et al. 2019 (EMBO Mol Med 11:e10427): erythrocyte lysis,
+# platelet contamination, coagulation. Per sample, an index per panel (summed
+# intensity ratios); samples above mean + 2 SD (rule of the article) or with a
+# modified z > 3.5 (median/MAD) are FLAGGED, never removed. Each index is also
+# tested against the condition: a contamination confounded with the condition
+# flags no sample but creates artefactual DEP. Every DEP is then checked for
+# panel membership and for co-variation with the indices within conditions.
+# Sheets Plasma_QC and Plasma_QC_DEP; also in qc_only mode (sample part only).
+# Plasma and serum only: in a cell lysate GAPDH or ACTB mean nothing.
+#   true      run it (or --plasma-qc on the command line)
+#   false     never
+#   __auto__  after loading, if the samples look like plasma / serum (albumin first,
+#             classic plasma proteins in the top 20), ask (interactive run) or print
+#             a one-line hint (non-interactive run: never blocks)
+# Matching is on gene symbols, case-insensitive: human, mouse, rat and dog work with a
+# UniProt FASTA (GN= field); hemoglobin symbols of these species are included.
+# On a finished run: python plasma_qc.py proteomics_output
+plasma_qc:           __auto__
+plasma_qc_panels:    null         # TSV/CSV with columns gene, panel; null = Geyer 2019 panels
+
+
 # ── QC-only mode ──────────────────────────────────────────────────────────────
 # true = raw data + Methods + QC figures only, no statistics
 # (ProteomicAnalysis_QC.xlsx). Enabled automatically when no condition has a

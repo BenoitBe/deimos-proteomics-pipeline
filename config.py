@@ -117,6 +117,12 @@ _DEFAULTS = {
     "deqms_max_pseudocount_pct": 50.0,  # % max de proteines a count<=1 tolere
     "deqms_force":         False,  # bypass le diagnostic, force DEqMS meme si defavorable
     "batch_column":        None,   # colonne ExperimentalDesign.csv a controler comme covariable
+    # Qualité des échantillons de plasma / sérum (panels de Geyer et al. 2019) :
+    # indices hémolyse / plaquettes / coagulation par échantillon + drapeaux sur
+    # les DEP (feuilles Plasma_QC, Plasma_QC_DEP). À réserver au plasma et au
+    # sérum : sur un lysat, GAPDH ou ACTB ne signalent aucune contamination.
+    "plasma_qc":           "__auto__",  # "__auto__" = question si les données ont la signature d'un plasma
+    "plasma_qc_panels":    None,   # TSV/CSV gene + panel (erythrocyte|platelet|coagulation) ; None = Geyer 2019
     # Chemins (peuvent être surchargés)
     "tsv_path":            "report.pg_matrix.tsv",
     "design_path":         "ExperimentalDesign.csv",
@@ -235,6 +241,13 @@ def _validate(params: dict) -> list[str]:
     for k in ("dpc_sensitivity", "differential_detection", "export_matrices"):
         if not isinstance(params.get(k, True), bool):
             errors.append(f"  {k} doit être true ou false (valeur : {params.get(k)!r})")
+    _pqv = params.get("plasma_qc", "__auto__")
+    if not (isinstance(_pqv, bool) or _pqv == "__auto__"):
+        errors.append(f"  plasma_qc doit être true, false ou __auto__ (valeur : {_pqv!r})")
+    _pqp = params.get("plasma_qc_panels")
+    if _pqp is not None and not (isinstance(_pqp, str) and os.path.isfile(_pqp)):
+        errors.append(f"  plasma_qc_panels : fichier TSV/CSV (colonnes gene, panel) introuvable "
+                      f"(valeur : {_pqp!r})")
     if str(params.get("dpc_level", "auto")).lower() not in ("auto", "precursor", "protein"):
         errors.append(f"  dpc_level doit être 'auto', 'precursor' ou 'protein'")
     try:
@@ -467,6 +480,13 @@ def parse_cli_args() -> argparse.Namespace:
               "dans un processus séparé ; sorties dans <out_dir>/pathfinder/."),
     )
     parser.add_argument(
+        "--plasma-qc",
+        action="store_true",
+        help=("Contrôle qualité des échantillons de plasma / sérum (plasma_qc: true) : "
+              "panels hémolyse, plaquettes, coagulation de Geyer et al. 2019 ; feuilles "
+              "Plasma_QC et Plasma_QC_DEP."),
+    )
+    parser.add_argument(
         "--insight",
         action="store_true",
         help=("Lancer InSight en toute fin de run (make_insight: true) : figures de "
@@ -564,6 +584,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.out_dir: params["out_dir"]     = args.out_dir
         if args.batch_column: params["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): params["qc_only"] = True
+        if getattr(args, "plasma_qc", False): params["plasma_qc"] = True
         if getattr(args, "pathfinder", False): params["make_pathfinder"] = True
         if getattr(args, "insight", False): params["make_insight"] = True
 
@@ -598,6 +619,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.out_dir: reloaded["out_dir"]      = args.out_dir
         if args.batch_column: reloaded["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): reloaded["qc_only"] = True
+        if getattr(args, "plasma_qc", False): reloaded["plasma_qc"] = True
         if getattr(args, "pathfinder", False): reloaded["make_pathfinder"] = True
         if getattr(args, "insight", False): reloaded["make_insight"] = True
         return reloaded
@@ -624,6 +646,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
     if args.out_dir: params["out_dir"]     = args.out_dir
     if args.batch_column: params["batch_column"] = args.batch_column
     if getattr(args, "qc_only", False): params["qc_only"] = True
+    if getattr(args, "plasma_qc", False): params["plasma_qc"] = True
 
     # GO — toutes les clés renvoyées par ask_go_params() sont reportées dans
     # params (sinon le choix STRING serait perdu et last_config.yaml aussi).
@@ -790,6 +813,8 @@ make_pathfinder:     false         # true = synthèse Pathfinder en fin de run (
 pathfinder_path:     null          # clone Pathfinder ; null = $PATHFINDER_HOME puis ../Pathfinder
 make_insight:        false         # true = figures de lecture biologique InSight en fin de run (--insight)
 insight_path:        null          # clone InSight ; null = $INSIGHT_HOME puis ../InSight
+plasma_qc:           __auto__      # plasma / sérum (Geyer 2019) ; __auto__ = question si les données ressemblent à du plasma
+plasma_qc_panels:    null          # TSV/CSV gene + panel ; null = panels de Geyer 2019
 use_deqms:           false
 
 # ── Chemins (optionnel — surchargeables aussi via CLI) ───────────────────────

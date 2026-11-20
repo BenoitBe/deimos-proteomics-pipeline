@@ -60,6 +60,22 @@ Designed for LC-MS/MS DIA workflows on TIMS-TOF (Bruker). Compatible with any ex
     confounded with the condition (rank-deficient design), with the condition × batch crosstab
     printed. Comes with `diagnostic_batch.png`: the same PCA as `plot_pca`, testing each PC
     against batch and against condition (Kruskal-Wallis, ε² effect size)
+  - optional **plasma / serum sample quality** (`plasma_qc: true`): the erythrocyte-lysis,
+    platelet and coagulation marker panels of Geyer et al. 2019 (EMBO Mol Med 11:e10427).
+    Per sample, one index per panel (summed intensity ratios), flagged — never removed —
+    above mean + 2 SD (rule of the article) or at a modified z > 3.5 (median/MAD, which the
+    contaminated sample cannot mask). Each index is tested against the condition: a
+    contamination confounded with the condition flags no sample but creates artefactual
+    DEP. Every DEP is then checked for panel membership and for co-variation with the
+    indices *within* conditions (partial correlation, BH over all proteins). Sheets
+    Plasma_QC and Plasma_QC_DEP; also on a finished run: `python plasma_qc.py proteomics_output`.
+    Switched on by `plasma_qc: true` or `--plasma-qc`; with the default `plasma_qc: __auto__`,
+    Deimos looks at the data after loading and, if they look like plasma or serum (albumin
+    first, classic plasma proteins in the top 20), asks the question in an interactive run or
+    prints a one-line hint otherwise (never blocks a `--config` run without a terminal).
+    Matching is on gene symbols, case-insensitive: human, mouse, rat and dog work with a UniProt
+    FASTA (`GN=` field; hemoglobin symbols of these species included). A FASTA without gene
+    names (NCBI RefSeq) matches nothing: the console warns and the Panel coverage table shows it
 - **QC-only mode** (`qc_only` / `--qc-only`), enabled automatically when no condition has a
   replicate: raw data, Methods and QC figures, no statistics
 - Automatic **multi-organism detection** (UniProt-style `_TAG` suffix in `Protein.Names`, e.g.
@@ -253,6 +269,7 @@ python deimos.py --config project.yaml --tsv /data/run2/report.pg_matrix.tsv --o
 python deimos.py --config project.yaml --batch-column batch
 python deimos.py --config project.yaml --qc-only
 python deimos.py --config project.yaml --pathfinder     # + Pathfinder synthesis at the end
+python deimos.py --config project.yaml --plasma-qc      # + plasma / serum sample quality
 python deimos.py --config project.yaml --insight        # + InSight figures and report at the end
 ```
 
@@ -384,6 +401,7 @@ deimos-proteomics-pipeline/
 ├── pathfinder_bridge.py          # _manifest sheet + Pathfinder launch (separate process)
 ├── insight_bridge.py             # InSight launch (separate process, after Pathfinder)
 ├── dpc_sensitivity.py            # DPC (limpa method): primary statistic, sensitivity, detection
+├── plasma_qc.py                  # Plasma / serum sample quality (Geyer 2019 panels); also a CLI
 ├── build_dashboardv7.py          # HTML dashboard generator
 ├── dashboard_template.html       # Dashboard template (light/dark theme)
 ├── diagnostic_dashboard.py       # Dashboard diagnostic utility
@@ -438,11 +456,11 @@ proteomics_output/
 UMAP · Scatter_Plots · Differential_Expression · Volcano_Plots · UpSet_Intersections ·
 Zscore_Heatmap · ANOVA_Results · ANOVA_Clusters, plus depending on the options: WGCNA_* · GO_* ·
 Cluster_Enrich_* · GSEA_* · Orthologues_Perseverance · Orthologues_STRING ·
-Sensitivity_Summary · Sensitivity_DPC · Differential_Detection, and a hidden `_manifest` sheet
-(last; unhide it in Excel to read it)
+Sensitivity_Summary · Sensitivity_DPC · Differential_Detection · Plasma_QC · Plasma_QC_DEP,
+and a hidden `_manifest` sheet (last; unhide it in Excel to read it)
 
 **QC-only mode**: Methods_Upstream · Methods · raw_data · Log2 (not imputed) · QC · PCA_Correlation
-(complete cases, ≥ 3 samples)
+(complete cases, ≥ 3 samples) · Plasma_QC (when plasma QC runs)
 
 ---
 
@@ -468,6 +486,7 @@ contrasts:            "__auto__"  # "__auto__", "all", or a list of patterns:
 
 control_condition:    "__auto__"  # "__auto__" (auto-detect), an explicit name, or false
 batch_column:         null        # column of ExperimentalDesign.csv modelled as a nuisance covariate
+plasma_qc:            __auto__    # plasma / serum: true, false, or __auto__ (asked if the data look like plasma)
 use_deqms:            false       # DEqMS, gated by the automatic reliability diagnostic
 
 go_organism:          null        # gProfiler species code (e.g. "bnapus"), null = disabled

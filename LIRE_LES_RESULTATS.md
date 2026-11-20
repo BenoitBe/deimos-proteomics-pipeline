@@ -83,6 +83,29 @@ Croise toujours avec `num_NAs` et la p.
   dit la forme (absente d'une condition entière, sporadique…), `higher_in` où
   elle est vue. Utile quand une protéine est tout ou rien.
 
+### Les feuilles de qualité plasma
+
+À lire **avant** `Differential_Expression` sur tout projet de plasma ou de sérum.
+Elles existent si l'étape a tourné : `plasma_qc: true`, `--plasma-qc`, ou réponse « oui » à
+la question que Deimos pose quand les données ressemblent à du plasma (`__auto__`, défaut).
+Un échantillon `flagged` est à regarder, pas forcément à exclure : sur du plasma propre
+simulé, la règle de l'article signale 5 % des échantillons sur au moins un indice.
+
+- **Plasma_QC** : un indice par échantillon pour l'hémolyse, la contamination
+  plaquettaire et la coagulation (panels de Geyer et al. 2019) ; plus haut = plus
+  contaminé. `flagged` signale un échantillon hors norme, il ne le retire pas :
+  l'exclure ou non est une décision à prendre, puis relancer. Le tableau *Index vs
+  condition* est le plus important : un indice qui diffère entre conditions ne
+  signale aucun échantillon, mais fabrique des DEP — c'est le cas le plus dangereux,
+  parce qu'il ne se voit pas ailleurs.
+- **Plasma_QC_DEP** : une ligne par DEP et par contraste. `high` = la protéine
+  appartient à un panel ou suit un indice, **et** cet indice diffère entre les deux
+  groupes dans le même sens : à considérer comme un artefact tant que rien ne prouve
+  le contraire. `check` = membre d'un panel ou corrélée à un indice, sans différence
+  d'indice entre les groupes : candidat possible, à valider. Une protéine hors panel
+  peut être `high` : elle a été repérée par sa co-variation avec l'indice d'un
+  échantillon à l'autre au sein des conditions.
+
 ---
 
 ## 3. Le dashboard `Proteomic_dashboard.html`
