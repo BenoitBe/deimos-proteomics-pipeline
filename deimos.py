@@ -5615,6 +5615,22 @@ def export_wgcna_sheets(wb: openpyxl.Workbook, wgcna: dict,
 # MAIN
 # ==============================================================================
 
+def _resolve_input_path(path, params):
+    """Chemin d'un fichier d'entrée relatif : dossier courant d'abord, puis dossier du
+    pg_matrix (tsv_path) — on lance souvent Deimos depuis son propre dossier avec les
+    données ailleurs. None si introuvable dans les deux."""
+    if not path:
+        return None
+    if os.path.isfile(path):
+        return path
+    if not os.path.isabs(path):
+        alt = os.path.join(os.path.dirname(os.path.abspath(params.get("tsv_path", "."))), path)
+        if os.path.isfile(alt):
+            print(f"[INFO] {path} : pris dans le dossier du pg_matrix ({alt})")
+            return alt
+    return None
+
+
 def main():
     # --- Configuration : YAML / rechargement / interactif ---
     # resolve_config gère les trois modes sans modifier le comportement interactif :
@@ -5669,6 +5685,14 @@ def main():
     _go_target = params.get("go_species_taxid") if _go_backend == "string" else _go_org
     _perseverance_path = params.get("perseverance_annotation_path")
     if _perseverance_path:
+        _found = _resolve_input_path(_perseverance_path, params)
+        if _found is None:
+            print(f"[ERROR] perseverance_annotation_path introuvable : {_perseverance_path}\n"
+                  f"        cherché dans le dossier courant ({os.getcwd()}) et dans celui "
+                  f"du pg_matrix ({os.path.dirname(os.path.abspath(params.get('tsv_path', '.')))}).\n"
+                  f"        Copier le fichier dans l'un des deux ou donner un chemin absolu.")
+            sys.exit(1)
+        _perseverance_path = _found
         _perseverance_annot = pd.read_csv(_perseverance_path, sep="\t")
         go_params = {"organism": _go_org, "run_gsea": params.get("run_gsea", False),
                     "custom_annotation": _perseverance_annot, "background": None}
@@ -5686,6 +5710,7 @@ def main():
         # Noms et espaces (BP/CC/MF) des termes : table GO, name, namespace
         _terms_path = params.get("perseverance_go_terms_path")
         if _terms_path:
+            _terms_path = _resolve_input_path(_terms_path, params) or _terms_path
             try:
                 from go_enrichment import load_go_terms
                 go_params["go_terms"] = load_go_terms(_terms_path)

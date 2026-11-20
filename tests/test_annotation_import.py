@@ -315,3 +315,16 @@ def test_an_evalue_column_is_recognised_by_its_shape(tmp_path):
     df2 = df.assign(**{"p-value": np.linspace(20, 99, 65)})
     col2, maybe2 = find_evalue_column(df2)
     assert col2 is None and maybe2 == ["p-value"]           # signalée, pas devinée
+
+
+def test_resolve_input_path_falls_back_to_pg_matrix_folder(tmp_path, monkeypatch):
+    import deimos as D
+    data = tmp_path / "data"; data.mkdir()
+    (data / "ann.tsv.gz").write_bytes(b"")
+    run = tmp_path / "run"; run.mkdir()
+    monkeypatch.chdir(run)
+    params = {"tsv_path": str(data / "report.pg_matrix.tsv")}
+    assert D._resolve_input_path("ann.tsv.gz", params) == str(data / "ann.tsv.gz")
+    assert D._resolve_input_path("absent.tsv", params) is None
+    (run / "ann.tsv.gz").write_bytes(b"")              # le dossier courant reste prioritaire
+    assert D._resolve_input_path("ann.tsv.gz", params) == "ann.tsv.gz"
