@@ -124,6 +124,11 @@ _DEFAULTS = {
     "plasma_qc":           "__auto__",  # "__auto__" = question si les données ont la signature d'un plasma
     "plasma_qc_panels":    None,   # TSV/CSV gene + panel (erythrocyte|platelet|coagulation) ; None = Geyer 2019
     # Chemins (peuvent être surchargés)
+    # Dossier du projet : racine des chemins RELATIFS ci-dessous. Permet de
+    # garder les entrees d'un projet chez lui et d'y ecrire ses sorties, au
+    # lieu de tout empiler dans le dossier de Deimos. None = comportement
+    # historique, les chemins relatifs partent du repertoire courant.
+    "project_dir":         None,
     "tsv_path":            "report.pg_matrix.tsv",
     "design_path":         "ExperimentalDesign.csv",
     "pr_path":             "report.pr_matrix.tsv",
@@ -175,6 +180,92 @@ def _loads(text: str) -> dict:
 
 
 # ── Résolution des clés dérivées ────────────────────────────────────────────────
+
+# Clés dont un chemin RELATIF est résolu dans project_dir. Ce sont les entrées
+# et les sorties propres à UN projet. En sont délibérément exclus :
+#   pathfinder_path, insight_path   des clones d'outils, partagés entre projets
+#   gsea_cache_dir                  un cache partagé (~/.deimos_cache par défaut)
+# Les y rattacher obligerait à dupliquer un clone de Pathfinder par projet.
+PROJECT_PATH_KEYS = (
+    "tsv_path", "design_path", "pr_path",
+    "annotation_fasta", "string_reference_fasta",
+    "perseverance_annotation_path", "perseverance_go_terms_path",
+    "perseverance_fasta_a", "perseverance_fasta_b",
+    "gsea_go_obo", "plasma_qc_panels",
+    "out_dir",
+)
+
+# Clés de chemin volontairement HORS du dossier de projet, et pourquoi. Un test
+# exige que toute clé de chemin de _DEFAULTS figure dans l'une des deux listes :
+# une clé ajoutée plus tard et oubliée ici resterait relative au répertoire
+# courant alors que tout le reste du projet aurait déménagé — une erreur muette.
+SHARED_PATH_KEYS = (
+    "project_dir",       # la racine elle-même
+    "pathfinder_path",   # clone d'outil, partagé entre projets
+    "insight_path",      # clone d'outil, partagé entre projets
+    "gsea_cache_dir",    # cache partagé (~/.deimos_cache par défaut)
+)
+
+
+def apply_project_dir(params: dict) -> dict:
+    """Résout les chemins relatifs du projet dans `project_dir`.
+
+    Sans cette clé, un chemin relatif part du répertoire courant : les matrices,
+    le plan et le FASTA finissent à côté de deimos.py, et `proteomics_output/`
+    est écrasé au projet suivant. Avec elle :
+
+        project_dir: D:/projets/ostrea_2026
+        tsv_path:    report.pg_matrix.tsv    -> D:/projets/ostrea_2026/report.pg_matrix.tsv
+        design_path: ExperimentalDesign.csv  -> D:/projets/ostrea_2026/ExperimentalDesign.csv
+        out_dir:     output                  -> D:/projets/ostrea_2026/output
+
+    Un chemin ABSOLU n'est jamais touché : une référence partagée entre projets
+    (un FASTA de protéome, un go.obo) reste à sa place, hors du dossier.
+
+    `~` et les variables d'environnement sont développés, dans project_dir comme
+    dans les chemins relatifs.
+
+    La détection automatique du FASTA et du pr_matrix suit sans rien changer :
+    elle balaie le dossier de `tsv_path`, qui est désormais celui du projet.
+
+    Le `last_config.yaml` écrit en fin de run enregistre les chemins RÉSOLUS, en
+    absolu : c'est la trace de ce qui a tourné, pas un modèle à recopier. Votre
+    YAML de projet, lui, reste relatif et se déplace avec le dossier.
+    """
+    raw = params.get("project_dir")
+    # Une chaîne de blancs est une coquille de YAML, pas une demande : sans ce
+    # strip() elle passait la garde et abspath("") résolvait tout sur le
+    # répertoire courant, exactement ce que la clé sert à éviter.
+    raw = str(raw).strip() if raw else ""      # None, False et "" se valent ici
+    if not raw:
+        return params
+
+    base = os.path.abspath(os.path.expanduser(os.path.expandvars(raw)))
+    params["project_dir"] = base
+    if not os.path.isdir(base):
+        print(f"\n  [ERROR] project_dir introuvable : {base}")
+        print("  [ERROR] Toutes les entrées relatives du projet en dépendent. "
+              "Créez le dossier, ou corrigez la clé project_dir.")
+        sys.exit(1)
+
+    resolus = []
+    for k in PROJECT_PATH_KEYS:
+        v = params.get(k)
+        if not isinstance(v, str) or not v.strip() or v == "__auto__":
+            continue                      # non renseigné, ou détection automatique
+        v2 = os.path.expanduser(os.path.expandvars(v))
+        if os.path.isabs(v2):
+            continue                      # absolu : partagé, on n'y touche pas
+        params[k] = os.path.normpath(os.path.join(base, v2))
+        resolus.append(k)
+
+    if resolus:
+        print(f"\n[PROJECT] project_dir : {base}")
+        print(f"          {len(resolus)} chemin(s) relatif(s) résolu(s) ici "
+              f"({', '.join(resolus)})")
+        print(f"          sorties -> {params.get('out_dir')}")
+    return params
+
 
 def _resolve(params: dict) -> dict:
     """Calcule les clés dérivées à partir des clés brutes."""
@@ -481,6 +572,11 @@ def parse_cli_args() -> argparse.Namespace:
               "réplicat)."),
     )
     parser.add_argument(
+        "--project-dir", dest="project_dir", metavar="DIR",
+        help=("Dossier du projet : racine des chemins relatifs (matrices, plan, "
+              "FASTA, out_dir). Les chemins absolus ne sont pas touchés."),
+    )
+    parser.add_argument(
         "--pathfinder",
         action="store_true",
         help=("Lancer la synthèse Pathfinder en fin de run (make_pathfinder: true), "
@@ -589,6 +685,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.tsv:     params["tsv_path"]    = args.tsv
         if args.design:  params["design_path"] = args.design
         if args.out_dir: params["out_dir"]     = args.out_dir
+        if getattr(args, "project_dir", None): params["project_dir"] = args.project_dir
         if args.batch_column: params["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): params["qc_only"] = True
         if getattr(args, "plasma_qc", False): params["plasma_qc"] = True
@@ -610,6 +707,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if "batch_column" not in params:
             params["batch_column"] = None
 
+        params = apply_project_dir(params)
         print_config_summary(params)
         # last_config.yaml aussi avec --config (contrat de l'en-tête : toujours écrit),
         # relu par InSight et par rebuild_dashboard.py
@@ -624,12 +722,13 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         if args.tsv:     reloaded["tsv_path"]    = args.tsv
         if args.design:  reloaded["design_path"] = args.design
         if args.out_dir: reloaded["out_dir"]      = args.out_dir
+        if getattr(args, "project_dir", None): reloaded["project_dir"] = args.project_dir
         if args.batch_column: reloaded["batch_column"] = args.batch_column
         if getattr(args, "qc_only", False): reloaded["qc_only"] = True
         if getattr(args, "plasma_qc", False): reloaded["plasma_qc"] = True
         if getattr(args, "pathfinder", False): reloaded["make_pathfinder"] = True
         if getattr(args, "insight", False): reloaded["make_insight"] = True
-        return reloaded
+        return apply_project_dir(reloaded)
 
     # ── C. Questions interactives ──────────────────────────────────────────────
     # ask_params_fn() retourne uniquement les clés stats. On fusionne _DEFAULTS
@@ -651,6 +750,7 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
     if args.tsv:     params["tsv_path"]    = args.tsv
     if args.design:  params["design_path"] = args.design
     if args.out_dir: params["out_dir"]     = args.out_dir
+    if getattr(args, "project_dir", None): params["project_dir"] = args.project_dir
     if args.batch_column: params["batch_column"] = args.batch_column
     if getattr(args, "qc_only", False): params["qc_only"] = True
     if getattr(args, "plasma_qc", False): params["plasma_qc"] = True
@@ -732,6 +832,10 @@ def resolve_config(ask_params_fn, ask_go_params_fn,
         params["use_deqms"] = rep in ("", "o", "oui", "y", "yes")
     else:
         print(f"\n  [INFO] {pr_path} not found — DEqMS unavailable, limma only.")
+
+    # Résolu AVANT la sauvegarde, pour que --save-config et last_config.yaml
+    # partent dans le dossier du projet dès la première écriture.
+    params = apply_project_dir(params)
 
     # ── D. Sauvegarde optionnelle --save-config ────────────────────────────────
     if args.save_config is not None:

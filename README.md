@@ -433,6 +433,21 @@ deimos-proteomics-pipeline/
 
 ## Output
 
+With `project_dir` set, every relative path below — inputs and `out_dir` alike — is
+resolved inside the project's folder, so one project's files never land in Deimos's
+own directory and never overwrite the previous project's results:
+
+```
+D:/projets/ostrea_2026/          # project_dir
+├── report.pg_matrix.tsv         # tsv_path:    report.pg_matrix.tsv
+├── ExperimentalDesign.csv       # design_path: ExperimentalDesign.csv
+├── config.yaml
+└── output/                      # out_dir:     output
+```
+
+An absolute path is never touched, so a FASTA or a `go.obo` shared between projects
+stays outside. `project_dir: null`, the default, keeps the previous behaviour.
+
 ```
 proteomics_output/
 ├── ProteomicAnalysis_Results.xlsx   # Full multi-sheet report

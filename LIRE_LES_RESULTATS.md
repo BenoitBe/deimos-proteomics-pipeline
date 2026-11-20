@@ -5,7 +5,7 @@ rapport Pathfinder. Écrit pour qu'on puisse ouvrir les fichiers sans se demande
 par où commencer.
 
 ```
-proteomics_output/
+proteomics_output/        (ou <project_dir>/output/ si vous travaillez par projet)
 ├── ProteomicAnalysis_Results.xlsx   les chiffres, c'est la source
 ├── Proteomic_dashboard.html         explorer, filtrer, exporter  (nom réglable)
 ├── pathfinder_report.html           la lecture d'ensemble
