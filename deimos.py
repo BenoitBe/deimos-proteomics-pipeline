@@ -4653,6 +4653,15 @@ def build_methods_sheet(ws, params: dict, tsv: pd.DataFrame,
                "both / imputation only / DPC only, per protein and contrast "
                "(sheet Sensitivity_DPC); counts per contrast in Sensitivity_Summary")
 
+    # ===== PLASMA SAMPLE QUALITY (plasma_qc: true, added) =====
+    _pq_rows = params.get("_plasma_qc_methods")
+    if _pq_rows:
+        put_section(f"{_next_sec}. PLASMA SAMPLE QUALITY (complementary)")
+        _next_sec += 1
+        put_header()
+        for _k, _v, _m in _pq_rows:
+            put_kv(_k, _v, _m)
+
     # ===== PATHFINDER (if requested and found) =====
     _pf_dir = locate_pathfinder(params) if params.get("make_pathfinder") else None
     if _pf_dir:
@@ -5874,7 +5883,7 @@ def export_qc_excel(tsv: pd.DataFrame, mat_log2: pd.DataFrame, meta: pd.DataFram
 
 def run_qc_only(tsv: pd.DataFrame, mat_log2: pd.DataFrame, meta: pd.DataFrame,
                 design: pd.DataFrame, params: dict, qc_files: list,
-                out_dir: str) -> str:
+                out_dir: str, plasma: "dict | None" = None) -> str:
     """Mode QC seul : figures QC + PCA/corrélation sur les cas complets, puis
     Excel (M&M, Methods, données brutes, log2, figures). Aucune imputation,
     statistique, WGCNA, GO ni dashboard."""
@@ -5914,6 +5923,19 @@ def run_qc_only(tsv: pd.DataFrame, mat_log2: pd.DataFrame, meta: pd.DataFrame,
     export_qc_excel(tsv, mat_log2, meta, design, params, qc_files, pca_imgs,
                     len(complete), reason, out_path)
     print(f"  [OK] Excel file saved: {out_path}")
+    # Qualité plasma (plasma_qc: true) : feuille Plasma_QC ajoutée au classeur QC
+    # (indices et confusion seulement : pas de DEP en mode QC seul).
+    if plasma is not None:
+        try:
+            import plasma_qc as _pq
+            _wb = load_workbook(out_path)
+            _sheets = _pq.write_sheets(_wb, plasma)
+            _wb.save(out_path)
+            print(f"  [OK] Plasma QC sheet added: {', '.join(_sheets)}")
+            if plasma.get("plot"):
+                qc_files = list(qc_files) + [plasma["plot"]]
+        except Exception as e:
+            print(f"  [WARN] Plasma QC sheet not written ({type(e).__name__}: {e})")
     # Figures déjà intégrées à l'Excel : on ne supprime QUE celles de ce run
     # (et leurs copies redimensionnées), pas d'éventuels fichiers d'autres runs.
     for f in list(qc_files) + list(pca_imgs):
@@ -6353,6 +6375,115 @@ def run_sensitivity_step(mat_log2: pd.DataFrame, mat_filt: pd.DataFrame,
     return res
 
 
+def resolve_plasma_qc(params: dict, mat_log2: pd.DataFrame, meta: pd.DataFrame,
+                      ask=input) -> bool:
+    """Décide si l'étape plasma tourne. true / false : choix explicite (YAML ou
+    --plasma-qc). "__auto__" : on regarde les données, après chargement — albumine
+    en tête et protéines plasmatiques dans le top 20 (plasma_qc.plasma_signature) ;
+    si c'est du plasma, la question est posée en run interactif, et seulement une
+    ligne d'information est écrite sinon (--config, CI : jamais de blocage)."""
+    v = params.get("plasma_qc", "__auto__")
+    if v is True:
+        return True
+    if v is not None and v != "__auto__":
+        return False
+    try:
+        import plasma_qc as _pq
+        genes = (meta["Genes"].fillna("").astype(str).tolist() if "Genes" in meta.columns
+                 else [""] * len(mat_log2))
+        sig = _pq.plasma_signature(mat_log2, genes)
+    except Exception as e:
+        print(f"  [WARN] Plasma signature not evaluated ({type(e).__name__}: {e})")
+        return False
+    if not sig["looks_like"]:
+        return False
+    print(f"\n[DIAG] These samples look like plasma / serum ({sig['evidence']}).")
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    if not interactive:
+        print("  [INFO] plasma_qc is 'auto' and the run is not interactive: the plasma "
+              "quality panels are NOT run. Set plasma_qc: true in the YAML, or add "
+              "--plasma-qc.")
+        return False
+    try:
+        rep = ask("  Check sample quality with the plasma panels (hemolysis, platelets, "
+                  "coagulation)? (Y/n) -> ").strip().lower()
+    except EOFError:
+        return False
+    return rep in ("", "o", "oui", "y", "yes")
+
+
+def run_plasma_qc_samples(mat_log2: pd.DataFrame, meta: pd.DataFrame,
+                          design: pd.DataFrame, params: dict, out_dir: str) -> "dict | None":
+    """Qualité des échantillons de plasma, étape 1 (au QC, avant les statistiques) :
+    indices érythrocytes / plaquettes / coagulation de Geyer et al. 2019 sur la matrice
+    NON filtrée, échantillons signalés (jamais retirés), indice contre condition.
+    plasma_qc: true -> lancé ; false -> rien ; "__auto__" (défaut) -> question si les
+    données ont la signature d'un plasma (voir resolve_plasma_qc). Ne lève jamais."""
+    if not resolve_plasma_qc(params, mat_log2, meta):
+        return None
+    print("\n[STEP] Plasma sample quality (Geyer et al. 2019 marker panels)...")
+    try:
+        import plasma_qc as _pq
+        m = mat_log2.copy()
+        m.columns = design["label"].astype(str).values
+        genes = (meta["Genes"].fillna("").astype(str).tolist() if "Genes" in meta.columns
+                 else [""] * len(m))
+        return _pq.run_sample_qc(m, genes, design["condition"].astype(str).tolist(),
+                                 panels_path=params.get("plasma_qc_panels"), out_dir=out_dir)
+    except Exception as e:
+        print(f"  [WARN] Plasma QC skipped ({type(e).__name__}: {e}) — pipeline not affected.")
+        return None
+
+
+def run_plasma_qc_dep(plasma: "dict | None", mat_log2: pd.DataFrame, mat_filt: pd.DataFrame,
+                      meta: pd.DataFrame, meta_filt: pd.DataFrame, design: pd.DataFrame,
+                      df_results: pd.DataFrame, contrast_names: list,
+                      params: dict) -> "dict | None":
+    """Étape 2 (après le différentiel) : DEP de chaque contraste (règle des volcanos,
+    volcano_status) croisées avec les panels et les indices. Retourne le résultat de
+    l'étape 1 inchangé si l'étape 2 échoue."""
+    if plasma is None:
+        return None
+    try:
+        import plasma_qc as _pq
+        if len(df_results) != len(mat_filt):
+            raise ValueError(f"{len(df_results)} result rows for {len(mat_filt)} matrix rows")
+        labels = design["label"].astype(str).values
+        mobs = mat_filt.copy()
+        mobs.columns = labels
+        mall = mat_log2.copy()
+        mall.columns = labels
+        masks = {}
+        for c in contrast_names:
+            _, _, _, up, down = volcano_status(df_results, c, params)
+            masks[c] = np.asarray(up | down, bool)
+        genes_obs = (df_results["Genes"].fillna("").astype(str).tolist()
+                     if "Genes" in df_results.columns else [""] * len(df_results))
+        genes_all = (meta["Genes"].fillna("").astype(str).tolist()
+                     if "Genes" in meta.columns else [""] * len(mall))
+        return _pq.run_dep_qc(plasma, mobs, genes_obs, df_results, contrast_names, masks,
+                              design["condition"].astype(str).tolist(),
+                              mat_all=mall, genes_all=genes_all)
+    except Exception as e:
+        print(f"  [WARN] Plasma QC of the DEP skipped ({type(e).__name__}: {e}) — "
+              f"sample indices kept.")
+        return plasma
+
+
+def _plasma_manifest_rows(plasma, sheets) -> list:
+    """Lignes 'plasma_qc' du manifeste (ajout) : où lire les drapeaux."""
+    if not plasma or not sheets:
+        return []
+    fl = plasma["flags"]
+    rows = [("plasma_qc", "sample_sheet", "Plasma_QC"),
+            ("plasma_qc", "flagged_samples",
+             ";".join(map(str, fl.index[fl["flagged"]])) or "none"),
+            ("plasma_qc", "confounded_indices", ";".join(plasma.get("confounded") or []) or "none")]
+    if "Plasma_QC_DEP" in sheets:
+        rows.append(("plasma_qc", "dep_sheet", "Plasma_QC_DEP"))
+    return rows
+
+
 def _sensitivity_manifest_rows(sensitivity, sheets) -> list:
     """Lignes 'sensitivity' du manifeste (schéma 1.1, ajout)."""
     if not sensitivity or not sheets:
@@ -6445,9 +6576,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
     print("\n[QC] Quality control...")
     qc_files = plot_qc(mat_log2, meta, design_filt, out_dir)
 
+    # --- 3bis. Qualité des échantillons de plasma (plasma_qc: true, AJOUT) ---
+    # Au QC, AVANT les statistiques : un échantillon hémolysé se décide ici
+    # (exclusion, covariable), pas à la lecture des DEP.
+    plasma = run_plasma_qc_samples(mat_log2, meta, design_filt, params, out_dir)
+
     # --- Mode QC seul : données brutes + M&M + figures QC, rien d'autre ---
     if params.get("qc_only"):
-        run_qc_only(tsv, mat_log2, meta, design_filt, params, qc_files, out_dir)
+        run_qc_only(tsv, mat_log2, meta, design_filt, params, qc_files, out_dir,
+                    plasma=plasma)
         if params.get("make_pathfinder"):
             print("  [SKIP] Pathfinder: QC-only mode, no p-values to synthesise.")
         if params.get("make_insight"):
@@ -6569,6 +6706,14 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
             "requested": str(params.get("primary_statistic", "dpc")).lower(),
             "fallback": params.get("_dpc_primary_fallback")}}
 
+    # --- 5quater. Plasma QC des DEP (après le basculement DPC : même règle que
+    #     les volcanos, sur les colonnes principales) ---
+    plasma = run_plasma_qc_dep(plasma, mat_log2, mat_filt, meta, meta_filt,
+                               design_filt, df_results, contrast_names, params)
+    if plasma is not None:
+        import plasma_qc as _pq
+        params = {**params, "_plasma_qc_methods": _pq.methods_rows(plasma)}
+
     # --- 6. Volcanos ---
     print("\n[STEP] Generating volcano plots...")
     volc_files, facet_volc = plot_volcanoes(df_results, contrast_names, params, out_dir)
@@ -6684,6 +6829,15 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
         export_wgcna_sheets(wb, wgcna_results, _write_df, _ins_img)
 
     # --- 13bis0. Onglets de sensibilité aux valeurs manquantes (ajoutés) ---
+    plasma_sheets = []
+    if plasma is not None:
+        try:
+            import plasma_qc as _pq
+            plasma_sheets = _pq.write_sheets(wb, plasma, _ins_img)
+            print(f"  [OK] Plasma QC sheets added: {', '.join(plasma_sheets)}")
+        except Exception as e:
+            print(f"  [WARN] Plasma QC sheets not written ({type(e).__name__}: {e})")
+
     sensitivity_sheets = []
     if sensitivity is not None:
         try:
@@ -6786,7 +6940,8 @@ def run_pipeline_core(tsv: pd.DataFrame, design: pd.DataFrame, out_dir: str,
                 "DEqMS" if any(str(c).endswith("_p.adj_limma") for c in df_results.columns)
                 else "limma eBayes"),
             extra_rows=_sensitivity_manifest_rows(sensitivity, sensitivity_sheets)
-            + [("gsea_sheet", sh, c) for sh, c in gsea_sheet_map.items()])
+            + [("gsea_sheet", sh, c) for sh, c in gsea_sheet_map.items()]
+            + _plasma_manifest_rows(plasma, plasma_sheets))
     except Exception as e:      # jamais bloquant pour le livrable
         print(f"  [WARN] _manifest sheet not written ({type(e).__name__}: {e})")
 

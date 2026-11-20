@@ -145,6 +145,24 @@ jobs:
           grep -q "Covariable de lot 'batch'" batch.log
           test -f batch_out/diagnostic_batch.png   # survit au nettoyage
 
+      # Qualité plasma : hémolyse confondue avec la condition. Aucun échantillon
+      # aberrant, mais l'indice doit être déclaré confondu et les feuilles écrites.
+      - name: Plasma QC — confounded hemolysis is reported
+        run: |
+          python tests/plasma_fixture.py plasma_data confounded
+          { cat smoke.yaml; echo "plasma_qc: true"; } > plasma.yaml
+          python deimos.py --config plasma.yaml --tsv plasma_data/report.pg_matrix.tsv \
+                           --design plasma_data/ExperimentalDesign.csv \
+                           --out-dir plasma_out | tee plasma.log
+          grep -q "Erythrocyte lysis index differs between conditions" plasma.log
+          python - <<'EOF'
+          import pandas as pd
+          xl = pd.ExcelFile("plasma_out/ProteomicAnalysis_Results.xlsx")
+          assert {"Plasma_QC", "Plasma_QC_DEP"} <= set(xl.sheet_names), xl.sheet_names
+          d = pd.read_excel(xl, "Plasma_QC_DEP")
+          assert {"HBB", "RBCTRK"} <= set(d.loc[d["flag"] == "high", "Genes"])
+          EOF
+
       # Un lot imbriqué dans la condition rend le modèle singulier : le run doit
       # REFUSER, pas produire des coefficients inutilisables en silence.
       - name: Batch covariate — confounded design is refused

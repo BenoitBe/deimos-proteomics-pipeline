@@ -12,6 +12,31 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Added
 
+- **Plasma / serum sample quality** (new module `plasma_qc.py`; `plasma_qc: true` or
+  `--plasma-qc`; default `__auto__`: after loading, if the samples look like plasma or serum —
+  albumin first, ≥ 8 classic plasma proteins in the top 20 — the question is asked in an
+  interactive run, a one-line hint is printed otherwise, so a run on anything else is
+  unchanged). Gene symbols are matched case-insensitively, with the hemoglobin symbols of mouse,
+  rat and dog; a warning is printed when few panel proteins match (FASTA without gene names).
+  On simulated clean plasma, the rule of the article flags 5 % of samples on at least one index
+  (mean + 2 SD is one-sided 2.3 % per index), the median/MAD rule 1.9 %: a flag asks for a look,
+  not for an exclusion. The three marker panels of Geyer et al. 2019 (EMBO Mol Med 11:e10427, Table EV2):
+  erythrocyte lysis, platelet contamination, coagulation. Per sample, one index per panel as
+  in the article (panel / all quantified proteins; all proteins / fibrinogen chains for
+  coagulation), computed on the unfiltered matrix before any statistics. Samples are flagged,
+  never removed: mean + 2 SD on the log2 index (rule of the article; it cannot flag anything
+  with 5 samples or fewer, a limit now stated in the console) or modified z > 3.5 (median/MAD).
+  Each index is tested against the condition (Kruskal-Wallis, ε²; Welch per contrast). Every
+  DEP is checked for panel membership and for its within-condition correlation with each index
+  (condition means removed from both sides, BH over all proteins; for a panel member the index
+  is recomputed without it). Two deliberate deviations from the article: ACTB and GAPDH, shared
+  by the erythrocyte and platelet panels, are left out of both index sums (hemolysis otherwise
+  raises the platelet index), and the coagulation index uses the three fibrinogen chains only.
+  Sheets Plasma_QC and Plasma_QC_DEP, a Methods section, `plasma_qc` rows in `_manifest`; the
+  sample part also runs in QC-only mode. Standalone on a finished run:
+  `python plasma_qc.py proteomics_output`. Custom panels: `plasma_qc_panels` (TSV gene, panel).
+  The panel lists were transcribed from a public copy of Table EV2 (the supplement cannot be
+  downloaded automatically): check them against the original before publication.
 - **`LIRE_LES_RESULTATS.md`**: a reading guide for the three outputs of a run — the
   workbook, the Deimos dashboard and the Pathfinder report. Sheet by sheet, page by
   page, what each number means, what to check before interpreting anything, the five
