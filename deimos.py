@@ -704,7 +704,7 @@ def annotate_from_fasta(tsv: pd.DataFrame, tsv_path: str, setting="__auto__") ->
     explicit = None if setting == "__auto__" else setting
     have = 0
     if "Genes" in tsv.columns:
-        g = tsv["Genes"].astype(str).str.strip()
+        g = tsv["Genes"].fillna("").astype(str).str.strip()   # pandas 3 : NaN != "nan"
         have = int((~g.isin(["", "|", "nan", "None", "NaN"])).sum())
     if explicit is None and len(tsv) and have > 0.5 * len(tsv):
         return None                                   # DIA-NN a déjà les noms
@@ -805,7 +805,9 @@ def load_data(tsv_path: str, design_path: str,
     tsv = tsv.rename(columns=rename_map)
 
     # Colonnes ID et name
-    tsv["ID"]   = tsv["Protein.Names"].astype(str).str.split(";").str[0]
+    # 1re entrée avant ";" sans chaîner .str : sous pandas 3, une colonne entièrement
+    # vide (FASTA sans noms UniProt, ex. Darmor-bzh) fait échouer .split().str[0].
+    tsv["ID"]   = tsv["Protein.Names"].astype(str).str.replace(r";.*", "", regex=True)
     tsv["name"] = tsv["Protein.Group"].astype(str).str.split(";").str[0]
 
     # Retirer contaminants cRAP
@@ -833,7 +835,7 @@ def detect_species_tags(tsv: pd.DataFrame, col: str = "Protein.Names") -> pd.Ser
     Retourne une Series alignée sur l'index de tsv, NaN si aucun suffixe
     reconnu (protéine sans tag exploitable — ni perdue ni mal classée).
     """
-    first_entry = tsv[col].astype(str).str.split(";").str[0]
+    first_entry = tsv[col].astype(str).str.replace(r";.*", "", regex=True)  # cf. load_data
     tags = first_entry.str.extract(r"_([A-Za-z0-9]{3,10})$")[0]
     # Contaminants (cRAP-, CON__, contam_...) : leurs suffixes _HUMAN/_BOVIN
     # (kératines, trypsine...) ne sont pas des organismes de l'étude —
@@ -1003,10 +1005,15 @@ def run_perseverance_step(df_results: pd.DataFrame, params: dict, out_dir: str
         else:
             fasta_a, fasta_b = ask_fasta_paths(candidates)
 
-    if not (os.path.isfile(fasta_a) and os.path.isfile(fasta_b)):
-        print(f"  [WARN] FASTA introuvable(s) ({fasta_a}, {fasta_b}) — "
-              f"Perseverance ignoré.")
+    _fa = _resolve_input_path(fasta_a, params)
+    _fb = _resolve_input_path(fasta_b, params)
+    if not (_fa and _fb):
+        _miss = [f for f, ok in ((fasta_a, _fa), (fasta_b, _fb)) if not ok]
+        print(f"  [WARN] FASTA introuvable(s) : {', '.join(map(str, _miss))} (cherché dans "
+              f"{os.getcwd()} et le dossier du pg_matrix) — Perseverance ignoré : pas "
+              f"d'orthologues, donc ni GSEA ni GO des clusters via l'espèce de référence.")
         return None, None
+    fasta_a, fasta_b = _fa, _fb
 
     id_col = "name" if "name" in df_results.columns else df_results.columns[0]
     protein_groups = df_results[id_col].astype(str).tolist()

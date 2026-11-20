@@ -5,6 +5,7 @@ import sys
 import textwrap
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -328,3 +329,42 @@ def test_resolve_input_path_falls_back_to_pg_matrix_folder(tmp_path, monkeypatch
     assert D._resolve_input_path("absent.tsv", params) is None
     (run / "ann.tsv.gz").write_bytes(b"")              # le dossier courant reste prioritaire
     assert D._resolve_input_path("ann.tsv.gz", params) == "ann.tsv.gz"
+
+
+def _darmor_like_pg_matrix(path, n=30):
+    """pg_matrix DIA-NN sur un FASTA sans noms UniProt (Darmor-bzh) : Protein.Names,
+    Genes et description vides, sauf sur les contaminants cRAP."""
+    rows = [[f"A01p{i:05d}.1_BnaDAR"] * 2 + ["", "", "", 1] for i in range(n)]
+    rows += [["cRAP-KRT1", "cRAP-KRT1", "K2C1_HUMAN", "KRT1", "Keratin", 1]]
+    meta = ["Protein.Group", "Protein.Ids", "Protein.Names", "Genes",
+            "First.Protein.Description", "N.Seq"]
+    df = pd.DataFrame(rows, columns=meta)
+    for i in range(1, 5):
+        df[f"D:\\raw\\x_Sple-{i}_DIA.raw"] = np.random.default_rng(i).lognormal(10, 1, len(df))
+    df.to_csv(path, sep="\t", index=False)
+
+
+def test_empty_protein_names_do_not_crash_loading(tmp_path):
+    """Régression (pandas 3) : Protein.Names entièrement vide après retrait des cRAP
+    -> AttributeError '.str accessor ... not floating' dans detect_species_tags."""
+    import deimos as D
+    tsv_p, des_p = tmp_path / "report.pg_matrix.tsv", tmp_path / "design.csv"
+    _darmor_like_pg_matrix(tsv_p)
+    pd.DataFrame({"label": [f"Sple-{i}" for i in range(1, 5)],
+                  "condition": ["A", "A", "B", "B"], "replicate": [1, 2, 1, 2]}) \
+        .to_csv(des_p, sep=";", index=False)
+    tsv, _ = D.load_data(str(tsv_p), str(des_p), annotation_fasta=False)
+    assert len(tsv) == 30 and tsv["name"].str.endswith("_BnaDAR").all()
+    tags = D.detect_species_tags(tsv)
+    assert tags.isna().all()
+
+
+def test_gsea_gene_keys_with_empty_genes_column():
+    """pandas 3 : astype(str) garde NaN -> ni plantage, ni clé NaN dans les tables."""
+    from gsea_enrichment import _key_proteins, gprofiler_gene_keys
+    df = pd.DataFrame({"name": ["P1", "P2", "P3"], "Genes": [np.nan, np.nan, "rbcL;rbcS"]})
+    assert _key_proteins(df) == {"RBCL": ["P3"]}
+    assert _key_proteins(df.assign(Genes=np.nan)) == {}
+    key_map, *_ = gprofiler_gene_keys(df, "athaliana", convert_fn=lambda ids, code: [],
+                                      verbose=False)
+    assert key_map == {"P3": "RBCL"}

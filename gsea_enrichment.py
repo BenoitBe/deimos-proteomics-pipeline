@@ -281,10 +281,11 @@ def _key_proteins(df, key_map=None):
         keys = df["Genes"]
     else:
         return {}
-    keys = keys.astype(str).str.split(";").str[0].str.strip().str.upper()
+    # replace et non split().str[0] : Genes entièrement vide -> float sous pandas 3
+    keys = keys.astype(str).str.replace(r";.*", "", regex=True).str.strip().str.upper()
     out = {}
     for k, p in zip(keys, pids):
-        if k and k not in ("NAN", "NONE"):
+        if isinstance(k, str) and k and k not in ("NAN", "NONE"):   # pandas 3 : NaN reste NaN
             out.setdefault(k, []).append(p)
     return out
 
@@ -349,8 +350,9 @@ def gprofiler_gene_keys(df, code, orthologs=None, convert_fn=None, verbose=True)
         return key_map, alias, summ
     why = err or f"g:Convert linked only {len(key_map)}/{n_q} identifiers to {code} genes"
     if "Genes" in df.columns:
-        g = df["Genes"].astype(str).str.split(";").str[0].str.strip().str.upper()
-        key_map = {p: v for p, v in zip(pids, g) if v and v not in _NO_HIT}
+        g = df["Genes"].astype(str).str.replace(r";.*", "", regex=True).str.strip().str.upper()
+        key_map = {p: v for p, v in zip(pids, g)
+                   if isinstance(v, str) and v and v not in _NO_HIT}
         alias = {v: v for v in key_map.values()}
         summ = (f"[WARN] {why} — fallback on the Genes column ({len(key_map)} symbols)"
                 + ("" if orthologs else "; for another species, run Perseverance towards "
@@ -403,7 +405,7 @@ def _ranking_metric(df_comparaison, contrast, params, key_map=None):
         df.columns = ["gene", "p", "lfc"]
     df = df.dropna(subset=["p", "lfc"])
     # Symbole propre : premier gène avant ';', majuscule, sans espaces
-    df["gene"] = (df["gene"].astype(str).str.split(";").str[0]
+    df["gene"] = (df["gene"].astype(str).str.replace(r";.*", "", regex=True)
                   .str.strip().str.upper())
     df = df[df["gene"].notna() & (df["gene"] != "") & (df["gene"] != "NAN")]
     if df.empty:
