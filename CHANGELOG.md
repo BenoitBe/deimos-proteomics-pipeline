@@ -154,6 +154,30 @@ and dashboard improvements accumulated since the previous public version.
     degrees of freedom globally against 9 per time point.
   - `tests/test_anova_strata.py` (11 tests).
 
+### Fixed
+
+- **Three keys the code read were declared nowhere, and `last_config.yaml` dropped them.**
+  `_save_last_config` keeps only `k in _DEFAULTS`, so `species_split`,
+  `perseverance_fasta_dir` and `go_string_mode` were erased from the run record even when
+  the user had set them explicitly. Two consequences, both silent: the file meant to be
+  *the* record of what ran lied by omission, and re-running from it asked again the very
+  question the key existed to suppress — `EOFError` under `--config`, with the run dying
+  after the workbook and before the sweep. All three are now declared, and
+  `test_les_reglages_utilisateur_survivent_au_last_config` pins their round trip.
+  - The thirteen keys the code computes during a run and stashes in `params` moved into
+    `_COMPUTED`, which previously held one. They stay out of `last_config.yaml` on
+    purpose, and a test checks `_COMPUTED` and `_DEFAULTS` remain disjoint so the set
+    cannot become a dumping ground.
+  - `ask_go_params()` built a local dict also named `params`, whose `backend` key made it
+    indistinguishable from the configuration. Renamed to `go_params`: the audit now reads
+    the code without guessing, rather than carrying an exception list.
+
+- **The key audit only looked one way.** It caught a key declared and never used
+  (`batch_column`) but not a key used and never declared, which is how `species_split`
+  survived. `test_toute_cle_lue_est_declaree` closes the other direction: every key read
+  from `params` must be in `_DEFAULTS` or `_COMPUTED`. Checked by removing `species_split`
+  from `_DEFAULTS` again — the test fails, naming `deimos.py:5824`.
+
 ### Added
 
 - **`project_dir`: one folder per project** (also `--project-dir`). It is the root for

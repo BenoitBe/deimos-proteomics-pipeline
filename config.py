@@ -59,6 +59,7 @@ _DEFAULTS = {
     "go_backend":          "gprofiler",  # "gprofiler" | "string" (bactéries, non-modèles)
     "go_species_taxid":    None,    # si go_backend == "string" : "auto" (détection depuis les accessions) ou taxid de SOUCHE (ex: 511145)
     "string_caller_identity": "Proteogen",  # identifiant appelant STRING (pas de donnée perso)
+    "go_string_mode":       None,          # résolution des identifiants STRING ; None = automatique
     # Univers de l'ORA (gProfiler, STRING, clusters) : "quantified" = protéines
     # testées (défaut) | "genome" = génome annoté entier (comportement antérieur)
     "enrichment_background": "quantified",
@@ -68,6 +69,8 @@ _DEFAULTS = {
     "string_categories":   None,    # None = GO:BP/MF/CC + KEGG + Reactome ; ex: [Process, KEGG, Keyword, Pfam]
     "perseverance_annotation_path": None,  # TSV Perseverance (protein_id, GO, KEGG, Pfam) -> ORA local, independant de go_organism
     "perseverance_threads": None,          # threads DIAMOND (RBH) ; None = tous les cœurs - 1
+    # Dossier où chercher les FASTA de Perseverance ; None = dossier des données.
+    "perseverance_fasta_dir": None,
     "perseverance_go_terms_path": None,    # TSV GO, name, namespace (annotation_import.py --terms-out) -> termes nommés, BP/CC/MF
     "control_condition":   "__auto__",  # "__auto__"=detection par synonymes, str=explicite, False=desactive
     "control_synonyms":    None,     # None = liste par defaut (ctl, ctrl, control, wt, mock...)
@@ -137,6 +140,10 @@ _DEFAULTS = {
     # de nom ; un chemin force ce FASTA ; false désactive. Seules les cellules vides
     # sont remplies, et aucun fichier n'est écrit.
     "annotation_fasta":    "__auto__",
+    # Plusieurs organismes dans Protein.Names : analyse complète et séparée par
+    # organisme. None = question au run (interactif) ; true/false décide sans
+    # question — indispensable en --config, où une question lève EOFError.
+    "species_split":       None,
     # Nom du dashboard HTML dans out_dir. Un chemin est réduit à son nom de
     # fichier ; .html est ajouté s'il manque. Nom d'avant le 12/11/2026 :
     # "proteogen_dashboard.html", à remettre ici pour le retrouver.
@@ -152,7 +159,20 @@ _DEFAULTS = {
 }
 
 # Clés dérivées calculées automatiquement (non stockées dans le YAML)
-_COMPUTED = {"volcano_lfc_min"}
+# Clés que le code CALCULE pendant un run et range dans `params` pour les relire
+# plus loin. Elles ne viennent pas de l'utilisateur et ne sont pas réécrites dans
+# last_config.yaml. Toute clé lue depuis `params` doit figurer ici ou dans
+# _DEFAULTS — c'est ce qu'exige test_config_keys_are_declared, et c'est ce qui
+# manquait à `species_split`, silencieusement effacée du last_config.yaml alors
+# que l'utilisateur l'avait renseignée.
+_COMPUTED = {
+    "volcano_lfc_min",            # dérivée de volcano_ratio_min
+    "_deqms", "_primary", "_sensitivity_methods", "_plasma_qc_methods",
+    "_local_annotation", "_dpc_primary_fallback", "_reading_in_pathfinder",
+    "go_species_name", "go_string_strain",
+    "id_mapping", "id_mapping_summary",
+    "impute_method_reason", "qc_only_reason",
+}
 
 
 # ── Helpers de sérialisation ────────────────────────────────────────────────────
@@ -191,7 +211,7 @@ PROJECT_PATH_KEYS = (
     "annotation_fasta", "string_reference_fasta",
     "perseverance_annotation_path", "perseverance_go_terms_path",
     "perseverance_fasta_a", "perseverance_fasta_b",
-    "gsea_go_obo", "plasma_qc_panels",
+    "gsea_go_obo", "plasma_qc_panels", "perseverance_fasta_dir",
     "out_dir",
 )
 

@@ -147,7 +147,7 @@ def ask_go_params() -> dict | None:
         caller = input(
             f"  Caller identity for STRING (project/lab name, not personal "
             f"data) [{DEFAULT_STRING_CALLER}] -> ").strip() or DEFAULT_STRING_CALLER
-        params = {"backend": "string",
+        go_params = {"backend": "string",
                   "species_taxid": "auto" if taxid_raw == "auto" else int(taxid_raw),
                   "caller_identity": caller,
                   "organism": None, "run_gsea": False}
@@ -160,7 +160,7 @@ def ask_go_params() -> dict | None:
         if not organism:
             print("  [WARN] No species provided — step skipped.\n")
             return None
-        params = {"backend": "gprofiler", "organism": organism, "run_gsea": False}
+        go_params = {"backend": "gprofiler", "organism": organism, "run_gsea": False}
 
     # Univers statistique de l'ORA (les deux backends)
     print("\n  Statistical background (universe) of the enrichment:")
@@ -170,9 +170,9 @@ def ask_go_params() -> dict | None:
     print("     [2] whole annotated genome (behaviour before 10/2026)")
     bg = "genome" if input("  Background [1/2] (default 1) -> ").strip() == "2" \
         else "quantified"
-    params["enrichment_background"] = bg
-    if params["backend"] == "string":
-        params["string_background"] = bg
+    go_params["enrichment_background"] = bg
+    if go_params["backend"] == "string":
+        go_params["string_background"] = bg
 
     # GSEA rank-based (optionnel, complément de l'ORA)
     print("\n  --- GSEA (rank-based, optional) ---")
@@ -183,11 +183,11 @@ def ask_go_params() -> dict | None:
     print("  [!] Human / mouse gene sets: proteins matched by gene symbol (Genes column),")
     print("      for mammals. A. thaliana and other g:Profiler species: g:Profiler GO,")
     print("      proteins linked by g:Convert (or Perseverance orthologues, e.g. B. napus).")
-    if params.get("backend") == "string":
+    if go_params.get("backend") == "string":
         print("  [!] Independent of the STRING backend: for bacteria, answer N.")
     rep_gsea = input("  Also run GSEA? (y/N) -> ").strip().lower()
     if rep_gsea in ("o", "oui", "y", "yes"):
-        params["run_gsea"] = True
+        go_params["run_gsea"] = True
         print("  Gene sets:")
         print("     [1] human — Enrichr: GO 2021, KEGG 2021, Reactome 2022 (default)")
         print("     [2] mouse — MSigDB mouse: hallmarks, Reactome, WikiPathways, GO")
@@ -196,16 +196,16 @@ def ask_go_params() -> dict | None:
         print("     [4] other g:Profiler species (code, e.g. hvulgare, osativa)")
         rep_org = input("  Gene sets [1/2] (3 = A. thaliana, 4 = other; default 1) -> ").strip().lower()
         if rep_org in ("3", "athaliana", "arabidopsis", "a. thaliana", "ath"):
-            params["gsea_organism"] = "athaliana"
+            go_params["gsea_organism"] = "athaliana"
         elif rep_org in ("4", "other", "autre"):
             code = input("  g:Profiler organism code (e.g. hvulgare) -> ").strip().lower()
-            params["gsea_organism"] = f"gprofiler:{code}" if code else "human"
+            go_params["gsea_organism"] = f"gprofiler:{code}" if code else "human"
         else:
-            params["gsea_organism"] = ("mouse" if rep_org in ("2", "mouse", "m", "souris",
+            go_params["gsea_organism"] = ("mouse" if rep_org in ("2", "mouse", "m", "souris",
                                                               "mmusculus", "mus musculus")
                                        else "human")
 
-    return params
+    return go_params
 
 
 # ==============================================================================
