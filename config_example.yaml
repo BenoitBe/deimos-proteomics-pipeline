@@ -208,6 +208,7 @@ string_reference_taxid: null      # orthology mode: STRING organism to map to
                                   # (default: parent species found via UniProt)
 string_reference_fasta: null      # local STRING proteome (otherwise data folder, then download)
 string_caller_identity: Proteogen # caller identity sent to the STRING API
+go_string_mode:         null      # STRING identifier resolution; null = automatic
 
 # Protein x sample matrices for other analyses (Mfuzz, MOFA+/MEFISTO,
 # multi-omics integration): folder <out_dir>/matrices/ with log2 + NA, log2
@@ -260,6 +261,7 @@ perseverance_annotation_path: null  # e.g. "perseverance_annotation_protein_grou
 # Protein groups whose leader is not annotated take the annotation of another member.
 perseverance_go_terms_path: null    # e.g. "ostrea_go_terms.tsv"
 perseverance_threads:       null    # DIAMOND threads for the RBH; null = all cores minus one
+perseverance_fasta_dir:     null    # where to look for the FASTAs; null = the data folder
 
 
 # ── Optional modules ──────────────────────────────────────────────────────────
@@ -325,6 +327,15 @@ insight_timeout:         900     # seconds
 # a path    : force that FASTA (even when DIA-NN already named the proteins)
 # false     : disable
 annotation_fasta:    "__auto__"
+
+# Several organisms in Protein.Names (host + pathogen, say): run a complete,
+# separate analysis per organism — own FDR, imputation and normalisation per
+# compartment rather than mixed into one matrix.
+#   null       = ask at run time. In --config with no terminal that question
+#                raises EOFError and the run dies AFTER the workbook but
+#                BEFORE the sweep, leaving the output folder full of PNGs.
+#   true/false = decide without asking. Set it for any unattended run.
+species_split:       null
 
 
 # ── ANOVA par strate (en plus de l'ANOVA globale) ────────────────────────────

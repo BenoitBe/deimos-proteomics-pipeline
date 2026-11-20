@@ -19,6 +19,7 @@ Le détecteur se valide lui-même (test_le_detecteur_attrape_une_cle_inerte) :
 un détecteur silencieusement cassé est pire que pas de détecteur.
 """
 import ast
+import os
 import pathlib
 import textwrap
 
@@ -265,6 +266,105 @@ def _flags_and_reads(sources: dict):
                     and isinstance(n.args[1].value, str)):
                 reads.add(n.args[1].value)
     return flags, reads
+
+
+def _keys_read_from_params(sources: dict):
+    """Toutes les clés lues depuis le dict `params` de la configuration."""
+    out = {}
+    for p, src in sources.items():
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            k = None
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "get" and n.args
+                    and isinstance(n.args[0], ast.Constant)
+                    and isinstance(n.args[0].value, str)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "params"):
+                k = n.args[0].value
+            if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                    and n.value.id == "params" and isinstance(n.ctx, ast.Load)
+                    and isinstance(n.slice, ast.Constant)
+                    and isinstance(n.slice.value, str)):
+                k = n.slice.value
+            if k:
+                out.setdefault(k, []).append(f"{getattr(p, 'name', p)}:{n.lineno}")
+    return out
+
+
+def test_le_detecteur_de_cles_non_declarees_fonctionne():
+    src = textwrap.dedent("""
+        def run(params):
+            a = params.get("declaree")
+            b = params["obligatoire"]
+            c = params.get("oubliee")
+    """)
+    lues = _keys_read_from_params({"echantillon.py": src})
+    assert set(lues) == {"declaree", "obligatoire", "oubliee"}
+
+
+def test_toute_cle_lue_est_declaree():
+    """L'inverse de l'audit d'inertie : une clé que le code LIT mais que la
+    configuration ne DÉCLARE pas.
+
+    `_save_last_config` filtre sur `k in _DEFAULTS`. Une clé non déclarée est
+    donc effacée du last_config.yaml même quand l'utilisateur l'a renseignée :
+    la trace du run ment par omission, et relancer depuis ce fichier repose la
+    question que la clé servait à supprimer — EOFError en mode --config.
+    C'est ce qui est arrivé à `species_split` jusqu'au 20/11/2026.
+    """
+    from config import _DEFAULTS, _COMPUTED
+
+    sources = {p: p.read_text(encoding="utf-8", errors="replace") for p in _sources()}
+    sources.update({p: p.read_text(encoding="utf-8", errors="replace")
+                    for p in ROOT.glob("config.py")})
+    lues = _keys_read_from_params(sources)
+    assert lues, "aucune clé trouvée : le test ne prouverait rien"
+
+    non_declarees = {k: v for k, v in lues.items()
+                     if k not in _DEFAULTS and k not in _COMPUTED}
+    assert not non_declarees, (
+        "clé(s) lue(s) par le code mais déclarée(s) nulle part — ajoutez-les à "
+        "_DEFAULTS (réglage utilisateur) ou à _COMPUTED (calculée pendant le "
+        "run) :\n"
+        + "\n".join(f"  {k}  ({', '.join(v[:3])})" for k, v in sorted(non_declarees.items())))
+
+
+def test_les_cles_calculees_ne_vont_pas_dans_le_last_config():
+    """_COMPUTED n'est pas un fourre-tout : ce qui y entre sort du fichier."""
+    import tempfile
+    import yaml
+    from config import _COMPUTED, _DEFAULTS, _save_last_config
+
+    assert not (set(_COMPUTED) & set(_DEFAULTS)), (
+        "une clé ne peut pas être à la fois un réglage utilisateur et une "
+        "valeur calculée")
+
+    d = tempfile.mkdtemp()
+    params = {**_DEFAULTS, "out_dir": d, **{k: "valeur" for k in _COMPUTED}}
+    _save_last_config(params)
+    with open(os.path.join(d, "last_config.yaml"), encoding="utf-8") as fh:
+        saved = yaml.safe_load(fh)
+    assert not (set(saved) & set(_COMPUTED))
+
+
+def test_les_reglages_utilisateur_survivent_au_last_config():
+    """La régression `species_split`, verrouillée sur les trois clés en cause."""
+    import tempfile
+    import yaml
+    from config import _DEFAULTS, _save_last_config
+
+    d = tempfile.mkdtemp()
+    reglages = {"species_split": False, "perseverance_fasta_dir": "/data/fasta",
+                "go_string_mode": "proteins"}
+    _save_last_config({**_DEFAULTS, **reglages, "out_dir": d})
+    with open(os.path.join(d, "last_config.yaml"), encoding="utf-8") as fh:
+        saved = yaml.safe_load(fh)
+    for k, v in reglages.items():
+        assert saved.get(k, "ABSENTE") == v, k
 
 
 def test_aucune_option_de_ligne_de_commande_n_est_morte():
