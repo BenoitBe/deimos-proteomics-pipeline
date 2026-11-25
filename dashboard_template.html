@@ -193,7 +193,14 @@ input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
       <span class="clbl">Robustness ≥</span>
       <input type="range" id="robSlider" min="0" max="100" step="5" value="0" style="width:70px;">
       <span class="sv" id="robVal">0</span>
-      <input type="text" id="volcSearch" placeholder="Search gene…" style="width:180px;">
+      <input type="text" id="volcSearch" placeholder="Search gene — Enter to pin" style="width:190px;"
+             title="Tape pour prévisualiser en jaune. Entrée épingle la sélection et vide le champ pour la recherche suivante.">
+      <span id="volcPinCount" style="font-size:10px;color:var(--tx3);min-width:58px;"></span>
+      <button id="btnVolcReset" onclick="volcResetPins()" style="padding:4px 9px;border-radius:6px;
+        border:1px solid var(--bd2);background:var(--bg3);color:var(--tx2);cursor:pointer;
+        font-size:10px;display:none;" title="Effacer toutes les protéines épinglées">
+        ↺ Reset
+      </button>
       <button id="btnInvert" onclick="toggleInvert()" style="margin-left:auto;padding:5px 12px;
         border-radius:6px;border:1px solid var(--bd2);background:var(--bg3);color:var(--tx2);
         cursor:pointer;font-size:11px;font-weight:500;transition:all .15s;"
@@ -203,7 +210,7 @@ input[type=range]{padding:0;height:4px;cursor:pointer;accent-color:var(--ac);}
     </div>
     <div style="position:relative;width:100%;height:460px;"><canvas id="volcCanvas"></canvas></div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:5px;">
-      <span style="font-size:10px;color:var(--tx3);">Hover a point for details · NS subsampled (600/contrast)</span>
+      <span style="font-size:10px;color:var(--tx3);">Hover a point for details · non-significant points subsampled for display; search, counts, DEP table and exports cover every protein</span>
       <button class="exp-btn" onclick="exportCanvas('volcCanvas','proteogen_volcano_'+activeContrast)" style="padding:3px 9px;font-size:10px;">⬇ PNG</button>
     </div>
   </div>
@@ -658,6 +665,73 @@ function initDepGrid(){
 }
 
 /* ── VOLCANO ── */
+/* ── Recherche du volcano : cumulative, et sur TOUTES les protéines ──────────
+   Deux limites corrigées le 25/11/2026 :
+   1. les non significatifs sont sous-échantillonnés à la construction pour que
+      le nuage reste dessinable ; une protéine NS absente du tirage était donc
+      introuvable. VOLC_INDEX porte nom, gène et coordonnées de TOUTES les
+      protéines, par contraste, et sert uniquement à la recherche ;
+   2. chaque recherche remplaçait la précédente. Les protéines épinglées
+      s'accumulent désormais jusqu'au bouton Reset.
+   Le champ fait une prévisualisation en direct ; Entrée épingle et vide le
+   champ, pour enchaîner les recherches.                                      */
+var volcPins = {};          /* nom de protéine -> terme qui l'a épinglée */
+
+function volcIndexHits(term){
+  /* Protéines dont le gène OU le nom contient `term`, dans l'index complet. */
+  var out = [];
+  if(!term || typeof VOLC_INDEX === 'undefined' || !VOLC_INDEX.prot) return out;
+  var prot = VOLC_INDEX.prot;
+  for(var i = 0; i < prot.length; i++){
+    var n = (prot[i][0] || '').toLowerCase();
+    var g = (prot[i][1] || '').toLowerCase();
+    if(g.indexOf(term) !== -1 || n.indexOf(term) !== -1) out.push(i);
+  }
+  return out;
+}
+
+function volcIndexXY(i, c){
+  /* Coordonnées (d, lp) de la protéine d'indice i dans le contraste c. */
+  if(typeof VOLC_INDEX === 'undefined' || !VOLC_INDEX.xy || !VOLC_INDEX.xy[c]) return null;
+  var a = VOLC_INDEX.xy[c];
+  var d = a[2 * i], lp = a[2 * i + 1];
+  if(d === null || d === undefined || lp === null || lp === undefined) return null;
+  return {d: d, lp: lp};
+}
+
+function volcPinCurrent(){
+  /* Entrée : épingle les protéines du terme courant, puis vide le champ. */
+  var box = document.getElementById('volcSearch');
+  var term = (box.value || '').toLowerCase().trim();
+  if(!term) return;
+  var hits = volcIndexHits(term);
+  if(!hits.length){
+    box.style.borderColor = 'rgba(248,81,73,.8)';
+    setTimeout(function(){ box.style.borderColor = ''; }, 900);
+    return;
+  }
+  hits.forEach(function(i){ volcPins[VOLC_INDEX.prot[i][0]] = term; });
+  box.value = '';
+  volcUpdatePinUI();
+  drawVolcano();
+}
+
+function volcResetPins(){
+  volcPins = {};
+  var box = document.getElementById('volcSearch');
+  if(box) box.value = '';
+  volcUpdatePinUI();
+  drawVolcano();
+}
+
+function volcUpdatePinUI(){
+  var n = Object.keys(volcPins).length;
+  var lbl = document.getElementById('volcPinCount');
+  var btn = document.getElementById('btnVolcReset');
+  if(lbl) lbl.textContent = n ? (n + ' épinglée' + (n > 1 ? 's' : '')) : '';
+  if(btn) btn.style.display = n ? '' : 'none';
+}
+
 function getVolcFilter(){
   const fc=parseFloat(document.getElementById('fcSlider').value);
   const ptype=document.querySelector('input[name="ptype"]:checked').value;
@@ -702,6 +776,30 @@ function drawVolcano(){
   const pts = invertActive
     ? rawPts.map(p=>({...p, d:-p.d, s: p.s==='U'?'D': p.s==='D'?'U': p.s}))
     : rawPts;
+  /* Protéines cherchées ou épinglées mais absentes du nuage dessiné : les NS
+     sont sous-échantillonnés, on va chercher leurs coordonnées dans l'index
+     complet. Calculé AVANT les bornes des axes, pour qu'une protéine trouvée
+     hors du nuage courant reste dans le cadre au lieu d'être tracée dehors. */
+  const _drawn=new Set(pts.map(p=>p.name));
+  const extra=[];
+  if(typeof VOLC_INDEX!=='undefined' && VOLC_INDEX.prot && VOLC_INDEX.prot.length){
+    const seen=new Set();
+    const addIdx=i=>{
+      const nm=VOLC_INDEX.prot[i][0];
+      if(_drawn.has(nm)||seen.has(nm))return;
+      const xy=volcIndexXY(i,activeContrast);
+      if(!xy)return;
+      seen.add(nm);
+      extra.push({name:nm, Genes:VOLC_INDEX.prot[i][1],
+                  d:(invertActive?-xy.d:xy.d), lp:xy.lp,
+                  p:Math.pow(10,-xy.lp), padj:null, pi:null, r:null,
+                  s:'N', desc:'', _fromIndex:true, _pinned:!!volcPins[nm]});
+    };
+    if(search) volcIndexHits(search).forEach(addIdx);
+    if(Object.keys(volcPins).length){
+      VOLC_INDEX.prot.forEach((pr,i)=>{ if(volcPins[pr[0]]) addIdx(i); });
+    }
+  }
   const canvas=document.getElementById('volcCanvas');
   const ctx=canvas.getContext('2d');
   const W=canvas.offsetWidth||900;const H=460;
@@ -712,7 +810,8 @@ function drawVolcano(){
   const pad={l:54,r:22,t:24,b:46};
   const pw=W-pad.l-pad.r;const ph=H-pad.t-pad.b;
   // y-axis: always -log10(p.val) for visual
-  const xv=pts.map(p=>p.d),yv=pts.map(p=>p.lp);
+  const xv=pts.map(p=>p.d).concat(extra.map(p=>p.d)),
+        yv=pts.map(p=>p.lp).concat(extra.map(p=>p.lp));
   if(!xv.length)return;
   const xmin=Math.min(_minOf(xv),0)-0.4,xmax=Math.max(_maxOf(xv),0)+0.4;
   // Ligne de seuil sur l'axe -log10(p brute) : en mode p.adj, p brute équivalente
@@ -734,7 +833,8 @@ function drawVolcano(){
     const x=sx(p.d),y=sy(p.lp);
     const sig=isSig(p,fc,ptype,thresh);
     const isU=sig&&p.d>fc,isD=sig&&p.d<-fc;
-    const hit=search&&((p.Genes||'').toLowerCase().includes(search)||(p.name||'').toLowerCase().includes(search));
+    const hit=(search&&((p.Genes||'').toLowerCase().includes(search)||(p.name||'').toLowerCase().includes(search)))
+              ||!!volcPins[p.name];
     let col=THEME.bg4,r=2.2;
     if(isU){col='rgba(63,185,80,.75)';su++;}
     if(isD){col='rgba(248,81,73,.75)';sd++;}
@@ -742,6 +842,25 @@ function drawVolcano(){
     ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();
     if(hit)ctx.stroke();
   });
+  /* Points venus de l'index : même jaune, même contour. */
+  extra.forEach(p=>{
+    ctx.beginPath();ctx.arc(sx(p.d),sy(p.lp),6,0,Math.PI*2);
+    ctx.fillStyle='#ffd700';ctx.fill();
+    ctx.strokeStyle=outlineCol;ctx.lineWidth=.8;ctx.stroke();
+  });
+  /* Étiqueter les épinglées seulement : une prévisualisation peut toucher des
+     centaines de protéines, et les nommer toutes rendrait le graphe illisible.
+     Au-delà de 25 épingles on s'abstient aussi. */
+  {
+    const pinned=pts.filter(p=>volcPins[p.name]).concat(extra.filter(p=>p._pinned));
+    if(pinned.length && pinned.length<=25){
+      ctx.font='10px sans-serif';ctx.textAlign='left';ctx.fillStyle=THEME.tx2;
+      pinned.forEach(p=>{
+        const lbl=(p.Genes||p.name||'').split(';')[0];
+        if(lbl) ctx.fillText(lbl, sx(p.d)+8, sy(p.lp)+3);
+      });
+    }
+  }
   ctx.fillStyle=THEME.tx2;ctx.font='11px sans-serif';ctx.textAlign='center';
   ctx.fillText(invertActive?'log₂ Fold Change (inverted)':'log₂ Fold Change',pad.l+pw/2,H-8);
   ctx.save();ctx.translate(14,pad.t+ph/2);ctx.rotate(-Math.PI/2);ctx.fillText('−log₁₀(p-value)',0,0);ctx.restore();
@@ -762,7 +881,16 @@ function drawVolcano(){
     ? (parts[1]||'').replace(/_/g,' ')+' vs '+(parts[0]||'').replace(/_/g,' ')
     : activeContrast.replace(/_vs_/g,' vs ').replace(/_/g,' ');
   ctx.fillText(contrastLabel,pad.l+pw/2,pad.t+14);
-  canvas._pts=pts;canvas._sx=sx;canvas._sy=sy;canvas._fc=fc;canvas._pt=ythresh;canvas._ptype=ptype;canvas._thresh=thresh;
+  canvas._pts=pts.concat(extra);canvas._sx=sx;canvas._sy=sy;canvas._fc=fc;canvas._pt=ythresh;canvas._ptype=ptype;canvas._thresh=thresh;
+}
+
+function _ttNum(v, mode){
+  /* Les points venus de l'index n'ont ni p.adj, ni Pi, ni robustesse : l'index
+     ne porte que ce qu'il faut pour les situer. Afficher un tiret plutot que NaN. */
+  if(v===null||v===undefined) return '—';
+  const f=parseFloat(v);
+  if(!isFinite(f)) return '—';
+  return mode==='exp' ? f.toExponential(2) : f.toFixed(3);
 }
 
 function initVolcTooltip(){
@@ -786,8 +914,9 @@ function initVolcTooltip(){
       tt.innerHTML='<div class="tg">'+(best.Genes||best.name||'—')+'</div>'+
         '<div class="tl"><code style="font-size:10px;color:'+THEME.tx3+';">'+best.name+'</code></div>'+
         descTxt+
-        '<div class="tl" style="margin-top:3px;">LFC:<b>'+best.d.toFixed(3)+'</b> p.val:<b>'+parseFloat(best.p).toExponential(2)+'</b> p.adj:<b>'+parseFloat(best.padj).toExponential(2)+'</b></div>'+
-        '<div class="tl">Pi:<b>'+parseFloat(best.pi).toFixed(3)+'</b> · Robustesse:<b>'+best.r+'/100</b></div>'+badge;
+        '<div class="tl" style="margin-top:3px;">LFC:<b>'+best.d.toFixed(3)+'</b> p.val:<b>'+_ttNum(best.p,'exp')+'</b> p.adj:<b>'+_ttNum(best.padj,'exp')+'</b></div>'+
+        '<div class="tl">Pi:<b>'+_ttNum(best.pi,'fix')+'</b> · Robustesse:<b>'+(best.r===null||best.r===undefined?'—':best.r+'/100')+'</b></div>'+
+        (best._fromIndex?'<div class="tl" style="color:'+THEME.tx3+';font-size:9px;margin-top:2px;">trouvée dans l\'index · non significative, hors du nuage dessiné</div>':'')+badge;
       tt.style.display='block';tt.style.left=(e.clientX+16)+'px';tt.style.top=(e.clientY-12)+'px';
     }else tt.style.display='none';
   });
@@ -1411,6 +1540,9 @@ document.getElementById('fcSlider').oninput=function(){document.getElementById('
 document.getElementById('pThresh').oninput=function(){document.getElementById('pThreshVal').textContent=parseFloat(this.value).toFixed(3);drawVolcano();};
 document.getElementById('robSlider').oninput=function(){document.getElementById('robVal').textContent=this.value;drawVolcano();};
 document.getElementById('volcSearch').oninput=function(){drawVolcano();};
+document.getElementById('volcSearch').onkeydown=function(e){
+  if(e.key==='Enter'){e.preventDefault();volcPinCurrent();}
+};
 document.querySelectorAll('input[name="ptype"]').forEach(r=>r.onchange=drawVolcano);
 document.querySelectorAll('input[name="goFig"]').forEach(r=>r.onchange=()=>showGOFig(currentGOContrast));
 document.getElementById('hmCluster').onchange=drawHeatmap;
