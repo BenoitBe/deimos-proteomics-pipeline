@@ -72,6 +72,11 @@ and dashboard improvements accumulated since the previous public version.
 
 ### Fixed
 
+- **STRING backend with a UniParc (or any gene-name-free) FASTA**: an empty `Genes` column was
+  read as the text `nan`, which looks like a bacterial gene symbol; the STRING organism probe
+  then found 0/1 gene and switched the GO off instead of using the orthology mode towards
+  `go_species_taxid` / `string_reference_taxid`. Missing-value tokens are no longer probed.
+
 - **Methods described the local ORA as g:Profiler.** With `perseverance_annotation_path`, the
   enrichment section said "g:Profiler (gost)" and its background/correction rows. It now
   describes the local test: annotation file and counts, sources, per-family background and
