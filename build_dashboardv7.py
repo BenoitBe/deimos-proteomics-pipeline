@@ -490,6 +490,52 @@ def build_proteome_data(df_comp, contrasts, cond_map, imp=None):
 
     return result
 
+def build_volcano_index(df_comp, contrasts):
+    """Index de recherche du volcano : TOUTES les protéines, tous les contrastes.
+
+    `build_proteome_data` sous-échantillonne les non significatifs à
+    NS_VOLCANO_MAX par contraste — sans quoi le nuage fige le navigateur. Une
+    protéine NS a donc environ 1200 chances sur N d'être dans le fichier, et la
+    recherche par nom de gène ne la trouve pas : elle n'y est tout simplement
+    pas. C'est ce que signale la mention « NS subsampled » sous le graphique.
+
+    Cet index répare la recherche sans alourdir le dessin. Structure normalisée,
+    parce que nom et gène ne dépendent pas du contraste et qu'il serait absurde
+    de les répéter dix fois :
+
+        {"prot": [[nom, gène], ...],              # table partagée
+         "xy":   {contraste: [d0, lp0, d1, lp1, ...]}}   # aligné sur `prot`
+
+    Coût : environ 25 octets par protéine pour la table, plus 12 par protéine et
+    par contraste pour les coordonnées. Sur 13 000 protéines et 10 contrastes,
+    de l'ordre de 1,9 Mo — à comparer aux ~26 Mo qu'aurait coûtés la suppression
+    pure et simple du sous-échantillonnage, chaque point portant alors sa
+    description et ses neuf autres champs.
+    """
+    names = df_comp['name'].astype(str).tolist() if 'name' in df_comp.columns else []
+    if not names:
+        return {"prot": [], "xy": {}}
+    genes = (df_comp['Genes'].fillna('').astype(str).tolist()
+             if 'Genes' in df_comp.columns else [''] * len(names))
+    prot = [[n, g] for n, g in zip(names, genes)]
+
+    xy = {}
+    for c in contrasts:
+        pcol = c + '_p.val'
+        dcol = c + '_diff'
+        if dcol not in df_comp.columns or pcol not in df_comp.columns:
+            continue
+        dv = pd.to_numeric(df_comp[dcol], errors='coerce')
+        pv = pd.to_numeric(df_comp[pcol], errors='coerce')
+        lp = -np.log10(pv.clip(lower=1e-300))
+        flat = []
+        for d_, l_ in zip(dv.tolist(), lp.tolist()):
+            flat.append(None if d_ != d_ else round(float(d_), 3))
+            flat.append(None if l_ != l_ else round(float(l_), 2))
+        xy[c] = flat
+    return {"prot": prot, "xy": xy}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PCA — score plot + loading plot (PCA de Deimos : onglets PCA_Scores / PCA_Loadings)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -6366,6 +6412,7 @@ def inject(template_html, data):
     block = (
         "const CONTRASTS="     + json.dumps(data['contrasts'], ensure_ascii=False)   + ";\n"
         "const PROTEOME_DATA=" + json.dumps(data['proteome_data'], ensure_ascii=False) + ";\n"
+        "const VOLC_INDEX="    + json.dumps(data.get('volc_index', {"prot": [], "xy": {}}), ensure_ascii=False) + ";\n"
         "const GO_DATA="       + json.dumps(data['go_data'], ensure_ascii=False)     + ";\n"
         "const HEATMAP="       + json.dumps(data['heatmap'], ensure_ascii=False)     + ";\n"
         "const SAMPLE_COLS="   + json.dumps(data['sample_cols'], ensure_ascii=False) + ";\n"
@@ -6794,7 +6841,7 @@ AUDIT_FIX_JS = r"""<script>
   document.querySelectorAll('.ph span').forEach(function(s){ if(/LFC\|\s*>\s*0\.26/.test(s.textContent)) s.textContent = RULE.text; });
   document.querySelectorAll('span').forEach(function(s){
     if(s.children.length === 0 && /NS subsampled/.test(s.textContent))
-      s.textContent = 'Hover a point for details · non-significant points subsampled for display; counts, DEP table and exports use all proteins';
+      s.textContent = 'Hover a point for details · non-significant points subsampled for display; search, counts, DEP table and exports cover every protein';
   });
   document.querySelectorAll('h2').forEach(function(h){
     if(/^PCA — ANOVA significant proteins/.test(h.textContent))
@@ -8239,6 +8286,9 @@ def main():
     # Nouvelles figures analytiques
     # Nouvelles figures analytiques (NS_REP_MAX=150 → allégé vs 400)
     data['rep_scatter'] = build_replicate_scatter(df_comp, cond_map_inv)
+    # Index de recherche : toutes les protéines, pour que la recherche du
+    # volcano trouve aussi les non significatifs sous-échantillonnés.
+    data['volc_index'] = build_volcano_index(df_comp, contrasts)
     data['ranked']  = build_ranked_abundance(df_comp, sample_cols)
     data['cv_plot'] = build_cv_plot(df_comp, sample_cols, cond_map_inv)
     data['qc_report'] = build_qc_report(stats, df_comp, sample_cols, cond_map_inv)

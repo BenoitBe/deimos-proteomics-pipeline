@@ -154,6 +154,32 @@ and dashboard improvements accumulated since the previous public version.
     degrees of freedom globally against 9 per time point.
   - `tests/test_anova_strata.py` (11 tests).
 
+### Changed
+
+- **The volcano search now finds every protein, and selections accumulate.** Two
+  separate limits, both reported from a real run:
+  - *Non-significant proteins were unsearchable.* `build_proteome_data` subsamples the
+    non-significant points to `NS_VOLCANO_MAX` (1200) per contrast, without which the
+    cloud freezes the browser. A non-significant protein outside that draw was not in the
+    file at all, so typing its gene name found nothing — on a 6000-protein test set that
+    was **68 % of the proteome**. `build_volcano_index` now ships name, gene and
+    coordinates for *every* protein, per contrast, used only by the search. The structure
+    is normalised — one shared protein table, one flat coordinate array per contrast —
+    because name and gene do not depend on the contrast: about 11 % added to the page,
+    against the ~5× it would have cost to stop subsampling, each point otherwise carrying
+    its description and nine other fields.
+  - *Each search erased the previous one.* Typing previews matches in yellow as before;
+    **Enter pins them** and clears the box for the next search, and pinned proteins stay
+    highlighted until the new **Reset** button. Pinned proteins are labelled with their
+    gene name (up to 25, beyond which the plot would be unreadable). A term matching
+    nothing flashes the box red instead of silently clearing the selection.
+  - Points recovered from the index carry no p.adj, Pi or robustness — the index holds
+    only what is needed to place them — so the tooltip shows "—" for those rather than
+    `NaN`, and says where the point came from.
+  - The caption under the plot was rewritten at render time by a JavaScript override that
+    matched on its old wording, so the template's own text was dead. Both now carry the
+    same sentence, and a test fails if they drift.
+
 ### Fixed
 
 - **Three keys the code read were declared nowhere, and `last_config.yaml` dropped them.**
