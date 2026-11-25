@@ -854,6 +854,7 @@ def resolve_string_taxid(protein_ids: list, species_taxid,
 # ------------------------------------------------------------------------------
 
 _GENE_SYMBOL = re.compile(r"^[a-z]{3}[A-Z]?[0-9]?$")   # dnaK, gyrB, prs, rpsP, groL...
+_MISSING_TOKENS = {"nan", "none", "null", "na", "n/a", ""}   # cellules vides lues en texte
 
 
 def _uniprot_taxon(taxid, timeout: int = 20) -> dict | None:
@@ -896,7 +897,11 @@ def probe_string_organism(gene_names, taxid,
     ne répond pas, n_testés 0 si aucun nom de gène exploitable.
     """
     names = list(dict.fromkeys(str(g).split(";")[0].strip() for g in gene_names))
-    names = [g for g in names if _GENE_SYMBOL.match(g)]
+    # Une colonne Genes vide (FASTA UniParc, protéome maison) arrive en 'nan' via
+    # astype(str) : 3 minuscules, donc un « symbole » pour _GENE_SYMBOL. Sondé, il
+    # donnait 0/1 gène reconnu et désactivait le GO STRING au lieu de l'orthologie.
+    names = [g for g in names
+             if g.lower() not in _MISSING_TOKENS and _GENE_SYMBOL.match(g)]
     if not names:
         return 0, 0
     if len(names) > n_probe:

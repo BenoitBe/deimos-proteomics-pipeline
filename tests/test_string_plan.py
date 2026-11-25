@@ -47,3 +47,38 @@ def test_perseverance_not_run_with_string_backend():
     i = src.index('elif local_go_params and local_go_params.get("backend") == "string":')
     j = src.index("run_perseverance_step(df_results, params, out_dir)", i)
     assert "correspondence_df, persev_override = None, None" in src[i:j]
+
+
+def test_uniparc_ids_without_gene_names_go_to_orthology(monkeypatch):
+    """Recherche DIA-NN sur un FASTA UniParc (en-têtes '>UPI… status=active') : ni
+    accession indexée dans STRING ni nom de gène (colonne Genes vide, lue NaN puis
+    'nan' par astype(str)). 'nan' ressemble à un symbole bactérien (3 minuscules) :
+    il ne doit pas servir de sonde, sinon 0/1 gène reconnu désactive le GO STRING
+    au lieu de passer en orthologie vers le taxid demandé."""
+    calls = []
+    monkeypatch.setattr(ge, "diagnose_string_coverage",
+                        lambda ids, T, caller, **kw: {"reliable": False, "unreachable": False,
+                                                       "coverage": 0.0, "recommendation": "x"})
+    monkeypatch.setattr(ge, "detect_string_taxid",
+                        lambda ids, caller: {"reliable": False, "unreachable": False, "taxid": None,
+                                             "name": None, "strain_taxid": None,
+                                             "recommendation": "x"})
+
+    def fake_map(names, taxid, caller, **kw):
+        calls.append(list(names))
+        import pandas as pd
+        return pd.DataFrame(columns=["queryItem"])
+    monkeypatch.setattr(ge, "_string_id_map", fake_map)
+    monkeypatch.setattr(ge, "_diamond_available", lambda: True)
+    ids = [f"UPI0000{i:06d}" for i in range(50)]
+    plan = ge.plan_string_mapping(ids, 93061, "x", gene_names=["nan"] * 50, reference_taxid=93061)
+    assert plan["mode"] == "ortholog" and plan["taxid"] == 93061
+    assert not any("nan" in c for c in calls)        # 'nan' never sent as a gene name
+
+
+def test_probe_ignores_missing_gene_tokens(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ge, "_string_id_map",
+                        lambda names, taxid, caller, **kw: seen.append(list(names)))
+    assert ge.probe_string_organism(["nan", "None", "", "NaN", "null"], 93061) == (0, 0)
+    assert seen == []
